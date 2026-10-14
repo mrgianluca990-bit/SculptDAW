@@ -279,7 +279,7 @@ jobs:
                   '            }\n',
                   '            let back = m.alt || m.shift;\n'
                   '            let active_track = s.edit.selected_tracks.first().copied().or_else(|| {\n'
-                  '                s.edit.selected_clips.first().and_then(|c| s.find_clip(*c).map(|(t, _)| t.id))\n'
+                  '                s.edit.selected_clips.first().and_then(|c| s.find_clip(*c).map(|(t, _)| t))\n'
                   '            });\n'
                   '            if s.edit.tab_to_transient\n'
                   '                && let Some(t) = active_track\n'
