@@ -1,4 +1,4 @@
-name: Sculpt DAW - Mac Universal - UI Pilot v2
+name: Sculpt DAW - Edit and Crossfade Pilot
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: sculpt-macos-${{ github.ref }}
@@ -46,10 +46,16 @@ jobs:
           echo 'Missing upstream source files restored for this build.'
           echo 'Note: source files must later be committed to SculptDAW permanently.'
 
-      - name: Apply Sculpt DAW UI pilot fixes (non-destructive)
+      - name: Integrate stable UI fixes and Pro Tools-style crossfades
         shell: bash
         run: |
           set -euo pipefail
+          # When the tested source changes have been committed to main, do not
+          # replay the one-time migration on already-updated source files.
+          if grep -q 'SCULPT_FADES_UI_MIGRATION_V1' crates/ui-egui/src/edit_window.rs; then
+            echo 'Sculpt UI/crossfade sources already integrated; no migration needed.'
+            exit 0
+          fi
           python3 - <<'PYSCULPT'
           #!/usr/bin/env python3
           """Patch Sculpt DAW UI in a checked-out GitHub Actions workspace.
@@ -602,6 +608,505 @@ jobs:
               ),
           ])
           print('Sculpt UI v2: native multi-file browsing in Import Audio dialog')
+          # Sculpt DAW crossfade & smart tool pilot, applied AFTER the tested UI pilot v2.
+          # Source transforms are checked for unique anchors; fail closed if source changes.
+
+          fade_engine = Path('crates/engine/src/edit.rs')
+          txt = fade_engine.read_text(encoding='utf-8')
+          start_marker = '/// Create fades from a selection (the incumbent\'s Edit › Fades › Create semantics):'
+          if txt.count(start_marker) != 1:
+              raise RuntimeError('crossfade: edit.rs create_fades anchor not unique')
+          txt = txt.replace(start_marker, '''/// Session-stable original cut location for a crossfade between these two clip IDs.
+          /// Stored in the undoable session edit state; no irreversible "split at midpoint" deletion.
+          fn sculpt_xfade_join_key(a: ClipId, b: ClipId) -> String {
+              format!("sculpt.xfade.join.{}.{}", a.0, b.0)
+          }
+
+          ''' + start_marker, 1)
+
+          old_head = '''pub fn create_fades(s: &mut Session, track: TrackId, range: Range, shape: FadeShape) -> usize {
+              if range.is_empty() {
+                  return 0;
+              }
+          '''
+          new_head = '''pub fn create_fades(s: &mut Session, track: TrackId, range: Range, shape: FadeShape) -> usize {
+              create_fades_with_shapes(s, track, range, shape, shape)
+          }
+
+          /// Fade-out and fade-in curves can be independently selected, as in the Pro Tools fade dialog.
+          pub fn create_fades_with_shapes(
+              s: &mut Session, track: TrackId, range: Range, shape_out: FadeShape, shape_in: FadeShape,
+          ) -> usize {
+              if range.is_empty() {
+                  return 0;
+              }
+              // Resizing an existing crossfade must be one undoable edit. Restore the saved
+              // original cut before recomputing handles, so previous extensions do not accumulate.
+              let rebuild: Vec<(ClipId, ClipId, Samples)> = s.track(track).map_or_else(Vec::new, |tr| {
+                  tr.clips().windows(2).filter_map(|pair| {
+                      let (a, b) = (&pair[0], &pair[1]);
+                      let original = s.edit.values.get(&sculpt_xfade_join_key(a.id, b.id))?;
+                      let seam = *original as Samples;
+                      (range.start < seam && seam < range.end && a.end() > b.start && a.fade_out.len > 0 && b.fade_in.len > 0)
+                          .then_some((a.id, b.id, seam))
+                  }).collect()
+              });
+              if let Some(pl) = s.track_mut(track).and_then(|t| t.playlist_mut()) {
+                  for (aid, bid, seam) in rebuild {
+                      let left = pl.clips.iter().position(|c| c.id == aid);
+                      let right = pl.clips.iter().position(|c| c.id == bid);
+                      if let (Some(i), Some(j)) = (left, right) {
+                          if i != j {
+                              if let Some(a) = pl.clips.get_mut(i) {
+                                  a.fade_out = Fade::default();
+                                  a.trim_end_to(seam);
+                              }
+                              if let Some(b) = pl.clips.get_mut(j) {
+                                  b.fade_in = Fade::default();
+                                  b.trim_start_to(seam);
+                              }
+                          }
+                      }
+                  }
+              }
+          '''
+          assert txt.count(old_head)==1, 'crossfade: old head mismatch'
+          txt=txt.replace(old_head,new_head,1)
+          # Only touch the specific block inside create_fades, not arbitrary other fade code.
+          a=txt.index('pub fn create_fades_with_shapes(')
+          b=txt.index('/// Remove fades on clips touching', a)
+          part=txt[a:b]
+          assert part.count('    let mut xfaded: Vec<ClipId> = Vec::new();') == 1
+          part=part.replace('    let mut xfaded: Vec<ClipId> = Vec::new();','    let mut xfaded: Vec<ClipId> = Vec::new();\n    let mut remembered_joins: Vec<(String, f64)> = Vec::new();',1)
+          assert part.count('                ca.fade_out = Fade { len: (ext_a + before).min(ca.length), shape };')==1
+          part=part.replace('                ca.fade_out = Fade { len: (ext_a + before).min(ca.length), shape };','                ca.fade_out = Fade { len: (ext_a + before).min(ca.length), shape: shape_out };',1)
+          assert part.count('                cb.fade_in = Fade { len: (ext_b + after).min(cb.length), shape };')==1
+          part=part.replace('                cb.fade_in = Fade { len: (ext_b + after).min(cb.length), shape };','                cb.fade_in = Fade { len: (ext_b + after).min(cb.length), shape: shape_in };',1)
+          assert part.count('            xfaded.push(b.id);')==1
+          part=part.replace('            xfaded.push(b.id);','            xfaded.push(b.id);\n            remembered_joins.push((sculpt_xfade_join_key(a.id, b.id), boundary as f64));',1)
+          assert part.count('c.fade_in = Fade { len: range.end - c.start, shape };')==1
+          part=part.replace('c.fade_in = Fade { len: range.end - c.start, shape };','c.fade_in = Fade { len: range.end - c.start, shape: shape_in };',1)
+          assert part.count('c.fade_out = Fade { len: c.end() - range.start, shape };')==1
+          part=part.replace('c.fade_out = Fade { len: c.end() - range.start, shape };','c.fade_out = Fade { len: c.end() - range.start, shape: shape_out };',1)
+          needle='''    made
+          }
+
+          '''
+          assert part.endswith(needle)
+          part=part[:-len(needle)]+'''    for (key, seam) in remembered_joins {
+                  s.edit.values.insert(key, seam);
+              }
+              made
+          }
+
+          '''
+          txt=txt[:a]+part+txt[b:]
+
+          start=txt.index('/// Remove fades on clips touching')
+          end=txt.index('#[cfg(test)]',start)
+          replacement='''/// Remove only fades intersecting the requested range (or the cursor position).
+          /// Crossfades restore the *original* edit boundary, not the middle of the overlap.
+          pub fn delete_fades(s: &mut Session, track: TrackId, range: Range) -> usize {
+              let remembered = s.edit.values.clone();
+              let mut used_keys = Vec::new();
+              let Some(pl) = s.track_mut(track).and_then(|t| t.playlist_mut()) else { return 0 };
+              let selected = |start: Samples, end: Samples| -> bool {
+                  if end <= start { return false; }
+                  if range.is_empty() {
+                      start <= range.start && range.start < end
+                  } else {
+                      start < range.end && range.start < end
+                  }
+              };
+              let mut changed = 0usize;
+              pl.sort();
+              for i in 0..pl.clips.len().saturating_sub(1) {
+                  let (a, b) = (&pl.clips[i], &pl.clips[i + 1]);
+                  if a.end() <= b.start || a.fade_out.len <= 0 || b.fade_in.len <= 0 || !selected(b.start, a.end()) {
+                      continue;
+                  }
+                  let key = sculpt_xfade_join_key(a.id, b.id);
+                  let seam = remembered.get(&key).map_or(b.start + (a.end() - b.start) / 2, |x| *x as Samples);
+                  if seam <= a.start || seam >= b.end() { continue; }
+                  if let Some(left) = pl.clips.get_mut(i) {
+                      left.fade_out = Fade::default();
+                      left.trim_end_to(seam);
+                  }
+                  if let Some(right) = pl.clips.get_mut(i + 1) {
+                      right.fade_in = Fade::default();
+                      right.trim_start_to(seam);
+                  }
+                  used_keys.push(key);
+                  changed += 1;
+              }
+              for c in &mut pl.clips {
+                  let mut erased = false;
+                  if c.fade_in.len > 0 && selected(c.start, c.start + c.fade_in.len) {
+                      c.fade_in = Fade::default();
+                      erased = true;
+                  }
+                  if c.fade_out.len > 0 && selected(c.end() - c.fade_out.len, c.end()) {
+                      c.fade_out = Fade::default();
+                      erased = true;
+                  }
+                  if erased { changed += 1; }
+              }
+              for key in used_keys { s.edit.values.remove(&key); }
+              changed
+          }
+
+          '''
+          txt=txt[:start]+replacement+txt[end:]
+          # Regression: asymmetric selection must restore its original seam precisely.
+          anchor='''    #[test]
+              fn fades_and_crossfades() {
+          '''
+          assert txt.count(anchor)==1
+          txt=txt.replace(anchor,'''    #[test]
+              fn sculpt_asymmetric_crossfade_restores_exact_junction() {
+                  let (mut s, t) = session_with_clip();
+                  separate_at(&mut s, t, 3000);
+                  assert_eq!(create_fades(&mut s, t, Range::new(2850, 3080), FadeShape::EqualPower), 1);
+                  let c = s.track(t).unwrap().clips();
+                  assert_eq!((c[0].end(), c[1].start), (3080, 2850));
+                  assert_eq!(delete_fades(&mut s, t, Range::new(2900, 3050)), 1);
+                  let c = s.track(t).unwrap().clips();
+                  assert_eq!((c[0].end(), c[1].start), (3000, 3000));
+              }
+
+              #[test]
+              fn sculpt_repeated_crossfade_resize_does_not_accumulate_handles() {
+                  let (mut s, t) = session_with_clip();
+                  separate_at(&mut s, t, 3000);
+                  assert_eq!(create_fades(&mut s, t, Range::new(2900, 3100), FadeShape::EqualPower), 1);
+                  assert_eq!(create_fades(&mut s, t, Range::new(2800, 3050), FadeShape::SCurve), 1);
+                  let c = s.track(t).unwrap().clips();
+                  assert_eq!((c[0].end(), c[1].start), (3050, 2800));
+                  assert_eq!(delete_fades(&mut s, t, Range::new(2800, 3050)), 1);
+                  let c = s.track(t).unwrap().clips();
+                  assert_eq!((c[0].end(), c[1].start), (3000, 3000));
+              }
+
+          '''+anchor,1)
+          fade_engine.write_text(txt,encoding='utf-8')
+          print('Sculpt Fades: transactional crossfade joins, resize, targeted removal, regression tests')
+
+          patch('crates/engine/src/cmd/edit.rs', [
+              (
+                  '''    let s = e.session_mut();
+              let n: usize = tracks.iter().map(|t| ops::create_fades(s, *t, r, shape)).sum();
+          ''',
+                  '''    let shape_out = str_param(p, "shape_out").map_or(Some(shape), FadeShape::from_id)
+                  .ok_or_else(|| bad("edit.fades_create", "unknown fade-out shape"))?;
+              let shape_in = str_param(p, "shape_in").map_or(Some(shape), FadeShape::from_id)
+                  .ok_or_else(|| bad("edit.fades_create", "unknown fade-in shape"))?;
+              let s = e.session_mut();
+              let n: usize = tracks.iter().map(|t| ops::create_fades_with_shapes(s, *t, r, shape_out, shape_in)).sum();
+          '''
+              ),
+          ])
+
+          # Curve editor with independently selectable fade-out/in, plus a live view.
+          patch('crates/ui-egui/src/dialogs.rs', [
+              (
+                  '    Fades { shape: String },',
+                  '    Fades { shape_in: String, shape_out: String, link: bool },'
+              ),
+              (
+                  '"edit.fades_create" => Dialog::Fades { shape: "equal power".into() },',
+                  '"edit.fades_create" => Dialog::Fades { shape_in: "equal power".into(), shape_out: "equal power".into(), link: true },'
+              ),
+              (
+                  '''                Dialog::Fades { shape } => {
+                              for s in soundcraft_model::FadeShape::ALL {
+                                  ui.radio_value(shape, s.label().to_lowercase(), s.label());
+                              }
+                              if buttons(ui, "OK", enter) {
+                                  action = Some(("edit.fades_create".into(), json!({"shape": shape})));
+                              }
+                          }
+          ''',
+                  '''                Dialog::Fades { shape_in, shape_out, link } => {
+                              ui.heading("Crossfade / Fade Editor");
+                              ui.checkbox(link, "Link Fade In and Fade Out curves");
+                              ui.horizontal(|ui| {
+                                  ui.label("FADE OUT");
+                                  egui::ComboBox::from_id_salt("sculpt_fade_out_shape")
+                                      .selected_text(shape_out.as_str()).show_ui(ui, |ui| {
+                                          for s in soundcraft_model::FadeShape::ALL {
+                                              if ui.selectable_value(shape_out, s.label().to_lowercase(), s.label()).changed() && *link {
+                                                  *shape_in = shape_out.clone();
+                                              }
+                                          }
+                                      });
+                                  ui.separator();
+                                  ui.label("FADE IN");
+                                  egui::ComboBox::from_id_salt("sculpt_fade_in_shape")
+                                      .selected_text(shape_in.as_str()).show_ui(ui, |ui| {
+                                          for s in soundcraft_model::FadeShape::ALL {
+                                              if ui.selectable_value(shape_in, s.label().to_lowercase(), s.label()).changed() && *link {
+                                                  *shape_out = shape_in.clone();
+                                              }
+                                          }
+                                      });
+                              });
+                              let out_shape = soundcraft_model::FadeShape::from_id(shape_out).unwrap_or_default();
+                              let in_shape = soundcraft_model::FadeShape::from_id(shape_in).unwrap_or_default();
+                              let (rect, _) = ui.allocate_exact_size(vec2(420.0, 125.0), egui::Sense::hover());
+                              ui.painter().rect_filled(rect, 4.0, egui::Color32::from_rgb(28, 34, 42));
+                              let left = rect.min.x + 10.0;
+                              let right = rect.max.x - 10.0;
+                              let top = rect.min.y + 10.0;
+                              let bottom = rect.max.y - 10.0;
+                              ui.painter().line_segment([egui::pos2(left, bottom), egui::pos2(right, bottom)], egui::Stroke::new(1.0, egui::Color32::GRAY));
+                              let mut out_pts = Vec::new();
+                              let mut in_pts = Vec::new();
+                              for i in 0..=60 {
+                                  let k = i as f32 / 60.0;
+                                  let x = left + (right - left) * k;
+                                  out_pts.push(egui::pos2(x, bottom - (bottom - top) * out_shape.gain(1.0 - k)));
+                                  in_pts.push(egui::pos2(x, bottom - (bottom - top) * in_shape.gain(k)));
+                              }
+                              ui.painter().add(egui::Shape::line(out_pts, egui::Stroke::new(2.5, egui::Color32::from_rgb(235, 145, 175))));
+                              ui.painter().add(egui::Shape::line(in_pts, egui::Stroke::new(2.5, egui::Color32::from_rgb(125, 215, 175))));
+                              ui.horizontal(|ui| {
+                                  ui.colored_label(egui::Color32::from_rgb(235, 145, 175), "● Fade Out");
+                                  ui.colored_label(egui::Color32::from_rgb(125, 215, 175), "● Fade In");
+                                  ui.label("Curves preview");
+                              });
+                              if buttons(ui, "Apply Fade", enter) {
+                                  action = Some(("edit.fades_create".into(), json!({"shape_out": shape_out, "shape_in": shape_in})));
+                              }
+                          }
+          '''
+              ),
+          ])
+          print('Sculpt Fades: dual-curve editor with preview')
+
+          patch('crates/ui-egui/src/lib.rs', [
+              (
+                  '    Fade { clip: soundcraft_model::ClipId, track: TrackId, fade_in: bool, to: Samples },',
+                  '    Fade { clip: soundcraft_model::ClipId, track: TrackId, fade_in: bool, to: Samples },\n'
+                  '    Crossfade { track: TrackId, seam: Samples, to: Samples },'
+              )
+          ])
+
+          patch('crates/ui-egui/src/shortcuts.rs', [
+              (
+                  '        Key::Equals if m.command && !(mac && m.ctrl) => {',
+                  '''        Key::F if mac && m.command && m.ctrl && !m.alt => {
+                      // Pro Tools: apply the default crossfade without opening the Fades dialog.
+                      let _ = app.run("edit.fades_create", json!({"shape": "equal power"}));
+                      true
+                  }
+                  Key::Equals if m.command && !(mac && m.ctrl) => {'''
+              ),
+          ])
+
+          # Visible crossfade pair overlay (both curves) and interactive Smart Tool at bottom seam.
+          patch('crates/ui-egui/src/edit_window.rs', [
+              (
+                  '''        draw_clip(app, &painter, &s, &track, clip, tl, lane, auto_view.is_some());
+              }
+              crate::video_track::draw_lane''',
+                  '''        draw_clip(app, &painter, &s, &track, clip, tl, lane, auto_view.is_some());
+              }
+              sculpt_draw_crossfades(&painter, &s, &track, tl, lane);
+              crate::video_track::draw_lane'''
+              ),
+              (
+                  '''    // Fades.
+              let fade_col = Color32::from_rgba_unmultiplied(255, 255, 255, 90);
+          ''',
+                  '''    // Sculpt: fades must stay legible against waveforms, even without selecting the clip.
+              let fade_col = Color32::from_rgba_unmultiplied(255, 255, 255, 225);
+              if clip.fade_in.len > 0 {
+                  let fx = x_of(s, tl, clip.start + clip.fade_in.len);
+                  if fx > x0 { painter.rect_filled(Rect::from_min_max(pos2(x0, body_r.min.y), pos2(fx, body_r.max.y)), 0.0, Color32::from_white_alpha(16)); }
+              }
+              if clip.fade_out.len > 0 {
+                  let fx = x_of(s, tl, clip.end() - clip.fade_out.len);
+                  if x1 > fx { painter.rect_filled(Rect::from_min_max(pos2(fx, body_r.min.y), pos2(x1, body_r.max.y)), 0.0, Color32::from_white_alpha(16)); }
+              }
+          '''
+              ),
+              (
+                  '        painter.add(Shape::line(pts, Stroke::new(1.2, fade_col)));',
+                  '        painter.add(Shape::line(pts, Stroke::new(2.0, fade_col)));'
+              ) if False else (
+                  '        painter.add(Shape::line(pts, Stroke::new(1.2, fade_col)));\n        painter.line_segment([pos2(x0, body_r.min.y), pos2(fx, body_r.min.y)], Stroke::new(1.0, fade_col));',
+                  '        painter.add(Shape::line(pts, Stroke::new(2.0, fade_col)));\n        painter.line_segment([pos2(x0, body_r.min.y), pos2(fx, body_r.min.y)], Stroke::new(1.0, fade_col));'
+              ),
+              (
+                  '        painter.add(Shape::line(pts, Stroke::new(1.2, fade_col)));\n    }\n    // Optional clip overlays',
+                  '        painter.add(Shape::line(pts, Stroke::new(2.0, fade_col)));\n    }\n    // Optional clip overlays'
+              ),
+              (
+                  '''    let menu_clip_id = id.with("menu_clip");
+          ''',
+                  '''    let menu_clip_id = id.with("menu_clip");
+              let menu_xfade_id = id.with("sculpt_menu_xfade");
+          '''
+              ),
+              (
+                  '''        ui.ctx().data_mut(|d| d.insert_temp(menu_clip_id, clip));
+              }
+              // The clip may have been removed''',
+                  '''        ui.ctx().data_mut(|d| d.insert_temp(menu_clip_id, clip));
+                  let xfade = resp.interact_pointer_pos().and_then(|p| {
+                      let s = app.engine.session();
+                      let at = sample_at(s, tl, p.x).max(0);
+                      track.clips().windows(2).find_map(|pair| {
+                          let (a, b) = (&pair[0], &pair[1]);
+                          (a.end() > b.start && a.fade_out.len > 0 && b.fade_in.len > 0
+                              && b.start <= at && at < a.end()).then_some((b.start, a.end()))
+                      })
+                  });
+                  ui.ctx().data_mut(|d| d.insert_temp(menu_xfade_id, xfade));
+              }
+              // The clip may have been removed'''
+              ),
+              (
+                  '''    resp.context_menu(|ui| clip_context_menu(app, ui, menu_clip));
+          ''',
+                  '''    let menu_xfade = ui.ctx().data(|d| d.get_temp::<Option<(Samples, Samples)>>(menu_xfade_id)).flatten();
+              resp.context_menu(|ui| {
+                  if let Some((start, end)) = menu_xfade {
+                      ui.label("Crossfade");
+                      if ui.button("Delete Crossfade").clicked() {
+                          let _ = app.run("edit.fades_delete", json!({"tracks": [track.id.0], "start": start, "end": end}));
+                          ui.close();
+                      }
+                      ui.separator();
+                  }
+                  clip_context_menu(app, ui, menu_clip);
+              });
+          '''
+              ),
+              (
+                  '''    let hit = clip_at(track, at_origin).cloned();
+              let upper = origin.y < lane.center().y;
+          ''',
+                  '''    let hit = clip_at(track, at_origin).cloned();
+              let upper = origin.y < lane.center().y;
+              // Pro Tools Smart Tool: a drag at the LOWER part of a clip seam creates
+              // or resizes a crossfade; the upper corners remain fade-in/out targets.
+              let sculpt_seam = if tool == Tool::Smart && origin.y > lane.min.y + lane.height() * 0.65 {
+                  track.clips().windows(2).find_map(|pair| {
+                      let (a, b) = (&pair[0], &pair[1]);
+                      if !a.is_audio() || !b.is_audio() { return None; }
+                      let stored = s.edit.values.get(&format!("sculpt.xfade.join.{}.{}", a.id.0, b.id.0));
+                      let seam = stored.map_or(a.end(), |v| *v as Samples);
+                      let adjacent_or_faded = a.end() == b.start ||
+                          (a.end() > b.start && a.fade_out.len > 0 && b.fade_in.len > 0);
+                      (adjacent_or_faded && (origin.x - x_of(&s, tl, seam)).abs() < 12.0).then_some(seam)
+                  })
+              } else { None };
+          '''
+              ),
+              (
+                  '''    if fade_corner.is_some() && resp.hovered() {
+          ''',
+                  '''    if sculpt_seam.is_some() && resp.hovered() {
+                  ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+              }
+              if fade_corner.is_some() && resp.hovered() {
+          '''
+              ),
+              (
+                  '''    } else if resp.drag_started() {
+                  app.gesture = match eff {
+          ''',
+                  '''    } else if resp.drag_started() && let Some(seam) = sculpt_seam {
+                  app.gesture = Some(Gesture::Crossfade { track: track.id, seam, to: at });
+              } else if resp.drag_started() {
+                  app.gesture = match eff {
+          '''
+              ),
+              (
+                  '''        Some(Gesture::Fade { to, .. }) => *to = at,
+          ''',
+                  '''        Some(Gesture::Fade { to, .. } | Gesture::Crossfade { to, .. }) => *to = at,
+          '''
+              ),
+              (
+                  '''                let _ = app.run("edit.fades_create", json!({"tracks": [track.0], "start": a, "end": b, "shape": "s-curve"}));
+          ''',
+                  '''                let _ = app.run("edit.fades_create", json!({"tracks": [track.0], "start": a, "end": b, "shape": "equal power"}));
+          '''
+              ),
+              (
+                  '''        Some(Gesture::TrimStart { clip, track, to }) => trim_clip(app, clip, track, to, true),
+          ''',
+                  '''        Some(Gesture::Crossfade { track, seam, to }) => {
+                      // Drag distance sets the crossfade half-width, symmetrically around the seam.
+                      let half = (to - seam).abs().max(s.sample_rate.samples(0.005));
+                      let start = (seam - half).max(0);
+                      let end = seam.saturating_add(half);
+                      let _ = app.run("edit.fades_create", json!({"tracks": [track.0], "start": start, "end": end, "shape": "equal power"}));
+                  }
+                  Some(Gesture::TrimStart { clip, track, to }) => trim_clip(app, clip, track, to, true),
+          '''
+              ),
+              (
+                  '''    if let Some(Gesture::Fade { clip, fade_in, to, .. }) = &app.gesture
+          ''',
+                  '''    if let Some(Gesture::Crossfade { track, seam, to }) = &app.gesture
+                  && let Some((_, r)) = app.edit_layout.rows.iter().find(|(i, _)| *i == track.0)
+              {
+                  let half = (to - seam).abs();
+                  let (x0, x1) = (x_of(s, tl, (seam - half).max(0)), x_of(s, tl, seam + half));
+                  painter.rect_stroke(Rect::from_min_max(pos2(x0, r[1] + 2.0), pos2(x1, r[3] - 2.0)),
+                      0.0, Stroke::new(2.0, Color32::from_rgb(244, 205, 116)), StrokeKind::Inside);
+              }
+              if let Some(Gesture::Fade { clip, fade_in, to, .. }) = &app.gesture
+          '''
+              ),
+          ])
+
+          # Add the crossfade-drawing function before clip rendering, so no extra imports needed.
+          edit_path=Path('crates/ui-egui/src/edit_window.rs')
+          src=edit_path.read_text(encoding='utf-8')
+          fn_anchor='fn draw_clip(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track, clip: &Clip, tl: Rect, lane: Rect, dim: bool) {'
+          assert src.count(fn_anchor)==1
+          new_fn='''fn sculpt_draw_crossfades(painter: &egui::Painter, s: &Session, track: &Track, tl: Rect, lane: Rect) {
+              for pair in track.clips().windows(2) {
+                  let (a, b) = (&pair[0], &pair[1]);
+                  if !a.is_audio() || !b.is_audio() || a.end() <= b.start || a.fade_out.len <= 0 || b.fade_in.len <= 0 {
+                      continue;
+                  }
+                  let x0 = x_of(s, tl, b.start);
+                  let x1 = x_of(s, tl, a.end());
+                  if x1 < tl.min.x || x0 > tl.max.x || (x1 - x0) < 3.0 { continue; }
+                  let area = Rect::from_min_max(pos2(x0, lane.min.y + 1.0), pos2(x1, lane.max.y - 1.0));
+                  painter.rect_filled(area, 0.0, Color32::from_rgba_unmultiplied(234, 199, 116, 45));
+                  painter.rect_stroke(area, 0.0, Stroke::new(1.5, Color32::from_rgb(230, 190, 105)), StrokeKind::Inside);
+                  let mut outgoing = Vec::new();
+                  let mut incoming = Vec::new();
+                  for i in 0..=32 {
+                      let k = i as f32 / 32.0;
+                      let time = b.start as f64 + (a.end() - b.start) as f64 * k as f64;
+                      let fade_out_pos = ((a.end() as f64 - time) / a.fade_out.len as f64).clamp(0.0, 1.0) as f32;
+                      let fade_in_pos = ((time - b.start as f64) / b.fade_in.len as f64).clamp(0.0, 1.0) as f32;
+                      let x = x0 + (x1 - x0) * k;
+                      outgoing.push(pos2(x, area.max.y - area.height() * a.fade_out.shape.gain(fade_out_pos)));
+                      incoming.push(pos2(x, area.max.y - area.height() * b.fade_in.shape.gain(fade_in_pos)));
+                  }
+                  painter.add(Shape::line(outgoing, Stroke::new(2.0, Color32::from_rgb(243, 155, 175))));
+                  painter.add(Shape::line(incoming, Stroke::new(2.0, Color32::from_rgb(132, 237, 179))));
+                  if x1 - x0 > 45.0 && area.height() > 35.0 {
+                      painter.text(pos2(area.center().x, area.min.y + 9.0), Align2::CENTER_CENTER, "X-FADE", bold(9.0), Color32::WHITE);
+                  }
+              }
+          }
+
+          '''
+          src=src.replace(fn_anchor,new_fn+fn_anchor,1)
+          edit_path.write_text(src,encoding='utf-8')
+          print('Sculpt Fades: waveform overlay, Smart Tool crossfade drag, delete popup, Cmd+Ctrl+F')
+          # Mark this source as migrated; future builds skip one-time patches.
+          path = Path('crates/ui-egui/src/edit_window.rs')
+          path.write_text(path.read_text(encoding='utf-8') + '\n// SCULPT_FADES_UI_MIGRATION_V1\n', encoding='utf-8')
           PYSCULPT
           git diff --stat
 
@@ -610,9 +1115,16 @@ jobs:
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
 
-      - name: Validate Sculpt UI patches compile before release build
+      - name: Validate complete Sculpt editing sources compile
         shell: bash
         run: cargo check --locked --target x86_64-apple-darwin -p sculpt-daw
+
+      - name: Run fade and crossfade regression tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --target x86_64-apple-darwin -p soundcraft-engine --lib fades_and_crossfades
+          cargo test --locked --target x86_64-apple-darwin -p soundcraft-engine --lib sculpt_
 
       - name: Build the universal app and CLI
         run: bash sculpt/build-macos.sh
@@ -627,12 +1139,51 @@ jobs:
           unzip -t "$ZIP"
           unzip -l "$ZIP" | grep -F 'Sculpt DAW.app/Contents/MacOS/sculpt-daw'
 
+      - name: Export verified source changes as a patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/sculpt
+          git diff --binary -- apps/soundcraft/src/main.rs crates/ui-egui/src crates/engine/src/edit.rs crates/engine/src/cmd/edit.rs > dist/sculpt/Sculpt_DAW_UI_Fades_Source.patch
+          test -s dist/sculpt/Sculpt_DAW_UI_Fades_Source.patch || echo 'Source already integrated in GitHub.'
+
       - name: Upload Sculpt DAW app
         uses: actions/upload-artifact@v4
         with:
-          name: Sculpt-DAW-Mac-UI-Pilot-v2
+          name: Sculpt-DAW-Mac-Edit-Fades-Pilot
           path: |
             dist/sculpt/Sculpt_DAW_0.4.0_Mac_Universal.zip
             dist/sculpt/Sculpt_DAW_0.4.0_Mac_Universal.zip.sha256
+            dist/sculpt/Sculpt_DAW_UI_Fades_Source.patch
           if-no-files-found: error
           retention-days: 30
+
+      # The same UI patches previously lived *only* in the workflow. Once the
+      # whole binary and fade-engine regression tests pass, persist the modified
+      # Rust sources. GITHUB_TOKEN pushes intentionally do not restart this job.
+      - name: Persist verified Rust fixes to SculptDAW main
+        if: success()
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add apps/soundcraft/src/main.rs \
+                  crates/ui-egui/src/lib.rs \
+                  crates/ui-egui/src/panels.rs \
+                  crates/ui-egui/src/mix_window.rs \
+                  crates/ui-egui/src/edit_window.rs \
+                  crates/ui-egui/src/toolbar.rs \
+                  crates/ui-egui/src/shortcuts.rs \
+                  crates/ui-egui/src/dialogs.rs \
+                  crates/ui-egui/src/menus.rs \
+                  crates/ui-egui/src/windows.rs \
+                  crates/engine/src/edit.rs \
+                  crates/engine/src/cmd/edit.rs
+          if git diff --cached --quiet; then
+            echo 'No source changes to persist.'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Sculpt DAW: integrate UI Pilot and crossfade editing sources'
+          git push origin HEAD:main
