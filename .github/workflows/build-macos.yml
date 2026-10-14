@@ -1,4 +1,4 @@
-name: Sculpt DAW - Mac Universal
+name: Sculpt DAW - Mac Universal - UI Pilot
 
 on:
   push:
@@ -46,10 +46,402 @@ jobs:
           echo 'Missing upstream source files restored for this build.'
           echo 'Note: source files must later be committed to SculptDAW permanently.'
 
+      - name: Apply Sculpt DAW UI pilot fixes (non-destructive)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYSCULPT'
+          #!/usr/bin/env python3
+          """Patch Sculpt DAW UI in a checked-out GitHub Actions workspace.
+          
+          This intentionally requires the exact source snippets from the tested 2026-10-14
+          baseline so a changed upstream source fails loudly instead of corrupting it.
+          """
+          from pathlib import Path
+          
+          
+          def patch(filename, replacements):
+              path = Path(filename)
+              data = path.read_text(encoding="utf-8")
+              for before, after in replacements:
+                  n = data.count(before)
+                  if n != 1:
+                      raise RuntimeError(f"{filename}: expected ONE occurrence, found {n}: {before[:100]!r}")
+                  data = data.replace(before, after, 1)
+              path.write_text(data, encoding="utf-8")
+              print(f"Sculpt UI patch: updated {filename} ({len(replacements)} changes)")
+          
+          
+          # Native macOS file dialog: enable selecting multiple audio files.
+          patch("crates/ui-egui/src/lib.rs", [
+              (
+                  '    pub pick_open: Option<Box<dyn Fn(&str, &[&str]) -> Option<String>>>,\n',
+                  '    pub pick_open: Option<Box<dyn Fn(&str, &[&str]) -> Option<String>>>,\n'
+                  '    pub pick_open_many: Option<Box<dyn Fn(&str, &[&str]) -> Option<Vec<String>>>>,\n',
+              )
+          ])
+          patch("apps/soundcraft/src/main.rs", [
+              (
+                  '            d.pick_file().map(|p| p.to_string_lossy().into_owned())\n        })),\n        pick_save:',
+                  '            d.pick_file().map(|p| p.to_string_lossy().into_owned())\n        })),\n'
+                  '        pick_open_many: Some(Box::new(|_purpose: &str, _exts: &[&str]| {\n'
+                  '            rfd::FileDialog::new()\n'
+                  '                .add_filter("Audio", &["wav", "wave", "bwf", "aif", "aiff", "aifc", "flac", "mp3", "ogg", "oga", "m4a", "aac", "mp4", "caf", "mkv", "webm"])\n'
+                  '                .pick_files()\n'
+                  '                .map(|files| files.into_iter().map(|p| p.to_string_lossy().into_owned()).collect())\n'
+                  '        })),\n'
+                  '        pick_save:',
+              )
+          ])
+          patch("crates/ui-egui/src/menus.rs", [
+              (
+                  '    if wants_dialog(id) && app.dialogs.open_for_command(&app.engine, id) {\n',
+                  '    // Sculpt: the native audio import picker supports selecting multiple files.\n'
+                  '    if id == "file.import_audio" {\n'
+                  '        if let Some(pick) = &app.services.pick_open_many {\n'
+                  '            if let Some(paths) = pick(id, &[]) {\n'
+                  '                let at = app.engine.session().edit.selection.start;\n'
+                  '                let mut imported = 0usize;\n'
+                  '                let mut failed = 0usize;\n'
+                  '                for file in paths {\n'
+                  '                    if app.run("file.import_audio", json!({"path": file, "at": at})).is_ok() {\n'
+                  '                        imported += 1;\n'
+                  '                    } else {\n'
+                  '                        failed += 1;\n'
+                  '                    }\n'
+                  '                }\n'
+                  '                app.ui.status = format!("Imported {imported} audio file(s)" );\n'
+                  '                if failed > 0 {\n'
+                  '                    app.ui.status.push_str(&format!("; {failed} failed"));\n'
+                  '                }\n'
+                  '            }\n'
+                  '            return;\n'
+                  '        }\n'
+                  '    }\n'
+                  '    if wants_dialog(id) && app.dialogs.open_for_command(&app.engine, id) {\n',
+              )
+          ])
+          
+          # Plugin windows appear immediately after selection, and offer one-shot native editor pop-up.
+          patch("crates/ui-egui/src/mix_window.rs", [
+              (
+                  '    let label = ins.as_ref().and_then(|i| plugin_info(&i.plugin)).map_or("", |p| p.short_name);\n',
+                  '    let mut bypass_clicked = false;\n'
+                  '    if let Some(current) = &ins {\n'
+                  '        let brect = Rect::from_min_max(pos2(r.min.x + 1.0, r.min.y + 1.0), pos2(r.min.x + 16.0, r.max.y - 1.0));\n'
+                  '        let toggle = ui.interact(brect, ui.id().with(("sculpt_insert_bypass", id.0, slot)), Sense::click());\n'
+                  '        ui.painter().circle_filled(brect.center(), 4.0, if current.bypass { t.text_dim } else { t.accent });\n'
+                  '        if toggle.on_hover_text("Bypass insert (on/off)").clicked() {\n'
+                  '            bypass_clicked = true;\n'
+                  '            let _ = app.run("mix.insert_bypass", json!({"track": id.0, "slot": slot}));\n'
+                  '        }\n'
+                  '    }\n'
+                  '    let label = ins.as_ref().and_then(|i| plugin_info(&i.plugin)).map_or("", |p| p.short_name);\n',
+              ),
+              (
+                  '    if resp.clicked() && ins.is_some() && !app.ui.plugin_windows.contains(&(id, slot)) {\n',
+                  '    if resp.clicked() && !bypass_clicked && ins.is_some() && !app.ui.plugin_windows.contains(&(id, slot)) {\n',
+              ),
+              (
+                  '                    let _ = app.run("mix.insert", json!({"track": id.0, "slot": slot, "plugin": p.id}));\n',
+                  '                    if app.run("mix.insert", json!({"track": id.0, "slot": slot, "plugin": p.id})).is_ok()\n'
+                  '                        && !app.ui.plugin_windows.contains(&(id, slot))\n'
+                  '                    {\n'
+                  '                        app.ui.plugin_windows.push((id, slot));\n'
+                  '                    }\n',
+              ),
+              (
+                  '    if let Some(plugin) = hosted_menus(ui, false)\n'
+                  '        && let Err(e) = app.run("mix.insert", json!({"track": id.0, "slot": slot, "plugin": plugin}))\n'
+                  '    {\n'
+                  '        app.ui.status = e;\n'
+                  '    }\n',
+                  '    if let Some(plugin) = hosted_menus(ui, false) {\n'
+                  '        match app.run("mix.insert", json!({"track": id.0, "slot": slot, "plugin": plugin})) {\n'
+                  '            Ok(_) => {\n'
+                  '                if !app.ui.plugin_windows.contains(&(id, slot)) {\n'
+                  '                    app.ui.plugin_windows.push((id, slot));\n'
+                  '                }\n'
+                  '            }\n'
+                  '            Err(e) => app.ui.status = e,\n'
+                  '        }\n'
+                  '    }\n',
+              ),
+              (
+                  '    if let Some(plugin) = picked\n'
+                  '        && let Err(e) = app.run("mix.instrument", json!({"track": id.0, "plugin": plugin}))\n'
+                  '    {\n'
+                  '        app.ui.status = e;\n'
+                  '    }\n',
+                  '    if let Some(plugin) = picked {\n'
+                  '        match app.run("mix.instrument", json!({"track": id.0, "plugin": plugin})) {\n'
+                  '            Ok(_) => {\n'
+                  '                if !app.ui.plugin_windows.contains(&(id, slot)) {\n'
+                  '                    app.ui.plugin_windows.push((id, slot));\n'
+                  '                }\n'
+                  '            }\n'
+                  '            Err(e) => app.ui.status = e,\n'
+                  '        }\n'
+                  '    }\n',
+              ),
+          ])
+          patch("crates/ui-egui/src/panels.rs", [
+              (
+                  '        let Some(info) = crate::mix_window::plugin_info(&ins.plugin) else { continue };\n',
+                  '        let Some(info) = crate::mix_window::plugin_info(&ins.plugin) else { continue };\n'
+                  '        // Auto-show a hosted VST3/CLAP/AU editor once the audio engine has prepared it.\n'
+                  '        if soundcraft_mix::is_third_party(&ins.plugin) {\n'
+                  '            let key = egui::Id::new(("sculpt_native_editor_once", tid.0, slot, &ins.plugin));\n'
+                  '            let attempted = ctx.data(|d| d.get_temp::<bool>(key).unwrap_or(false));\n'
+                  '            if !attempted\n'
+                  '                && let Some(player) = &app.player\n'
+                  '                && player.has_editor(tid, slot)\n'
+                  '            {\n'
+                  '                if let Err(e) = player.open_editor(tid, slot) {\n'
+                  '                    app.ui.status = format!("{}: {e}", info.name);\n'
+                  '                }\n'
+                  '                ctx.data_mut(|d| d.insert_temp(key, true));\n'
+                  '            }\n'
+                  '        }\n',
+              )
+          ])
+          
+          # Expose Edit-window insert slots and I/O labels as actual interaction surfaces.
+          patch("crates/ui-egui/src/edit_window.rs", [
+              (
+                  '                text(ui, item(0), &format!("in: {}", route(&track.mixer.input)), t.text);\n',
+                  '                let rr = item(0);\n'
+                  '                text(ui, rr, &format!("in: {}", route(&track.mixer.input)), t.text);\n'
+                  '                if ui.interact(rr, ui.id().with(("sculpt_edit_io_in", track.id.0)), Sense::click()).on_hover_text("Open I/O setup").clicked() {\n'
+                  '                    app.ui.show_io_setup = true;\n'
+                  '                }\n',
+              ),
+              (
+                  '                text(ui, item(1), &format!("out: {}", route(&track.mixer.output)), t.text);\n',
+                  '                let rr = item(1);\n'
+                  '                text(ui, rr, &format!("out: {}", route(&track.mixer.output)), t.text);\n'
+                  '                if ui.interact(rr, ui.id().with(("sculpt_edit_io_out", track.id.0)), Sense::click()).on_hover_text("Open I/O setup").clicked() {\n'
+                  '                    app.ui.show_io_setup = true;\n'
+                  '                }\n',
+              ),
+              (
+                  '                    .and_then(|x| soundcraft_dsp::plugin_info(&x.plugin).map(|p| p.name))\n',
+                  '                    .and_then(|x| crate::mix_window::plugin_info(&x.plugin).map(|p| p.name))\n',
+              ),
+              (
+                  '                text(ui, item(i), name, t.text);\n',
+                  '                let slot = off + i;\n'
+                  '                let rr = item(i);\n'
+                  '                text(ui, rr, name, t.text);\n'
+                  '                let occupied = track.mixer.inserts.get(slot).is_some_and(|x| x.is_some());\n'
+                  '                let resp = ui.interact(rr, ui.id().with(("sculpt_edit_insert", track.id.0, slot)), Sense::click());\n'
+                  '                if resp.clicked() && occupied && !app.ui.plugin_windows.contains(&(track.id, slot)) {\n'
+                  '                    app.ui.plugin_windows.push((track.id, slot));\n'
+                  '                }\n'
+                  '                let popup = if occupied { egui::Popup::context_menu(&resp) } else { egui::Popup::menu(&resp) };\n'
+                  '                popup.show(|ui| crate::mix_window::plugin_menu(app, ui, track.id, slot, occupied));\n',
+              ),
+              (
+                  '        if (origin.x - xs).abs() < 6.0 {\n',
+                  '        if (origin.x - xs).abs() < 10.0 {\n',
+              ),
+              (
+                  '        } else if (origin.x - xe).abs() < 6.0 {\n',
+                  '        } else if (origin.x - xe).abs() < 10.0 {\n',
+              ),
+          ])
+          patch("crates/ui-egui/src/toolbar.rs", [
+              (
+                  '            let bracket = Rect::from_min_max(pos2(bx0 - 2.0, r.min.y + 1.0), pos2(bx1 + 2.0, r.min.y + 5.0));\n'
+                  '            let resp = ui.interact(bracket.expand2(vec2(0.0, 2.0)), ui.id().with("smart"), Sense::click());\n',
+                  '            let bracket = Rect::from_min_max(pos2(bx0 - 2.0, r.min.y + 1.0), pos2(bx1 + 2.0, r.min.y + 9.0));\n'
+                  '            let resp = ui.interact(bracket.expand2(vec2(0.0, 5.0)), ui.id().with("smart"), Sense::click());\n',
+              )
+          ])
+          
+          # Tab to transient: selected clip-only workflows work, Shift+Tab goes backwards.
+          patch("crates/ui-egui/src/shortcuts.rs", [
+              (
+                  '        Key::Tab if plain || m.alt => {\n',
+                  '        Key::Tab if plain || m.alt || (m.shift && !m.command && !m.ctrl) => {\n',
+              ),
+              (
+                  '            let back = m.alt;\n'
+                  '            if s.edit.tab_to_transient\n'
+                  '                && !back\n'
+                  '                && let Some(t) = s.edit.selected_tracks.first().copied()\n'
+                  '            {\n'
+                  '                let r = soundcraft_time::Range::new(at + 1, s.content_end());\n'
+                  '                if let Some(n) = soundcraft_engine::io::transients_in(s, t, r, 0.5).into_iter().find(|x| *x > at + 64) {\n'
+                  '                    let _ = app.run("transport.locate", json!({"at": n}));\n'
+                  '                    return true;\n'
+                  '                }\n'
+                  '            }\n',
+                  '            let back = m.alt || m.shift;\n'
+                  '            let active_track = s.edit.selected_tracks.first().copied().or_else(|| {\n'
+                  '                s.edit.selected_clips.first().and_then(|c| s.find_clip(*c).map(|(t, _)| t.id))\n'
+                  '            });\n'
+                  '            if s.edit.tab_to_transient\n'
+                  '                && let Some(t) = active_track\n'
+                  '            {\n'
+                  '                let start = if back { 0 } else { at.saturating_add(1) };\n'
+                  '                let end = if back { at } else { s.content_end() };\n'
+                  '                let r = soundcraft_time::Range::new(start, end);\n'
+                  '                let points = soundcraft_engine::io::transients_in(s, t, r, 0.4);\n'
+                  '                let found = if back {\n'
+                  '                    points.into_iter().rev().find(|x| *x < at.saturating_sub(64))\n'
+                  '                } else {\n'
+                  '                    points.into_iter().find(|x| *x > at + 64)\n'
+                  '                };\n'
+                  '                if let Some(n) = found {\n'
+                  '                    let _ = app.run("transport.locate", json!({"at": n}));\n'
+                  '                    return true;\n'
+                  '                }\n'
+                  '            }\n',
+              ),
+          ])
+          
+          print("Sculpt UI patch complete")
+          
+          # Sculpt I/O Setup v1: three functional tabs rather than a tiny mixed list.
+          path = Path('crates/ui-egui/src/windows.rs')
+          content = path.read_text(encoding='utf-8')
+          start_marker = 'pub fn io_setup(app: &mut SoundApp, ctx: &egui::Context) {'
+          end_marker = '/// Setup › Keyboard Shortcuts.'
+          if content.count(start_marker) != 1 or content.count(end_marker) != 1:
+              raise RuntimeError('Cannot locate I/O Setup boundaries')
+          a = content.index(start_marker)
+          b = content.index(end_marker, a)
+          new_io = r'''pub fn io_setup(app: &mut SoundApp, ctx: &egui::Context) {
+              let mut open = app.ui.show_io_setup;
+              win(ctx, &mut open, "Sculpt DAW · I/O Setup", vec2(690.0, 490.0), |ui| {
+                  let tab_key = egui::Id::new("sculpt_io_setup_tab");
+                  let mut tab: String = ui.ctx().data(|d| d.get_temp(tab_key)).unwrap_or_else(|| "Output".into());
+                  ui.horizontal(|ui| {
+                      for page in ["Input", "Output", "Bus"] {
+                          if ui.selectable_label(tab == page, page.to_uppercase()).clicked() {
+                              tab = page.to_string();
+                          }
+                      }
+                  });
+                  ui.ctx().data_mut(|d| d.insert_temp(tab_key, tab.clone()));
+                  ui.separator();
+                  match tab.as_str() {
+                      "Input" => {
+                          ui.heading("Hardware Inputs");
+                          ui.label("Audio inputs are provided by the active CoreAudio interface.");
+                          ui.label("Per-channel input patching is not implemented in this version.");
+                          if ui.button("Open Playback Engine / Hardware…").clicked() {
+                              app.ui.show_playback_engine = true;
+                          }
+                      }
+                      "Output" => {
+                          ui.heading("Output Paths");
+                          ui.label("Main output format");
+                          let main = app.engine.session().main_format();
+                          egui::ComboBox::from_id_salt("sculpt_main_output_format")
+                              .selected_text(main.label())
+                              .show_ui(ui, |ui| {
+                                  for f in soundcraft_model::ChannelFormat::ALL.into_iter().filter(|f| (2..=16).contains(&f.channels())) {
+                                      if ui.selectable_label(f == main, f.label()).clicked() && f != main {
+                                          let _ = app.run("setup.main_format", json!({"format": f.label()}));
+                                      }
+                                  }
+                              });
+                          ui.separator();
+                          ui.horizontal(|ui| {
+                              ui.strong("Path");
+                              ui.add_space(240.0);
+                              ui.strong("Hardware channels");
+                          });
+                          let paths = app.engine.session().outputs.clone();
+                          egui::ScrollArea::vertical().max_height(250.0).show(ui, |ui| {
+                              for p in paths {
+                                  ui.horizontal(|ui| {
+                                      let key = egui::Id::new(("sculpt_output_name", &p.name));
+                                      let mut name: String = ui.ctx().data(|d| d.get_temp(key)).unwrap_or_else(|| p.name.clone());
+                                      let response = ui.add(egui::TextEdit::singleline(&mut name).desired_width(250.0));
+                                      ui.ctx().data_mut(|d| d.insert_temp(key, name.clone()));
+                                      if response.lost_focus() && !name.trim().is_empty() && name != p.name {
+                                          let _ = app.run("setup.io", json!({"action": "rename_output", "name": p.name, "new_name": name}));
+                                      }
+                                      ui.label(format!("{}–{} · {}", p.first_channel + 1, p.first_channel + p.format.channels() as u16, p.format.label()));
+                                      if ui.small_button("Delete").clicked() {
+                                          let _ = app.run("setup.io", json!({"action": "delete_output", "name": p.name}));
+                                      }
+                                  });
+                              }
+                          });
+                          if ui.button("+ Add Stereo Output Path").clicked() {
+                              let paths = &app.engine.session().outputs;
+                              let first = paths.iter().map(|p| p.first_channel as usize + p.format.channels()).max().unwrap_or(0);
+                              let name = format!("Out {}-{}", first + 1, first + 2);
+                              let _ = app.run("setup.io", json!({"action": "create_output", "name": name, "first_channel": first, "format": "stereo"}));
+                          }
+                      }
+                      _ => {
+                          ui.heading("Internal Busses");
+                          ui.label("Rename a bus by editing its label, or create a stereo bus.");
+                          let busses: Vec<(String, String)> = app.engine.session().busses.iter().map(|b| (b.name.clone(), b.format.label().to_string())).collect();
+                          egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
+                              for (name, fmt) in busses {
+                                  ui.horizontal(|ui| {
+                                      let key = egui::Id::new(("sculpt_bus_name", &name));
+                                      let mut edit: String = ui.ctx().data(|d| d.get_temp(key)).unwrap_or_else(|| name.clone());
+                                      let response = ui.add(egui::TextEdit::singleline(&mut edit).desired_width(250.0));
+                                      ui.ctx().data_mut(|d| d.insert_temp(key, edit.clone()));
+                                      if response.lost_focus() && !edit.trim().is_empty() && edit != name {
+                                          let _ = app.run("setup.io", json!({"action": "rename_bus", "name": name, "new_name": edit}));
+                                      }
+                                      ui.label(fmt);
+                                      if ui.small_button("Delete").clicked() {
+                                          let _ = app.run("setup.io", json!({"action": "delete_bus", "name": name}));
+                                      }
+                                  });
+                              }
+                          });
+                          if ui.button("+ New Stereo Bus").clicked() {
+                              let n = app.engine.session().busses.len() + 1;
+                              let _ = app.run("setup.io", json!({"action": "create_bus", "name": format!("Bus {n}"), "format": "stereo"}));
+                          }
+                      }
+                  }
+              });
+              app.ui.show_io_setup = open;
+          }
+          
+          '''
+          content = content[:a] + new_io + content[b:]
+          path.write_text(content, encoding='utf-8')
+          print('Sculpt UI patch: rebuilt I/O Setup tabs')
+          
+          # New sessions: show the essential Pro Tools-style I/O and insert headers immediately.
+          patch("apps/soundcraft/src/main.rs", [
+              (
+                  '            let mut app = SoundApp::new(engine, player, services());\n',
+                  '            let mut app = SoundApp::new(engine, player, services());\n'
+                  '            for (flag, cmd) in [\n'
+                  '                ("edit_view.io", "view.edit_io"),\n'
+                  '                ("edit_view.inserts_ae", "view.edit_inserts_ae"),\n'
+                  '                ("edit_view.inserts_fj", "view.edit_inserts_fj"),\n'
+                  '            ] {\n'
+                  '                if !app.engine.session().edit.flag(flag) {\n'
+                  '                    let _ = app.run(cmd, serde_json::json!({}));\n'
+                  '                }\n'
+                  '            }\n',
+              ),
+          ])
+          PYSCULPT
+          git diff --stat
+
       - name: Install Rust stable with both macOS targets
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Validate Sculpt UI patches compile before release build
+        shell: bash
+        run: cargo check --locked --target x86_64-apple-darwin -p sculpt-daw
 
       - name: Build the universal app and CLI
         run: bash sculpt/build-macos.sh
@@ -67,7 +459,7 @@ jobs:
       - name: Upload Sculpt DAW app
         uses: actions/upload-artifact@v4
         with:
-          name: Sculpt-DAW-Mac-Universal
+          name: Sculpt-DAW-Mac-UI-Pilot
           path: |
             dist/sculpt/Sculpt_DAW_0.4.0_Mac_Universal.zip
             dist/sculpt/Sculpt_DAW_0.4.0_Mac_Universal.zip.sha256
