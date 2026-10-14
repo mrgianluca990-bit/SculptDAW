@@ -21,6 +21,31 @@ jobs:
       - name: Check out Sculpt DAW
         uses: actions/checkout@v4
 
+      # Some folders were omitted when the source archive was uploaded through
+      # GitHub's browser interface. Restore ONLY missing files from the exact
+      # upstream SoundCraft commit the Sculpt patch was based on.
+      - name: Check out pinned SoundCraft source for missing files
+        uses: actions/checkout@v4
+        with:
+          repository: storytold/soundcraft
+          ref: 6cf896e76c0ec82a11bf2494f209cfe7c8507f74
+          path: soundcraft-upstream
+          persist-credentials: false
+
+      - name: Restore missing Rust source files without overwriting Sculpt
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p crates/dsp/src xtask/src
+          rsync -a --ignore-existing soundcraft-upstream/crates/dsp/src/ crates/dsp/src/
+          if [ ! -f xtask/src/main.rs ]; then
+            cp soundcraft-upstream/xtask/src/main.rs xtask/src/main.rs
+          fi
+          test -s crates/dsp/src/lib.rs
+          test -s xtask/src/main.rs
+          echo 'Missing upstream source files restored for this build.'
+          echo 'Note: source files must later be committed to SculptDAW permanently.'
+
       - name: Install Rust stable with both macOS targets
         uses: dtolnay/rust-toolchain@stable
         with:
