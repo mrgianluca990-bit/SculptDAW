@@ -1,4 +1,4 @@
-name: Sculpt DAW - Mac Universal - UI Pilot
+name: Sculpt DAW - Mac Universal - UI Pilot v2
 
 on:
   push:
@@ -53,13 +53,13 @@ jobs:
           python3 - <<'PYSCULPT'
           #!/usr/bin/env python3
           """Patch Sculpt DAW UI in a checked-out GitHub Actions workspace.
-          
+
           This intentionally requires the exact source snippets from the tested 2026-10-14
           baseline so a changed upstream source fails loudly instead of corrupting it.
           """
           from pathlib import Path
-          
-          
+
+
           def patch(filename, replacements):
               path = Path(filename)
               data = path.read_text(encoding="utf-8")
@@ -70,8 +70,8 @@ jobs:
                   data = data.replace(before, after, 1)
               path.write_text(data, encoding="utf-8")
               print(f"Sculpt UI patch: updated {filename} ({len(replacements)} changes)")
-          
-          
+
+
           # Native macOS file dialog: enable selecting multiple audio files.
           patch("crates/ui-egui/src/lib.rs", [
               (
@@ -121,7 +121,7 @@ jobs:
                   '    if wants_dialog(id) && app.dialogs.open_for_command(&app.engine, id) {\n',
               )
           ])
-          
+
           # Plugin windows appear immediately after selection, and offer one-shot native editor pop-up.
           patch("crates/ui-egui/src/mix_window.rs", [
               (
@@ -205,7 +205,7 @@ jobs:
                   '        }\n',
               )
           ])
-          
+
           # Expose Edit-window insert slots and I/O labels as actual interaction surfaces.
           patch("crates/ui-egui/src/edit_window.rs", [
               (
@@ -258,7 +258,7 @@ jobs:
                   '            let resp = ui.interact(bracket.expand2(vec2(0.0, 5.0)), ui.id().with("smart"), Sense::click());\n',
               )
           ])
-          
+
           # Tab to transient: selected clip-only workflows work, Shift+Tab goes backwards.
           patch("crates/ui-egui/src/shortcuts.rs", [
               (
@@ -300,9 +300,9 @@ jobs:
                   '            }\n',
               ),
           ])
-          
+
           print("Sculpt UI patch complete")
-          
+
           # Sculpt I/O Setup v1: three functional tabs rather than a tiny mixed list.
           path = Path('crates/ui-egui/src/windows.rs')
           content = path.read_text(encoding='utf-8')
@@ -409,12 +409,12 @@ jobs:
               });
               app.ui.show_io_setup = open;
           }
-          
+
           '''
           content = content[:a] + new_io + content[b:]
           path.write_text(content, encoding='utf-8')
           print('Sculpt UI patch: rebuilt I/O Setup tabs')
-          
+
           # New sessions: show the essential Pro Tools-style I/O and insert headers immediately.
           patch("apps/soundcraft/src/main.rs", [
               (
@@ -431,6 +431,177 @@ jobs:
                   '            }\n',
               ),
           ])
+
+
+          # Sculpt DAW UI pilot v2: single native editor, Edit bypasses, multi-import in any dialog.
+          # These replacements run AFTER the first-generation pilot transformations.
+
+          # The first pilot requested BOTH a generic parameter window and a native editor,
+          # and remembered editor-open attempts forever. Treat third-party plugin window
+          # entries as single-use open requests. Render a generic fallback only when no
+          # native editor has become available, not in addition to the native editor.
+          panel_file = Path('crates/ui-egui/src/panels.rs')
+          panel = panel_file.read_text(encoding='utf-8')
+          start_marker = '        // Auto-show a hosted VST3/CLAP/AU editor once the audio engine has prepared it.\n'
+          end_marker = '        let place = if instrument { '
+          if panel.count(start_marker) != 1 or panel.count(end_marker) != 1:
+              raise RuntimeError('Sculpt editor patch: expected pilot native-editor block not found exactly once')
+          a = panel.index(start_marker)
+          b = panel.index(end_marker, a)
+          replacement = '''        // Sculpt: a hosted plugin should display its native GUI OR a generic fallback,
+                  // never both. A click on an insert is an open request, not a persistent window.
+                  let native_editor = soundcraft_mix::is_third_party(&ins.plugin);
+                  let fallback_key = egui::Id::new(("sculpt_native_fallback", tid.0, slot));
+                  let pending_key = egui::Id::new(("sculpt_native_pending", tid.0, slot));
+                  if native_editor {
+                      let fallback = ctx.data(|d| d.get_temp::<bool>(fallback_key).unwrap_or(false));
+                      if !fallback {
+                          if let Some(player) = &app.player {
+                              if player.has_editor(tid, slot) {
+                                  // A closed native editor is reopened on *every* new insert click.
+                                  // Do not keep a generic window around after opening the native one.
+                                  ctx.data_mut(|d| d.remove::<f64>(pending_key));
+                                  if player.editor_open(tid, slot) {
+                                      continue;
+                                  }
+                                  match player.open_editor(tid, slot) {
+                                      Ok(()) => continue,
+                                      Err(e) => {
+                                          app.ui.status = format!("{} native editor: {e}", info.name);
+                                          ctx.data_mut(|d| d.insert_temp(fallback_key, true));
+                                      }
+                                  }
+                              } else {
+                                  // The audio thread asynchronously prepares hosted plugin instances.
+                                  // Give it time before deciding this particular plugin has no GUI.
+                                  let now = ctx.input(|i| i.time);
+                                  let started = ctx.data(|d| d.get_temp::<f64>(pending_key));
+                                  let since = started.unwrap_or(now);
+                                  if started.is_none() {
+                                      ctx.data_mut(|d| d.insert_temp(pending_key, now));
+                                  }
+                                  if now - since < 2.0 {
+                                      keep.push((tid, slot));
+                                      ctx.request_repaint_after_secs(0.05);
+                                      continue;
+                                  }
+                                  ctx.data_mut(|d| d.insert_temp(fallback_key, true));
+                              }
+                          }
+                      }
+                  }
+          '''
+          panel = panel[:a] + replacement + panel[b:]
+          # When a user explicitly requests the native editor from the generic fallback,
+          # remove the fallback marker so the generic window disappears next frame.
+          needle = '''                            } else if let Err(e) = p.open_editor(tid, slot) {
+                                          app.ui.status = format!("{}: {e}", info.name);
+                                      }
+          '''
+          substitute = '''                            } else {
+                                          match p.open_editor(tid, slot) {
+                                              Ok(()) => { ctx.data_mut(|d| { d.remove::<bool>(fallback_key); }); }
+                                              Err(e) => { app.ui.status = format!("{}: {e}", info.name); }
+                                          }
+                                      }
+          '''
+          if panel.count(needle) != 1:
+              raise RuntimeError('Sculpt editor patch: expected native editor button not found')
+          panel = panel.replace(needle, substitute, 1)
+          # The native popup has a separate close button. Clear fallback bookkeeping when
+          # the user closes the generic window so a new click always retries the native GUI.
+          needle = '''        if open {
+                      keep.push((tid, slot));
+                  }
+          '''
+          substitute = '''        if open {
+                      keep.push((tid, slot));
+                  } else {
+                      ctx.data_mut(|d| {
+                          d.remove::<f64>(pending_key);
+                          d.remove::<bool>(fallback_key);
+                      });
+                  }
+          '''
+          if panel.count(needle) != 1:
+              raise RuntimeError('Sculpt editor patch: expected end-of-window block not found')
+          panel = panel.replace(needle, substitute, 1)
+          panel_file.write_text(panel, encoding='utf-8')
+          print('Sculpt UI v2: native-only plugin editors, close/reopen, generic fallback')
+
+          # Add an actual bypass touch target to every occupied Edit-window insert.
+          # Do not place it beneath the insert name hit target: separate rectangles prevent
+          # the name click from consuming the bypass button.
+          patch('crates/ui-egui/src/edit_window.rs', [
+              (
+                  '''                let resp = ui.interact(rr, ui.id().with(("sculpt_edit_insert", track.id.0, slot)), Sense::click());
+                          if resp.clicked() && occupied && !app.ui.plugin_windows.contains(&(track.id, slot)) {
+          ''',
+                  '''                let name_rect = Rect::from_min_max(rr.min, pos2(rr.max.x - 18.0, rr.max.y));
+                          let resp = ui.interact(name_rect, ui.id().with(("sculpt_edit_insert", track.id.0, slot)), Sense::click());
+                          if let Some(insert) = track.mixer.inserts.get(slot).and_then(|i| i.as_ref()) {
+                              let bypass_rect = Rect::from_min_max(pos2(rr.max.x - 17.0, rr.min.y), rr.max);
+                              let by_fill = if insert.bypass { t.insert_bypass } else { t.insert_on };
+                              ui.painter().rect_filled(bypass_rect, 2.0, by_fill);
+                              ui.painter().text(bypass_rect.center(), Align2::CENTER_CENTER, "B", regular(9.0), t.text);
+                              if ui.interact(bypass_rect, ui.id().with(("sculpt_edit_insert_bypass", track.id.0, slot)), Sense::click())
+                                  .on_hover_text(if insert.bypass { "Enable plugin" } else { "Bypass plugin" })
+                                  .clicked()
+                              {
+                                  let _ = app.run("mix.insert_bypass", json!({"track": track.id.0, "slot": slot}));
+                              }
+                          }
+                          if resp.clicked() && occupied && !app.ui.plugin_windows.contains(&(track.id, slot)) {
+          '''
+              ),
+          ])
+          print('Sculpt UI v2: bypass buttons in Edit insert rows')
+
+          # Some invocation paths still open the manual Import Audio path prompt. Make its
+          # Browse action a native multi-select as well, so the behavior is consistent
+          # regardless of menu, keyboard shortcut, or direct dialog.
+          patch('crates/ui-egui/src/dialogs.rs', [
+              (
+                  '''                    ui.add(egui::TextEdit::singleline(path).desired_width(420.0));
+                              if let Some(pick) = &app.services.pick_open
+          ''',
+                  '''                    ui.add(egui::TextEdit::singleline(path).desired_width(420.0));
+                              if cmd == "file.import_audio"
+                                  && let Some(pick) = &app.services.pick_open_many
+                                  && ui.button("Browse multiple audio files…").clicked()
+                                  && let Some(paths) = pick(cmd, &[])
+                              {
+                                  let at = app.engine.session().edit.selection.start;
+                                  let mut imported = 0usize;
+                                  let mut failed = 0usize;
+                                  for file in paths {
+                                      if app.run("file.import_audio", json!({"path": file, "at": at})).is_ok() {
+                                          imported += 1;
+                                      } else {
+                                          failed += 1;
+                                      }
+                                  }
+                                  app.ui.status = format!("Imported {imported} audio file(s)");
+                                  if failed > 0 {
+                                      app.ui.status.push_str(&format!("; {failed} failed"));
+                                  }
+                                  // Files were imported immediately; do not ask for an extra OK click.
+                                  keep = false;
+                              }
+                              if let Some(pick) = &app.services.pick_open
+          '''
+              ),
+              (
+                  '''                        && key != "dir"
+                                  && ui.button("Browse…").clicked()
+          ''',
+                  '''                        && key != "dir"
+                                  && cmd != "file.import_audio"
+                                  && ui.button("Browse…").clicked()
+          '''
+              ),
+          ])
+          print('Sculpt UI v2: native multi-file browsing in Import Audio dialog')
           PYSCULPT
           git diff --stat
 
@@ -459,7 +630,7 @@ jobs:
       - name: Upload Sculpt DAW app
         uses: actions/upload-artifact@v4
         with:
-          name: Sculpt-DAW-Mac-UI-Pilot
+          name: Sculpt-DAW-Mac-UI-Pilot-v2
           path: |
             dist/sculpt/Sculpt_DAW_0.4.0_Mac_Universal.zip
             dist/sculpt/Sculpt_DAW_0.4.0_Mac_Universal.zip.sha256
