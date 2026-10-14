@@ -17,7 +17,7 @@ APP="$WORK/Sculpt DAW.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$ROOT/dist/sculpt"
 for bin in sculpt-daw soundcraft-cli; do
   lipo -create "$CARGO_TARGET_DIR/aarch64-apple-darwin/release/$bin" "$CARGO_TARGET_DIR/x86_64-apple-darwin/release/$bin" -output "$APP/Contents/MacOS/$bin"
-  lipo -verify_arch arm64 x86_64 "$APP/Contents/MacOS/$bin"
+  lipo "$APP/Contents/MacOS/$bin" -verify_arch arm64 x86_64
   otool -L "$APP/Contents/MacOS/$bin"
 done
 ICONSET="$WORK/Sculpt.iconset"
