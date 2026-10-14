@@ -1,0 +1,50 @@
+name: Sculpt DAW - Mac Universal
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sculpt-macos-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-macos:
+    name: Build Sculpt DAW for macOS (Apple Silicon + Intel)
+    runs-on: macos-15-intel
+    timeout-minutes: 120
+    steps:
+      - name: Check out Sculpt DAW
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable with both macOS targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Build the universal app and CLI
+        run: bash sculpt/build-macos.sh
+
+      - name: Verify downloadable ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP="dist/sculpt/Sculpt_DAW_0.4.0_Mac_Universal.zip"
+          test -s "$ZIP"
+          shasum -a 256 -c "$ZIP.sha256"
+          unzip -t "$ZIP"
+          unzip -l "$ZIP" | grep -F 'Sculpt DAW.app/Contents/MacOS/sculpt-daw'
+
+      - name: Upload Sculpt DAW app
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sculpt-DAW-Mac-Universal
+          path: |
+            dist/sculpt/Sculpt_DAW_0.4.0_Mac_Universal.zip
+            dist/sculpt/Sculpt_DAW_0.4.0_Mac_Universal.zip.sha256
+          if-no-files-found: error
+          retention-days: 30
