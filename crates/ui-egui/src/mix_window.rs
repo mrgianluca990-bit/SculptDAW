@@ -492,25 +492,9 @@ pub fn plugin_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, slot: usize, oc
         }
         ui.separator();
     }
-    let mut cats: Vec<soundcraft_dsp::Category> = Vec::new();
-    for p in soundcraft_dsp::plugins() {
-        if !p.is_instrument && !cats.contains(&p.category) {
-            cats.push(p.category);
-        }
-    }
-    for c in cats {
-        ui.menu_button(format!("{c:?}"), |ui| {
-            for p in soundcraft_dsp::plugins().iter().filter(|p| p.category == c && !p.is_instrument) {
-                if ui.button(p.name).clicked() {
-                    if app.run("mix.insert", json!({"track": id.0, "slot": slot, "plugin": p.id})).is_ok()
-                        && !app.ui.plugin_windows.contains(&(id, slot))
-                    {
-                        app.ui.plugin_windows.push((id, slot));
-                    }
-                }
-            }
-        });
-    }
+    // SCULPT_CORE_VST3_AU_ONLY_V1: limited, auditable native-plugin interface.
+    // Built-in DSP remains compiled to preserve legacy project files.
+    ui.label("Effects · VST3 / Audio Units");
     if let Some(plugin) = hosted_menus(ui, false) {
         match app.run("mix.insert", json!({"track": id.0, "slot": slot, "plugin": plugin})) {
             Ok(_) => {
@@ -546,13 +530,7 @@ pub fn instrument_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId) {
         ui.separator();
     }
     let mut picked = None;
-    ui.menu_button("Built-in", |ui| {
-        for p in soundcraft_dsp::plugins().iter().filter(|p| p.is_instrument) {
-            if ui.button(p.name).clicked() {
-                picked = Some(p.id.to_string());
-            }
-        }
-    });
+    ui.label("Instruments · VST3 / Audio Units");
     if let Some(p) = hosted_menus(ui, true) {
         picked = Some(p);
     }
@@ -579,12 +557,6 @@ struct MenuPlugin {
 /// id picked. Each format is scanned the first time its submenu opens, then cached by its host.
 fn hosted_menus(ui: &mut Ui, instruments: bool) -> Option<String> {
     let mut picked = None;
-    ui.menu_button("CLAP", |ui| {
-        let list = soundcraft_clap_host::scan().into_iter().filter(|d| d.is_instrument == instruments);
-        if let Some(p) = vendor_menus(ui, list.map(|d| MenuPlugin { id: d.id, name: d.name, vendor: d.vendor }).collect(), "No CLAP plugins found") {
-            picked = Some(p);
-        }
-    });
     ui.menu_button("VST3", |ui| {
         let list = soundcraft_vst3_host::scan().into_iter().filter(|d| d.is_instrument == instruments);
         if let Some(p) = vendor_menus(ui, list.map(|d| MenuPlugin { id: d.id, name: d.name, vendor: d.vendor }).collect(), "No VST3 plugins found") {
@@ -979,5 +951,24 @@ mod tests {
         assert_eq!(parse_pan("R25"), Some(0.25));
         assert_eq!(parse_pan("0.5"), Some(0.5));
         assert_eq!(parse_pan("center"), None);
+    }
+}
+
+#[cfg(test)]
+mod sculpt_plugin_core_tests {
+    // Checks that the GUI won't regress into the legacy broad plugin picker.
+    // VST3 & AU hosts are tested separately with real fixture/system plugins.
+    #[test]
+    fn only_vst3_and_audio_units_are_visible() {
+        let src = include_str!("mix_window.rs");
+        let menu = &src[src.find("pub fn plugin_menu(").unwrap()..src.find("fn vendor_menus(").unwrap()];
+        let hosted = &src[src.find("fn hosted_menus(").unwrap()..src.find("fn vendor_menus(").unwrap()];
+        assert!(hosted.contains("menu_button(\"VST3\""));
+        assert!(hosted.contains("menu_button(\"Audio Units\""));
+        assert!(!hosted.contains("menu_button(\"CLAP\""));
+        assert!(!menu.contains("soundcraft_dsp::plugins()"));
+        assert!(!menu.contains("menu_button(\"Built-in\""));
+        assert!(menu.contains("mix.insert_bypass"));
+        assert!(menu.contains("mix.insert_remove"));
     }
 }

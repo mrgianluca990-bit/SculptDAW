@@ -1,0 +1,28 @@
+# Sculpt DAW Core — limited, testable feature surface (v0.1)
+# Add ONE validated menu path at a time, AFTER successful real-world testing.
+# These entries are test candidates, not an assertion that all functions are approved.
+File > New...
+File > Open > Session...
+File > Close Session
+File > Save Session
+File > Save Session As...
+File > Import > Audio...
+Edit > Can't Undo
+Edit > Can't Redo
+Edit > Cut
+Edit > Copy
+Edit > Paste
+Edit > Clear
+Edit > Separate > At Selection
+Edit > Fades > Create...
+Edit > Fades > Delete
+Track > New...
+Track > Delete
+View > Mix Window Views > Inserts A-E
+View > Mix Window Views > Sends A-E
+View > Mix Window Views > I/O
+View > Edit Window Views > Inserts A-E
+View > Edit Window Views > I/O
+Window > Edit
+Window > Mix
+Window > Transport

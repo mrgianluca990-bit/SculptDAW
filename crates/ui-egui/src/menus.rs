@@ -194,16 +194,45 @@ fn insert_path(roots: &mut Vec<MenuNode>, line: &str) {
     }
 }
 
+// SCULPT_CORE_MENU_V1: small, explicit QA surface; full SoundCraft commands stay in the engine.
+// To promote a feature, edit ONLY sculpt/qa-core-menu.txt after real-world testing.
+const SCULPT_CORE_MENU: &str = include_str!("../../../sculpt/qa-core-menu.txt");
+
 pub fn tree() -> Vec<MenuNode> {
     let mut roots: Vec<MenuNode> = Vec::new();
-    for line in catalog::catalog() {
+    for line in SCULPT_CORE_MENU.lines().map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+    {
         insert_path(&mut roots, line);
     }
-    insert_path(&mut roots, "Window > Reset Panel Layout");
-    for (path, _) in MENU_WINDOWS {
-        insert_path(&mut roots, path);
-    }
     roots
+}
+
+#[cfg(test)]
+mod sculpt_core_menu_tests {
+    use super::*;
+
+    #[test]
+    fn only_explicit_core_items_are_displayed() {
+        let allowed: Vec<&str> = SCULPT_CORE_MENU.lines().map(str::trim)
+            .filter(|p| !p.is_empty() && !p.starts_with('#')).collect();
+        assert!((12..=45).contains(&allowed.len()), "keep the core UI intentionally small");
+        assert!(allowed.iter().all(|p| catalog::catalog().iter().any(|s| s == p)),
+            "every core entry must exist in the original menu catalog");
+        fn leaves(nodes: &[MenuNode], out: &mut Vec<String>) {
+            for node in nodes {
+                if node.children.is_empty() { out.push(node.path.clone()); }
+                else { leaves(&node.children, out); }
+            }
+        }
+        let mut actual = Vec::new();
+        leaves(&tree(), &mut actual);
+        assert_eq!(actual.len(), allowed.len());
+        for path in allowed { assert!(actual.iter().any(|s| s == path), "missing: {path}"); }
+        assert!(!actual.iter().any(|s| s.starts_with("AudioSuite >")));
+        assert!(!actual.iter().any(|s| s.starts_with("Event >")));
+        assert!(!actual.iter().any(|s| s.starts_with("Setup >")));
+    }
 }
 
 pub fn menu_bar(app: &mut SoundApp, ui: &mut egui::Ui) {
@@ -212,15 +241,9 @@ pub fn menu_bar(app: &mut SoundApp, ui: &mut egui::Ui) {
         ui,
         |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
-                ui.menu_button("SoundCraft", |ui| {
-                    if ui.button("About SoundCraft").clicked() {
+                ui.menu_button("Sculpt DAW", |ui| {
+                    if ui.button("About Sculpt DAW").clicked() {
                         app.ui.show_about = true;
-                    }
-                    if ui.button("Session Info").clicked() {
-                        app.ui.show_session_info = true;
-                    }
-                    if ui.button("Session Audio Health").clicked() {
-                        let _ = app.run("window.audio_health", json!({"value": true}));
                     }
                     ui.separator();
                     if ui.button("Quit").clicked() {

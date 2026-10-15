@@ -33,8 +33,6 @@ impl NativeMenu {
         let mut native = Self { menu, entries: Vec::new(), events, last_sync: None };
         let app_menu = Submenu::new("Sculpt DAW", true);
         native.add_item(app, &app_menu, "About Sculpt DAW", "", Some("window.about".into()))?;
-        native.add_item(app, &app_menu, "Session Info", "", Some("window.session_info".into()))?;
-        native.add_item(app, &app_menu, "Session Audio Health", "", Some("window.audio_health".into()))?;
         app_menu.append(&PredefinedMenuItem::separator())?;
         app_menu.append(&PredefinedMenuItem::services(None))?;
         app_menu.append(&PredefinedMenuItem::separator())?;

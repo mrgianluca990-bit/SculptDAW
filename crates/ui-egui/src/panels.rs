@@ -369,7 +369,9 @@ fn plugin_windows(app: &mut SoundApp, ctx: &egui::Context) {
         let Some(info) = crate::mix_window::plugin_info(&ins.plugin) else { continue };
         // Sculpt: a hosted plugin should display its native GUI OR a generic fallback,
         // never both. A click on an insert is an open request, not a persistent window.
-        let native_editor = soundcraft_mix::is_third_party(&ins.plugin);
+        // VST3 exposes a native editor; Audio Units currently use generic controls.
+        // Do not wait two seconds for an AU native editor which is not implemented.
+        let native_editor = ins.plugin.starts_with("vst3:");
         let fallback_key = egui::Id::new(("sculpt_native_fallback", tid.0, slot));
         let pending_key = egui::Id::new(("sculpt_native_pending", tid.0, slot));
         if native_editor {
@@ -427,7 +429,7 @@ fn plugin_windows(app: &mut SoundApp, ctx: &egui::Context) {
                         }
                         ui.menu_button("Presets ▾", |ui| preset_menu(app, ui, tid, slot, info, &ins));
                     }
-                    if soundcraft_mix::is_third_party(&ins.plugin) {
+                    if native_editor {
                         let open = app.player.as_ref().is_some_and(|p| p.editor_open(tid, slot));
                         let available = app.player.as_ref().is_some_and(|p| p.has_editor(tid, slot));
                         let label = if open { "Close Plugin Editor" } else { "Open Plugin Editor" };
