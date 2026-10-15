@@ -1,96 +1,194 @@
-name: Sculpt DAW Core 16 - Native Sessions and Edit Mix Stabilization
-
+name: Sculpt DAW Core 16 - Fixed Native Sessions and Spot
 on:
   push:
     branches: [main]
   workflow_dispatch:
-
 permissions:
-  contents: write
-
+  contents: read
 concurrency:
-  group: sculpt-daw-core-${{ github.ref }}
+  group: sculpt-core16-${{ github.ref }}
   cancel-in-progress: false
-
 jobs:
-  build-core:
-    name: Sculpt DAW Core (macOS Universal)
+  macos:
+    name: Sculpt DAW macOS Universal (one build)
     runs-on: macos-15-intel
     timeout-minutes: 120
     steps:
-      - name: Checkout Sculpt DAW
+      - name: Checkout Sculpt
         uses: actions/checkout@v4
-
-      # Keep exact upstream provenance while the original upload remains incomplete.
-      - name: Checkout pinned SoundCraft for missing source files
+      - name: Checkout pinned SoundCraft sources
         uses: actions/checkout@v4
         with:
           repository: storytold/soundcraft
           ref: 6cf896e76c0ec82a11bf2494f209cfe7c8507f74
           path: soundcraft-upstream
           persist-credentials: false
-
-      - name: Restore missing Rust source files without overwriting Sculpt
+      - name: Restore missing source files and proven Core15 patches
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p crates/dsp/src xtask/src
           rsync -a --ignore-existing soundcraft-upstream/crates/dsp/src/ crates/dsp/src/
           if [ ! -f xtask/src/main.rs ]; then cp soundcraft-upstream/xtask/src/main.rs xtask/src/main.rs; fi
-          test -s crates/dsp/src/lib.rs
-          test -s xtask/src/main.rs
-
-      - name: Install Sculpt Core QA menu (do not remove underlying commands)
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PYSCULPTCORE'
-          #!/usr/bin/env python3
-          """Install the small Sculpt Core menu surface; preserve the engine and commands."""
+          git fetch --no-tags --depth=1 origin 6d0b50cef84523e44c9e6ad1af13b0570574c933
+          git show 6d0b50cef84523e44c9e6ad1af13b0570574c933:.github/workflows/build-macos.yml > /tmp/sculpt-core15.yml
+          python3 - <<'PY_REPLAY'
           from pathlib import Path
-          CORE_MENU = "# Sculpt DAW Core — limited, testable feature surface (v0.1)\n# Add ONE validated menu path at a time, AFTER successful real-world testing.\n# These entries are test candidates, not an assertion that all functions are approved.\nFile > New...\nFile > Open > Session...\nFile > Close Session\nFile > Save Session\nFile > Save Session As...\nFile > Import > Audio...\nEdit > Can't Undo\nEdit > Can't Redo\nEdit > Cut\nEdit > Copy\nEdit > Paste\nEdit > Clear\nEdit > Separate > At Selection\nEdit > Fades > Create...\nEdit > Fades > Delete\nTrack > New...\nTrack > Delete\nView > Mix Window Views > Inserts A-E\nView > Mix Window Views > Sends A-E\nView > Mix Window Views > I/O\nView > Edit Window Views > Inserts A-E\nView > Edit Window Views > I/O\nWindow > Edit\nWindow > Mix\nWindow > Transport\n"
-          
-          path = Path('sculpt/qa-core-menu.txt')
-          path.parent.mkdir(parents=True, exist_ok=True)
-          if not path.exists():
-              path.write_text(CORE_MENU, encoding='utf-8')
-          
-          src = Path('crates/ui-egui/src/menus.rs')
-          code = src.read_text(encoding='utf-8')
-          marker = '// SCULPT_CORE_MENU_V1'
-          if marker not in code:
-              original = 'pub fn tree() -> Vec<MenuNode> {\n    let mut roots: Vec<MenuNode> = Vec::new();\n    for line in catalog::catalog() {\n        insert_path(&mut roots, line);\n    }\n    insert_path(&mut roots, "Window > Reset Panel Layout");\n    for (path, _) in MENU_WINDOWS {\n        insert_path(&mut roots, path);\n    }\n    roots\n}\n'
-              replacement = '// SCULPT_CORE_MENU_V1: small, explicit QA surface; full SoundCraft commands stay in the engine.\n// To promote a feature, edit ONLY sculpt/qa-core-menu.txt after real-world testing.\nconst SCULPT_CORE_MENU: &str = include_str!("../../../sculpt/qa-core-menu.txt");\n\npub fn tree() -> Vec<MenuNode> {\n    let mut roots: Vec<MenuNode> = Vec::new();\n    for line in SCULPT_CORE_MENU.lines().map(str::trim)\n        .filter(|line| !line.is_empty() && !line.starts_with(\'#\'))\n    {\n        insert_path(&mut roots, line);\n    }\n    roots\n}\n\n#[cfg(test)]\nmod sculpt_core_menu_tests {\n    use super::*;\n\n    #[test]\n    fn only_explicit_core_items_are_displayed() {\n        let allowed: Vec<&str> = SCULPT_CORE_MENU.lines().map(str::trim)\n            .filter(|p| !p.is_empty() && !p.starts_with(\'#\')).collect();\n        assert!((12..=45).contains(&allowed.len()), "keep the core UI intentionally small");\n        assert!(allowed.iter().all(|p| catalog::catalog().iter().any(|s| s == p)),\n            "every core entry must exist in the original menu catalog");\n        fn leaves(nodes: &[MenuNode], out: &mut Vec<String>) {\n            for node in nodes {\n                if node.children.is_empty() { out.push(node.path.clone()); }\n                else { leaves(&node.children, out); }\n            }\n        }\n        let mut actual = Vec::new();\n        leaves(&tree(), &mut actual);\n        assert_eq!(actual.len(), allowed.len());\n        for path in allowed { assert!(actual.iter().any(|s| s == path), "missing: {path}"); }\n        assert!(!actual.iter().any(|s| s.starts_with("AudioSuite >")));\n        assert!(!actual.iter().any(|s| s.starts_with("Event >")));\n        assert!(!actual.iter().any(|s| s.starts_with("Setup >")));\n    }\n}\n'
-              if code.count(original) != 1:
-                  raise SystemExit('Unexpected menus.rs tree layout: refusing risky source changes')
-              code = code.replace(original, replacement, 1)
-          # Keep the fallback egui menu branded correctly (native menu already says Sculpt DAW).
-          code = code.replace('ui.menu_button("SoundCraft", |ui| {', 'ui.menu_button("Sculpt DAW", |ui| {')
-          code = code.replace('ui.button("About SoundCraft")', 'ui.button("About Sculpt DAW")')
-          src.write_text(code, encoding='utf-8')
-          native = Path('apps/soundcraft/src/native_menu.rs')
-          if native.exists():
-              source = native.read_text(encoding='utf-8')
-              source = '\n'.join(line for line in source.split('\n')
-                  if 'native.add_item(app, &app_menu, \"Session Info\",' not in line
-                  and 'native.add_item(app, &app_menu, \"Session Audio Health\",' not in line)
-              native.write_text(source, encoding='utf-8')
-          
-          fallback = src.read_text(encoding='utf-8')
-          for fragment in [
-              '                    if ui.button(\"Session Info\").clicked() {\n                        app.ui.show_session_info = true;\n                    }\n',
-              '                    if ui.button(\"Session Audio Health\").clicked() {\n                        let _ = app.run(\"window.audio_health\", json!({\"value\": true}));\n                    }\n',
-          ]:
-              fallback = fallback.replace(fragment, '')
-          src.write_text(fallback, encoding='utf-8')
-          print('Sculpt Core menu:', len([s for s in CORE_MENU.splitlines() if s and not s.startswith('#')]), 'entries')
-          PYSCULPTCORE
-          git diff --stat
-
-      - name: Limit visible plugins to VST3 and Audio Units
+          import subprocess
+          src=Path('/tmp/sculpt-core15.yml').read_text(encoding='utf-8')
+          names = ['Install Sculpt Core QA menu (do not remove underlying commands)', 'Limit visible plugins to VST3 and Audio Units', 'Patch Sculpt Core 13 - eight slots, fades, crossfade moves, Return, session and exit', 'Sculpt Core 15 - Shared Send, Meter and Crossfade Corrections', 'Sculpt Core 15 - Targeted SoundCraft 0.7 trim fix']
+          for name in names:
+              key = '      - name: '+name+'\n'
+              if src.count(key)!=1: raise SystemExit('Baseline Core15 step not found: '+name)
+              section=src.split(key,1)[1].split('\n      - name:',1)[0]
+              marker='        run: |\n'
+              if section.count(marker)!=1: raise SystemExit('Expected one run block in '+name)
+              lines=section.split(marker,1)[1].splitlines()
+              code='\n'.join(line[10:] if line.startswith('          ') else line for line in lines)+'\n'
+              if not code.strip().startswith('set -euo pipefail'): raise SystemExit('Baseline script prefix wrong: '+name)
+              print('CORE15 RESTORE:', name, flush=True)
+              subprocess.run(['bash','-euo','pipefail','-c',code],check=True)
+          PY_REPLAY
+      - name: Apply Core16 changes and Spot dialog
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PYSCULPTPLUGINS'
-          #!/usr/bin/env python3
-          """Sculpt DAW Core: expose VST3 and Audio Units only in plugin pickers.
+          python3 - <<'PY_PATCH'
+          import base64,lzma
+          payload = """
+          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
+          AAAABFla
+          """
+          source=lzma.decompress(base64.b64decode(''.join(payload.split()))).decode('utf-8')
+          compile(source,'sculpt_core16_and_spot.py','exec')
+          exec(source,{'__name__':'__main__'})
+          print('CORE16 AND SPOT PATCH APPLIED; SHUFFLE/SLIP/GRID UNCHANGED')
+          PY_PATCH
+      - name: Install Rust for both Mac architectures
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+      - name: Validate and regression test
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_CHECK'
+          from pathlib import Path
+          e=Path('crates/ui-egui/src/edit_window.rs').read_text()
+          d=Path('crates/ui-egui/src/dialogs.rs').read_text()
+          assert 'SCULPT_CORE16_SPOT_CLICK' in e and 'SCULPT_CORE16_SPOT_DRAG' in e
+          assert 'SCULPT_CORE16_SPOT_CONFIRM' in d
+          assert 'SCULPT_CORE16_EDIT_FADER_PAN' in e
+          print('Source guards OK')
+          PY_CHECK
+          cargo check --locked --target x86_64-apple-darwin -p sculpt-daw
+          cargo test --locked --target x86_64-apple-darwin -p soundcraft-engine --lib sculpt_
+          cargo test --locked --target x86_64-apple-darwin -p soundcraft-ui-egui --lib sculpt_
+          cargo test --locked --target x86_64-apple-darwin -p soundcraft-ui-egui --test shortcuts
+          cargo test --locked --target x86_64-apple-darwin -p soundcraft-playback --lib
+          cargo test --locked --target x86_64-apple-darwin -p soundcraft-vst3-host --test fixture_e2e
+          cargo test --locked --target x86_64-apple-darwin -p soundcraft-au-host --test system_units
+      - name: Build Sculpt DAW Mac app
+        shell: bash
+        run: bash sculpt/build-macos.sh
+      - name: Validate native document and zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP=dist/sculpt/Sculpt_DAW_0.4.0_Mac_Universal.zip
+          APP="dist/sculpt/Sculpt DAW.app"
+          test -s "$ZIP"
+          shasum -a 256 -c "$ZIP.sha256"
+          unzip -t "$ZIP" > /dev/null
+          /usr/libexec/PlistBuddy -c 'Print :UTExportedTypeDeclarations:0:UTTypeIdentifier' "$APP/Contents/Info.plist" | grep -Fx 'audio.sculpt.daw.session'
+          /usr/libexec/PlistBuddy -c 'Print :UTExportedTypeDeclarations:0:UTTypeTagSpecification:public.filename-extension:0' "$APP/Contents/Info.plist" | grep -Fx scdaw
+      - name: Upload Sculpt DAW Core16 fixed
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sculpt-DAW-Core16-Fixed-Spot-Mac
+          path: |
+            dist/sculpt/Sculpt_DAW_0.4.0_Mac_Universal.zip
+            dist/sculpt/Sculpt_DAW_0.4.0_Mac_Universal.zip.sha256
+          if-no-files-found: error
+          retention-days: 14
+# SCULPT_CORE16_WORKFLOW_COMPLETE
