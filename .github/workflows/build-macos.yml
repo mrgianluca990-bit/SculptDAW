@@ -1,4 +1,4 @@
-name: Sculpt DAW Core 16 - Fixed Native Sessions and Spot
+name: Sculpt DAW Core 17 - Fixed Mac Build
 on:
   push:
     branches: [main]
@@ -6,11 +6,11 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: sculpt-core16-${{ github.ref }}
+  group: sculpt-core17-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   macos:
-    name: Sculpt DAW macOS Universal (one build)
+    name: Sculpt DAW Core17 Mac Universal (one build)
     runs-on: macos-15-intel
     timeout-minutes: 120
     steps:
@@ -23,6 +23,14 @@ jobs:
           ref: 6cf896e76c0ec82a11bf2494f209cfe7c8507f74
           path: soundcraft-upstream
           persist-credentials: false
+      - name: Verify approved amber Sculpt DAW app icon
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s assets/sculpt-daw/sculpt-daw-512.png
+          test -s QA/SculptDAW_Core17_Patch.py
+          echo '923b49c8994363786b46b3a71aef73e5779e97a22a63966d85db63bb1c4555cd  assets/sculpt-daw/sculpt-daw-512.png' | shasum -a 256 -c -
+          python3 -m py_compile QA/SculptDAW_Core17_Patch.py
       - name: Restore missing source files and proven Core15 patches
         shell: bash
         run: |
@@ -144,6 +152,28 @@ jobs:
           exec(source,{'__name__':'__main__'})
           print('CORE16 AND SPOT PATCH APPLIED; SHUFFLE/SLIP/GRID UNCHANGED')
           PY_PATCH
+      - name: Apply repository Core17 patch and verify native .scdaw (prebuild)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Already committed in SculptDAW; fail early if the file is missing.
+          test -s QA/SculptDAW_Core17_Patch.py
+          python3 -m py_compile QA/SculptDAW_Core17_Patch.py
+          python3 QA/SculptDAW_Core17_Patch.py
+          # Manifest must be modified before the packaging process runs.
+          python3 - <<'PY_AUDIT'
+          from pathlib import Path
+          import plistlib
+          p=Path('packaging/macos/Info.plist.in')
+          info=plistlib.loads(p.read_bytes())
+          uti=info['UTExportedTypeDeclarations'][0]
+          assert uti['UTTypeIdentifier']=='audio.sculpt.daw.session', uti
+          assert 'scdaw' in uti['UTTypeTagSpecification']['public.filename-extension'], uti
+          assert all('ai.storyteller.soundcraft.session' != t.get('UTTypeIdentifier') for t in info['UTExportedTypeDeclarations'])
+          assert 'View > Rulers > Markers' in Path('sculpt/qa-core-menu.txt').read_text()
+          assert 'Window > Memory Locations' in Path('sculpt/qa-core-menu.txt').read_text()
+          print('CORE17: patch + plist + marker UI verified BEFORE compile')
+          PY_AUDIT
       - name: Install Rust for both Mac architectures
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -163,6 +193,9 @@ jobs:
           PY_CHECK
           cargo check --locked --target x86_64-apple-darwin -p sculpt-daw
           cargo test --locked --target x86_64-apple-darwin -p soundcraft-engine --lib sculpt_
+          # All new Core17 regression cases are included in the same library test set.
+          cargo test --locked --target x86_64-apple-darwin -p soundcraft-engine --lib sculpt_core17_
+          cargo test --locked --target x86_64-apple-darwin -p soundcraft-mix --lib
           cargo test --locked --target x86_64-apple-darwin -p soundcraft-ui-egui --lib sculpt_
           cargo test --locked --target x86_64-apple-darwin -p soundcraft-ui-egui --test shortcuts
           cargo test --locked --target x86_64-apple-darwin -p soundcraft-playback --lib
@@ -176,19 +209,34 @@ jobs:
         run: |
           set -euo pipefail
           ZIP=dist/sculpt/Sculpt_DAW_0.4.0_Mac_Universal.zip
-          APP="dist/sculpt/Sculpt DAW.app"
           test -s "$ZIP"
           shasum -a 256 -c "$ZIP.sha256"
           unzip -t "$ZIP" > /dev/null
-          /usr/libexec/PlistBuddy -c 'Print :UTExportedTypeDeclarations:0:UTTypeIdentifier' "$APP/Contents/Info.plist" | grep -Fx 'audio.sculpt.daw.session'
-          /usr/libexec/PlistBuddy -c 'Print :UTExportedTypeDeclarations:0:UTTypeTagSpecification:public.filename-extension:0' "$APP/Contents/Info.plist" | grep -Fx scdaw
-      - name: Upload Sculpt DAW Core16 fixed
+          python3 - <<'PY_PLIST'
+          from pathlib import Path
+          import plistlib, zipfile
+          zpath=Path('dist/sculpt/Sculpt_DAW_0.4.0_Mac_Universal.zip')
+          with zipfile.ZipFile(zpath) as z:
+              paths=[p for p in z.namelist() if p.endswith('Sculpt DAW.app/Contents/Info.plist')]
+              if len(paths)!=1:
+                  raise SystemExit(f'Expected 1 Info.plist in signed ZIP, found {paths}')
+              info=plistlib.loads(z.read(paths[0]))
+              matches=[n for n in z.namelist() if n.endswith('Sculpt DAW.app/Contents/Resources/Sculpt DAW.icns')]
+              assert len(matches)==1, 'Icon missing from signed app ZIP'
+          assert info['CFBundleIdentifier']=='audio.sculpt.daw', info.get('CFBundleIdentifier')
+          assert any(t.get('UTTypeIdentifier')=='audio.sculpt.daw.session' and 'scdaw' in t.get('UTTypeTagSpecification',{}).get('public.filename-extension',[]) for t in info.get('UTExportedTypeDeclarations',[])), info.get('UTExportedTypeDeclarations')
+          assert any('audio.sculpt.daw.session' in t.get('LSItemContentTypes',[]) for t in info.get('CFBundleDocumentTypes',[])), info.get('CFBundleDocumentTypes')
+          print('CORE17: signed ZIP, app icon, native UTI, .scdaw document type verified')
+          PY_PLIST
+      - name: Upload Sculpt DAW Core17 Mac (one artifact)
         uses: actions/upload-artifact@v4
         with:
-          name: Sculpt-DAW-Core16-Fixed-Spot-Mac
+          name: Sculpt-DAW-Core17-Fixed-Mac
           path: |
             dist/sculpt/Sculpt_DAW_0.4.0_Mac_Universal.zip
             dist/sculpt/Sculpt_DAW_0.4.0_Mac_Universal.zip.sha256
           if-no-files-found: error
           retention-days: 14
-# SCULPT_CORE16_WORKFLOW_COMPLETE
+# SCULPT_CORE17_WORKFLOW_COMPLETE
+
+# SCULPT_CORE17_FIXED_WORKFLOW_COMPLETE
