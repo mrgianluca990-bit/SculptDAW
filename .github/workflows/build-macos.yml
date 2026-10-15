@@ -1,4 +1,4 @@
-name: Sculpt DAW - Edit and Crossfade Pilot
+name: Sculpt DAW - Edit, Fades and Shutdown Pilot
 
 on:
   push:
@@ -1110,6 +1110,110 @@ jobs:
           PYSCULPT
           git diff --stat
 
+      - name: Shut down VST3 and CLAP instances on the correct thread
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYSHUTDOWN'
+          from pathlib import Path
+
+          def replace_exact(file, before, after):
+              f = Path(file)
+              content = f.read_text(encoding="utf-8")
+              if "SCULPT_ORDERLY_PLUGIN_SHUTDOWN_V1" in content:
+                  print(f"Sculpt shutdown already integrated in {file}")
+                  return
+              count = content.count(before)
+              if count != 1:
+                  raise RuntimeError(f"Unexpected {file} shutdown baseline: found {count} exact matches")
+              f.write_text(content.replace(before, after, 1), encoding="utf-8")
+              print(f"Orderly plugin shutdown: patched {file}")
+
+          playback = Path("crates/playback/src/lib.rs")
+          code = playback.read_text(encoding="utf-8")
+          if "SCULPT_ORDERLY_PLUGIN_SHUTDOWN_V1" not in code:
+              pairs = [
+                  (
+                      "    CaptureStates(Sender<PluginStates>),\n",
+                      "    CaptureStates(Sender<PluginStates>),\n"
+                      "    /// Return every hosted plugin to the UI thread, then acknowledge cleanup.\n"
+                      "    Shutdown(Sender<()>),\n",
+                  ),
+                  (
+                      "                Cmd::CaptureStates(reply) => {\n",
+                      "                Cmd::Shutdown(reply) => {\n"
+                      "                    self.playing = false;\n"
+                      "                    self.recording = false;\n"
+                      "                    self.input = None;\n"
+                      "                    self.end = None;\n"
+                      "                    self.looped = None;\n"
+                      "                    self.pending_len = 0;\n"
+                      "                    let rate = self.session.sample_rate.as_f64() as f32;\n"
+                      "                    let mut old = std::mem::replace(&mut self.mix, new_engine(rate));\n"
+                      "                    let plugins = old.drain_plugins();\n"
+                      "                    if !plugins.is_empty() {\n"
+                      "                        let _ = self.garbage.send(plugins);\n"
+                      "                    }\n"
+                      "                    let _ = reply.send(());\n"
+                      "                }\n"
+                      "                Cmd::CaptureStates(reply) => {\n",
+                  ),
+                  (
+                      "    pub fn stop(&self) {\n",
+                      "    /// Graceful application shutdown: release editors on the main thread,\n"
+                      "    /// drain audio-thread plugin instances back to the main thread,\n"
+                      "    /// and only then destroy the audio stream.\n"
+                      "    /// SCULPT_ORDERLY_PLUGIN_SHUTDOWN_V1\n"
+                      "    pub fn shutdown(&mut self) {\n"
+                      "        self.stop();\n"
+                      "        {\n"
+                      "            let mut side = self.side();\n"
+                      "            for editor in side.editors.values_mut() {\n"
+                      "                editor.close();\n"
+                      "            }\n"
+                      "            side.editors.clear();\n"
+                      "            side.shadow.clear();\n"
+                      "        }\n"
+                      "        let (reply, done) = channel();\n"
+                      "        if self.tx.send(Cmd::Shutdown(reply)).is_ok()\n"
+                      "            && done.recv_timeout(std::time::Duration::from_secs(2)).is_err()\n"
+                      "        {\n"
+                      "            log::warn!(\"audio shutdown timed out; leaving still-referenced VST3 modules loaded\");\n"
+                      "        }\n"
+                      "        // Dropping the stream stops further callbacks. The callback has\n"
+                      "        // already surrendered plugin instances in the acknowledged path.\n"
+                      "        self._stream.take();\n"
+                      "        self.side().collect_garbage();\n"
+                      "    }\n\n"
+                      "    pub fn stop(&self) {\n",
+                  ),
+              ]
+              for before, after in pairs:
+                  if code.count(before) != 1:
+                      raise RuntimeError(f"Playback shutdown patch: expected one match, got {code.count(before)}: {before[:85]!r}")
+                  code = code.replace(before, after, 1)
+              playback.write_text(code, encoding="utf-8")
+              print("Orderly shutdown: patched playback command, plugin transfer and player")
+
+          main = Path("apps/soundcraft/src/main.rs")
+          code = main.read_text(encoding="utf-8")
+          if "SCULPT_ORDERLY_PLUGIN_SHUTDOWN_V1" not in code:
+              before = "        self.0.player = None;\n        soundcraft_engine::shutdown_plugin_hosts();\n"
+              after = (
+                  "        // SCULPT_ORDERLY_PLUGIN_SHUTDOWN_V1: synchronize plugin ownership before\n"
+                  "        // calling VST3 bundle exits, which are sensitive to thread ordering.\n"
+                  "        if let Some(mut player) = self.0.player.take() {\n"
+                  "            player.shutdown();\n"
+                  "        }\n"
+                  "        soundcraft_engine::shutdown_plugin_hosts();\n"
+              )
+              if code.count(before) != 1:
+                  raise RuntimeError("Main app shutdown patch does not match the expected baseline")
+              main.write_text(code.replace(before, after, 1), encoding="utf-8")
+              print("Orderly shutdown: patched app on_exit")
+          PYSHUTDOWN
+          git diff --stat
+
       - name: Install Rust stable with both macOS targets
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -1125,6 +1229,7 @@ jobs:
           set -euo pipefail
           cargo test --locked --target x86_64-apple-darwin -p soundcraft-engine --lib fades_and_crossfades
           cargo test --locked --target x86_64-apple-darwin -p soundcraft-engine --lib sculpt_
+          cargo test --locked --target x86_64-apple-darwin -p soundcraft-playback --lib
 
       - name: Build the universal app and CLI
         run: bash sculpt/build-macos.sh
@@ -1144,13 +1249,13 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist/sculpt
-          git diff --binary -- apps/soundcraft/src/main.rs crates/ui-egui/src crates/engine/src/edit.rs crates/engine/src/cmd/edit.rs > dist/sculpt/Sculpt_DAW_UI_Fades_Source.patch
+          git diff --binary -- apps/soundcraft/src/main.rs crates/ui-egui/src crates/engine/src/edit.rs crates/engine/src/cmd/edit.rs crates/playback/src/lib.rs > dist/sculpt/Sculpt_DAW_UI_Fades_Source.patch
           test -s dist/sculpt/Sculpt_DAW_UI_Fades_Source.patch || echo 'Source already integrated in GitHub.'
 
       - name: Upload Sculpt DAW app
         uses: actions/upload-artifact@v4
         with:
-          name: Sculpt-DAW-Mac-Edit-Fades-Pilot
+          name: Sculpt-DAW-Mac-Edit-Fades-Shutdown-Pilot
           path: |
             dist/sculpt/Sculpt_DAW_0.4.0_Mac_Universal.zip
             dist/sculpt/Sculpt_DAW_0.4.0_Mac_Universal.zip.sha256
@@ -1178,7 +1283,8 @@ jobs:
                   crates/ui-egui/src/menus.rs \
                   crates/ui-egui/src/windows.rs \
                   crates/engine/src/edit.rs \
-                  crates/engine/src/cmd/edit.rs
+                  crates/engine/src/cmd/edit.rs \
+                  crates/playback/src/lib.rs
           if git diff --cached --quiet; then
             echo 'No source changes to persist.'
             exit 0
