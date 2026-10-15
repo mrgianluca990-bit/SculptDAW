@@ -99,6 +99,25 @@ fn command_for(key: Key, mods: Modifiers, mac: bool) -> Option<&'static str> {
 fn fixed(app: &mut SoundApp, key: Key, m: Modifiers, mac: bool) -> bool {
     let plain = !m.command && !m.alt && !m.ctrl && !m.shift;
     match key {
+        // macOS Delete sends Backspace; external keyboards can send Delete.
+        // If a fade is selected, erase ONLY that fade (never its source clip).
+        Key::Backspace | Key::Delete if plain && app.ui.window == MainWindow::Edit => {
+            if let Some(fade) = app.ui.selected_fade {
+                let args = json!({"track": fade.track.0, "clip": fade.clip.0,
+                    "other": fade.other.map(|id| id.0), "fade_in": fade.fade_in});
+                match app.run("edit.fade_delete_target", args) {
+                    Ok(_) => app.ui.selected_fade = None,
+                    Err(e) => app.ui.status = e,
+                }
+            } else {
+                // Pro Tools-style Delete for selected clips OR a non-empty edit range.
+                let edit = &app.engine.session().edit;
+                if !edit.selected_clips.is_empty() || (!edit.selected_tracks.is_empty() && !edit.selection.is_empty()) {
+                    let _ = app.run("edit.clear", json!({}));
+                }
+            }
+            true
+        }
         Key::Space if !m.command && !m.alt => {
             let id = if m.shift { "transport.half_speed" } else { "transport.toggle" };
             let _ = app.run(id, json!({}));

@@ -44,6 +44,16 @@ pub enum MainWindow {
     Mix,
 }
 
+/// A timeline fade selection; `other` identifies the incoming clip in a crossfade.
+/// This is transient UI state, never persisted as part of an audio session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FadeSelection {
+    pub track: TrackId,
+    pub clip: soundcraft_model::ClipId,
+    pub other: Option<soundcraft_model::ClipId>,
+    pub fade_in: bool,
+}
+
 /// UI state (serde, so agents can read and set it).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -70,6 +80,9 @@ pub struct UiState {
     pub edit_views: Vec<String>,
     /// Open plugin windows (track, slot).
     pub plugin_windows: Vec<(TrackId, usize)>,
+    /// Fade/crossfade highlighted in Edit; selecting one does not select or delete its clip.
+    #[serde(skip)]
+    pub selected_fade: Option<FadeSelection>,
     pub audiosuite: Option<String>,
     pub status: String,
     pub show_automation: bool,
@@ -129,6 +142,7 @@ impl Default for UiState {
             mix_views: vec!["inserts_ae".into(), "sends_ae".into(), "io".into(), "color".into()],
             edit_views: vec!["color".into()],
             plugin_windows: Vec::new(),
+            selected_fade: None,
             audiosuite: None,
             status: String::new(),
             show_automation: false,
@@ -686,6 +700,7 @@ impl SoundApp {
                     self.recorder_failed = false;
                     self.punch = None;
                     self.gesture = None;
+                    self.ui.selected_fade = None;
                     self.touched.clear();
                     self.last_write_at = i64::MIN;
                     self.edit_layout.follow_hold = false;

@@ -123,6 +123,7 @@ pub fn specs() -> Vec<CommandSpec> {
             fades_create
         ),
         cmd!("edit.fades_delete", "Delete", ["Edit", "Fades"], None, "{tracks?, start?, end?}", has_selection, fades_delete),
+        cmd!("edit.fade_delete_target", "Delete Selected Fade", [], None, "{track, clip, other?, fade_in?}", always, fade_delete_target),
         cmd!("edit.fade_to_start", "Fade to Start", ["Edit", "Fades"], Some("Cmd+Ctrl+D"), "{}", has_selection, |e, p| fade_to(e, p, true)),
         cmd!("edit.fade_to_end", "Fade to End", ["Edit", "Fades"], Some("Cmd+Ctrl+G"), "{}", has_selection, |e, p| fade_to(e, p, false)),
         cmd!("edit.nudge", "Nudge", [], Some("Plus/Minus"), "{direction: 1|-1, count?: n}", has_selection, nudge),
@@ -686,6 +687,17 @@ fn fades_create(e: &mut Engine, p: &Value) -> Result<Value> {
         return Err(bad("edit.fades_create", "the selection must cover a clip start, end or the boundary between two clips"));
     }
     Ok(json!({"fades": n}))
+}
+
+fn fade_delete_target(e: &mut Engine, p: &Value) -> Result<Value> {
+    let cmd = "edit.fade_delete_target";
+    let track = p.get("track").and_then(Value::as_u64).map(TrackId).ok_or_else(|| bad(cmd, "missing track"))?;
+    let clip = p.get("clip").and_then(Value::as_u64).map(ClipId).ok_or_else(|| bad(cmd, "missing clip"))?;
+    let other = p.get("other").and_then(Value::as_u64).map(ClipId);
+    let fade_in = p.get("fade_in").and_then(Value::as_bool).unwrap_or(false);
+    let count = ops::delete_selected_fade(e.session_mut(), track, clip, other, fade_in);
+    if count == 0 { return Err(bad(cmd, "selected fade or crossfade no longer exists")); }
+    Ok(json!({"deleted": count}))
 }
 
 fn fades_delete(e: &mut Engine, p: &Value) -> Result<Value> {

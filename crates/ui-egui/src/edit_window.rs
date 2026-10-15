@@ -2,7 +2,7 @@
 
 use crate::theme::{Tokens, bold, clip_colors, regular, rgb};
 use crate::widgets::{rec_toggle, selector_box, text_toggle};
-use crate::{Gesture, SoundApp, icons, toolbar};
+use crate::{FadeSelection, Gesture, SoundApp, icons, toolbar};
 use egui::{Align2, Color32, CornerRadius, Pos2, Rect, Sense, Shape, Stroke, StrokeKind, Ui, pos2, vec2};
 use serde_json::json;
 use soundcraft_model::{AutoParam, Clip, ClipContent, ClipId, Session, Tool, Track, TrackHeight, TrackId, TrackKind};
@@ -706,7 +706,7 @@ fn track_row(app: &mut SoundApp, ui: &mut Ui, id: TrackId, row: Rect, tl: Rect) 
         }
         draw_clip(app, &painter, &s, &track, clip, tl, lane, auto_view.is_some());
     }
-    sculpt_draw_crossfades(&painter, &s, &track, tl, lane);
+    sculpt_draw_crossfades(&painter, &s, &track, tl, lane, app.ui.selected_fade);
     crate::video_track::draw_lane(app, &painter, &s, &track, tl, lane);
     if let Some(p) = &auto_view {
         draw_automation(&painter, &s, &track, p, tl, lane);
@@ -1177,7 +1177,7 @@ fn grid_lines(painter: &egui::Painter, s: &Session, tl: Rect, lane: Rect) {
     }
 }
 
-fn sculpt_draw_crossfades(painter: &egui::Painter, s: &Session, track: &Track, tl: Rect, lane: Rect) {
+fn sculpt_draw_crossfades(painter: &egui::Painter, s: &Session, track: &Track, tl: Rect, lane: Rect, selection: Option<FadeSelection>) {
     for pair in track.clips().windows(2) {
         let (a, b) = (&pair[0], &pair[1]);
         if !a.is_audio() || !b.is_audio() || a.end() <= b.start || a.fade_out.len <= 0 || b.fade_in.len <= 0 {
@@ -1188,7 +1188,8 @@ fn sculpt_draw_crossfades(painter: &egui::Painter, s: &Session, track: &Track, t
         if x1 < tl.min.x || x0 > tl.max.x || (x1 - x0) < 3.0 { continue; }
         let area = Rect::from_min_max(pos2(x0, lane.min.y + 1.0), pos2(x1, lane.max.y - 1.0));
         painter.rect_filled(area, 0.0, Color32::from_rgba_unmultiplied(234, 199, 116, 45));
-        painter.rect_stroke(area, 0.0, Stroke::new(1.5, Color32::from_rgb(230, 190, 105)), StrokeKind::Inside);
+        let chosen = selection.is_some_and(|f| f.track == track.id && f.clip == a.id && f.other == Some(b.id));
+        painter.rect_stroke(area, 0.0, Stroke::new(if chosen { 3.0 } else { 1.5 }, if chosen { Color32::from_rgb(255, 248, 175) } else { Color32::from_rgb(230, 190, 105) }), StrokeKind::Inside);
         let mut outgoing = Vec::new();
         let mut incoming = Vec::new();
         for i in 0..=32 {
@@ -1203,7 +1204,7 @@ fn sculpt_draw_crossfades(painter: &egui::Painter, s: &Session, track: &Track, t
         painter.add(Shape::line(outgoing, Stroke::new(2.0, Color32::from_rgb(243, 155, 175))));
         painter.add(Shape::line(incoming, Stroke::new(2.0, Color32::from_rgb(132, 237, 179))));
         if x1 - x0 > 45.0 && area.height() > 35.0 {
-            painter.text(pos2(area.center().x, area.min.y + 9.0), Align2::CENTER_CENTER, "X-FADE", bold(9.0), Color32::WHITE);
+            painter.text(pos2(area.center().x, area.min.y + 9.0), Align2::CENTER_CENTER, if chosen { "X-FADE SELECTED" } else { "X-FADE" }, bold(9.0), Color32::WHITE);
         }
     }
 }
@@ -1351,6 +1352,8 @@ fn draw_clip(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track
     }
     // Sculpt: fades must stay legible against waveforms, even without selecting the clip.
     let fade_col = Color32::from_rgba_unmultiplied(255, 255, 255, 225);
+    let select_in = app.ui.selected_fade.is_some_and(|f| f.track == track.id && f.clip == clip.id && f.other.is_none() && f.fade_in);
+    let select_out = app.ui.selected_fade.is_some_and(|f| f.track == track.id && f.clip == clip.id && f.other.is_none() && !f.fade_in);
     if clip.fade_in.len > 0 {
         let fx = x_of(s, tl, clip.start + clip.fade_in.len);
         if fx > x0 { painter.rect_filled(Rect::from_min_max(pos2(x0, body_r.min.y), pos2(fx, body_r.max.y)), 0.0, Color32::from_white_alpha(16)); }
@@ -1367,7 +1370,7 @@ fn draw_clip(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track
                 pos2(x0 + (fx - x0) * k, body_r.max.y - body_r.height() * clip.fade_in.shape.gain(k))
             })
             .collect();
-        painter.add(Shape::line(pts, Stroke::new(2.0, fade_col)));
+        painter.add(Shape::line(pts, Stroke::new(if select_in { 3.0 } else { 2.0 }, if select_in { Color32::from_rgb(255, 224, 112) } else { fade_col })));
         painter.line_segment([pos2(x0, body_r.min.y), pos2(fx, body_r.min.y)], Stroke::new(1.0, fade_col));
     }
     if clip.fade_out.len > 0 {
@@ -1378,7 +1381,7 @@ fn draw_clip(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track
                 pos2(fx + (x1 - fx) * k, body_r.max.y - body_r.height() * clip.fade_out.shape.gain(1.0 - k))
             })
             .collect();
-        painter.add(Shape::line(pts, Stroke::new(2.0, fade_col)));
+        painter.add(Shape::line(pts, Stroke::new(if select_out { 3.0 } else { 2.0 }, if select_out { Color32::from_rgb(255, 224, 112) } else { fade_col })));
     }
     // Optional clip overlays (View › Clip).
     let ov = Color32::from_rgb(16, 16, 16);
@@ -1528,6 +1531,53 @@ fn clip_gain_popup(ctx: &egui::Context, fader_bottom: Pos2, pos: f32) {
     p.text(pos2(panel.center().x, panel.min.y + 12.0), Align2::CENTER_CENTER, format!("{db:+.1}"), regular(10.5), t.counter_text);
 }
 
+/// Locate the fade explicitly clicked, without selecting or deleting the audio clip.
+fn sculpt_fade_at_pointer(s: &Session, track: &Track, tl: Rect, lane: Rect, p: Pos2) -> Option<FadeSelection> {
+    if !lane.contains(p) { return None; }
+    let at = sample_at(s, tl, p.x).max(0);
+    for pair in track.clips().windows(2) {
+        let (a, b) = (&pair[0], &pair[1]);
+        if a.is_audio() && b.is_audio() && a.end() > b.start && a.fade_out.len > 0 && b.fade_in.len > 0
+            && b.start <= at && at < a.end()
+        {
+            return Some(FadeSelection { track: track.id, clip: a.id, other: Some(b.id), fade_in: false });
+        }
+    }
+    let top = lane.min.y + if lane.height() >= 40.0 && s.edit.flag("view.clip.name") { 13.0 } else { 0.0 };
+    let h = (lane.max.y - top).max(1.0);
+    for c in track.clips() {
+        if !c.is_audio() { continue; }
+        if c.fade_in.len > 0 && c.start <= at && at < c.start + c.fade_in.len {
+            let phase = (at - c.start) as f32 / c.fade_in.len as f32;
+            let y = lane.max.y - h * c.fade_in.shape.gain(phase);
+            if (p.y - y).abs() <= 11.0 {
+                return Some(FadeSelection { track: track.id, clip: c.id, other: None, fade_in: true });
+            }
+        }
+        if c.fade_out.len > 0 && c.end() - c.fade_out.len <= at && at < c.end() {
+            let phase = (c.end() - at) as f32 / c.fade_out.len as f32;
+            let y = lane.max.y - h * c.fade_out.shape.gain(phase);
+            if (p.y - y).abs() <= 11.0 {
+                return Some(FadeSelection { track: track.id, clip: c.id, other: None, fade_in: false });
+            }
+        }
+    }
+    None
+}
+
+fn sculpt_delete_target(app: &mut SoundApp, target: FadeSelection) {
+    let result = app.run("edit.fade_delete_target", json!({
+        "track": target.track.0,
+        "clip": target.clip.0,
+        "other": target.other.map(|id| id.0),
+        "fade_in": target.fade_in,
+    }));
+    match result {
+        Ok(_) => app.ui.selected_fade = None,
+        Err(e) => app.ui.status = e,
+    }
+}
+
 fn lane_interaction(app: &mut SoundApp, ui: &mut Ui, track: &Track, lane: Rect, tl: Rect) {
     let id = ui.id().with(("lane", track.id.0));
     let resp = ui.interact(lane, id, Sense::click_and_drag());
@@ -1536,12 +1586,15 @@ fn lane_interaction(app: &mut SoundApp, ui: &mut Ui, track: &Track, lane: Rect, 
     // The clip is remembered at the right-click so the menu keeps its target while it is used.
     let menu_clip_id = id.with("menu_clip");
     let menu_xfade_id = id.with("sculpt_menu_xfade");
+    let menu_fade_id = id.with("sculpt_menu_fade");
     if resp.secondary_clicked() {
         let clip = resp.interact_pointer_pos().and_then(|p| {
             let s = app.engine.session();
             clip_at(track, sample_at(s, tl, p.x).max(0)).map(|c| c.id)
         });
         ui.ctx().data_mut(|d| d.insert_temp(menu_clip_id, clip));
+        let target = resp.interact_pointer_pos().and_then(|p| sculpt_fade_at_pointer(app.engine.session(), track, tl, lane, p));
+        ui.ctx().data_mut(|d| d.insert_temp(menu_fade_id, target));
         let xfade = resp.interact_pointer_pos().and_then(|p| {
             let s = app.engine.session();
             let at = sample_at(s, tl, p.x).max(0);
@@ -1555,12 +1608,14 @@ fn lane_interaction(app: &mut SoundApp, ui: &mut Ui, track: &Track, lane: Rect, 
     }
     // The clip may have been removed or moved since the right-click; only use it if it still exists.
     let menu_clip = ui.ctx().data(|d| d.get_temp::<Option<ClipId>>(menu_clip_id)).flatten().filter(|c| track.clips().iter().any(|x| x.id == *c));
-    let menu_xfade = ui.ctx().data(|d| d.get_temp::<Option<(Samples, Samples)>>(menu_xfade_id)).flatten();
+    let _menu_xfade = ui.ctx().data(|d| d.get_temp::<Option<(Samples, Samples)>>(menu_xfade_id)).flatten();
+    let menu_fade = ui.ctx().data(|d| d.get_temp::<Option<FadeSelection>>(menu_fade_id)).flatten();
     resp.context_menu(|ui| {
-        if let Some((start, end)) = menu_xfade {
-            ui.label("Crossfade");
-            if ui.button("Delete Crossfade").clicked() {
-                let _ = app.run("edit.fades_delete", json!({"tracks": [track.id.0], "start": start, "end": end}));
+        if let Some(target) = menu_fade {
+            let label = if target.other.is_some() { "Delete Crossfade" } else if target.fade_in { "Delete Fade In" } else { "Delete Fade Out" };
+            ui.label(if target.other.is_some() { "Crossfade" } else { "Fade" });
+            if ui.button(label).clicked() {
+                sculpt_delete_target(app, target);
                 ui.close();
             }
             ui.separator();
@@ -1586,6 +1641,14 @@ fn lane_interaction(app: &mut SoundApp, ui: &mut Ui, track: &Track, lane: Rect, 
     let origin = if resp.drag_started() { ui.input(|i| i.pointer.press_origin()).unwrap_or(p) } else { p };
     let at_origin = sample_at(&s, tl, origin.x).max(0);
     let hit = clip_at(track, at_origin).cloned();
+    if resp.clicked() {
+        if let Some(fade) = sculpt_fade_at_pointer(&s, track, tl, lane, p) {
+            app.ui.selected_fade = Some(fade);
+            ui.ctx().request_repaint();
+            return;
+        }
+        app.ui.selected_fade = None;
+    }
     let upper = origin.y < lane.center().y;
     // Pro Tools Smart Tool: a drag at the LOWER part of a clip seam creates
     // or resizes a crossfade; the upper corners remain fade-in/out targets.
