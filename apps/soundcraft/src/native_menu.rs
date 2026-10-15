@@ -73,7 +73,8 @@ impl NativeMenu {
     fn add_item(&mut self, app: &SoundApp, parent: &Submenu, label: &str, path: &str, command: Option<String>) -> muda::Result<()> {
         let (enabled, checked) = menus::item_state(app, path, command.as_deref());
         // egui owns keyboard shortcuts, so a key press is dispatched only once.
-        let item = CheckMenuItem::new(label, enabled, checked, None);
+        let display = match label { "Inserts F-J" => "Inserts F-H", "Sends F-J" => "Sends F-H", _ => label };
+        let item = CheckMenuItem::new(display, enabled, checked, None);
         parent.append(&item)?;
         self.entries.push(Entry { item, command, path: path.into(), enabled, checked });
         Ok(())

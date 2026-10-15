@@ -281,24 +281,58 @@ pub fn heal(s: &mut Session, track: TrackId, range: Range) -> usize {
 
 /// Move clips by `delta` (and optionally to another track), overwriting what they land on.
 pub fn move_clips(s: &mut Session, ids: &[ClipId], delta: Samples, to_track: Option<TrackId>) -> usize {
+    // SCULPT_CORE_GROUP_MOVE_PRESERVES_XFADE_V1: extract *all* moving clips first,
+    // clear destination material before inserting any, then append all moving clips together.
+    // The former per-clip place_clip() erased the overlap of the preceding moved clip.
+    let moving_ids: std::collections::HashSet<ClipId> = ids.iter().copied().collect();
+    let mut joints = Vec::new();
+    for t in &s.tracks {
+        for pair in t.clips().windows(2) {
+            let (a, b) = (&pair[0], &pair[1]);
+            let key = sculpt_xfade_join_key(a.id, b.id);
+            if s.edit.values.contains_key(&key) {
+                joints.push((a.id, b.id, key));
+            }
+        }
+    }
+    // Moving only one side breaks the crossfade association intentionally; remove
+    // both linked fades so no misleading standalone fade remains.
+    for (a, b, key) in &joints {
+        if moving_ids.contains(a) != moving_ids.contains(b) {
+            if let Some(c) = s.find_clip_mut(*a) { c.fade_out = Fade::default(); }
+            if let Some(c) = s.find_clip_mut(*b) { c.fade_in = Fade::default(); }
+            s.edit.values.remove(key);
+        }
+    }
     let mut moving: Vec<(TrackId, Clip)> = Vec::new();
     for t in &mut s.tracks {
         let tid = t.id;
         if let Some(pl) = t.playlist_mut() {
             pl.clips.retain(|c| {
-                if ids.contains(&c.id) && !c.time_locked && !c.edit_locked {
+                if moving_ids.contains(&c.id) && !c.time_locked && !c.edit_locked {
                     moving.push((tid, c.clone()));
                     false
-                } else {
-                    true
-                }
+                } else { true }
             });
         }
     }
     let n = moving.len();
+    let mut relocated = Vec::with_capacity(n);
     for (tid, mut c) in moving {
         c.start = c.start.saturating_add(delta).max(0);
-        place_clip(s, to_track.unwrap_or(tid), c);
+        relocated.push((to_track.unwrap_or(tid), c));
+    }
+    // Clear only STATIONARY material before any of the moved clips are inserted.
+    for (target, c) in &relocated { clear_range(s, *target, c.range(), false); }
+    for (target, c) in relocated {
+        if let Some(pl) = s.track_mut(target).and_then(|t| t.playlist_mut()) { pl.clips.push(c); }
+    }
+    for t in &mut s.tracks { if let Some(pl) = t.playlist_mut() { pl.sort(); } }
+    // Keep the saved, undoable crossfade seam aligned with the pair when both move.
+    for (a, b, key) in joints {
+        if moving_ids.contains(&a) && moving_ids.contains(&b)
+            && let Some(v) = s.edit.values.get_mut(&key)
+        { *v = (*v + delta as f64).max(0.0); }
     }
     n
 }
@@ -531,6 +565,30 @@ mod tests {
 
     fn clips(s: &Session, t: TrackId) -> Vec<(Samples, Samples, Samples)> {
         s.track(t).unwrap().clips().iter().map(|c| (c.start, c.length, c.source_offset())).collect()
+    }
+
+    #[test]
+    fn sculpt_core_group_move_keeps_crossfade() {
+        let (mut s, t) = session_with_clip();
+        let first = s.track(t).unwrap().clips()[0].id;
+        let second = s.new_clip_id();
+        if let Some(pl) = s.track_mut(t).and_then(|t| t.playlist_mut()) {
+            pl.clips.push(Clip::audio(second, "b", SourceId(500), 5000, 5000, 2500));
+            pl.sort();
+        }
+        let key = sculpt_xfade_join_key(first, second);
+        assert!(create_fades(&mut s, t, Range::new(4750, 5250), FadeShape::EqualPower)>0);
+        let original = *s.edit.values.get(&key).expect("crossfade seam");
+        assert_eq!(move_clips(&mut s, &[first,second], 1000, None), 2);
+        let v = s.track(t).unwrap().clips();
+        assert_eq!(v.len(),2, "moving two clips must not delete one side");
+        assert!(v[0].end()>v[1].start, "overlap must survive group move");
+        assert!(v[0].fade_out.len>0 && v[1].fade_in.len>0, "both fades remain linked");
+        assert_eq!(s.edit.values.get(&key).copied(),Some(original+1000.0));
+        assert_eq!(move_clips(&mut s, &[second], 1500, None), 1);
+        assert!(!s.edit.values.contains_key(&key));
+        assert_eq!(s.find_clip(first).unwrap().1.fade_out.len,0);
+        assert_eq!(s.find_clip(second).unwrap().1.fade_in.len,0);
     }
 
     #[test]

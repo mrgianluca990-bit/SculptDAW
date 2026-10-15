@@ -708,9 +708,11 @@ fn store_wav(dir: &Path, stem: &str, bytes: &[u8]) -> Result<(String, bool)> {
 
 /// Open a `.scraft` session and decode its audio files (missing files are reported, not fatal).
 pub fn open_session(e: &mut Engine, path: &str) -> Result<Vec<String>> {
-    let text = std::fs::read_to_string(path).map_err(|err| EngineError::Io(format!("{path}: {err}")))?;
+    // SCULPT_CORE_SESSION_OPEN_PATH_V1: same path resolver used by Save As.
+    let path = session_file(path);
+    let text = std::fs::read_to_string(&path).map_err(|err| EngineError::Io(format!("{}: {err}", path.display())))?;
     let mut s = Session::from_json(&text).map_err(|err| EngineError::Io(err.to_string()))?;
-    let dir = Path::new(path).parent().map(Path::to_path_buf).unwrap_or_default();
+    let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
     let mut missing = Vec::new();
     for src in s.sources.clone() {
         let p = if Path::new(&src.path).is_absolute() { PathBuf::from(&src.path) } else { dir.join(&src.path) };
@@ -726,7 +728,7 @@ pub fn open_session(e: &mut Engine, path: &str) -> Result<Vec<String>> {
     missing.extend(relink_videos(&mut s, &dir));
     s.folder = Some(dir);
     e.replace_session(s);
-    e.path = Some(path.to_string());
+    e.path = Some(path.to_string_lossy().into_owned());
     for m in &missing {
         e.message(format!("missing media: {m}"));
     }
@@ -1298,5 +1300,43 @@ mod bundle_tests {
         write_file(&p.to_string_lossy(), b"hello").unwrap();
         assert_eq!(std::fs::read(&p).unwrap(), b"hello");
         let _ = std::fs::remove_file(&p);
+    }
+}
+
+#[cfg(test)]
+mod sculpt_core_session_roundtrip_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn sculpt_core_save_and_open_session_with_audio_and_fades() {
+        let base = std::env::temp_dir().join(format!("sculpt-core-reopen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let audio = base.join("incoming.wav");
+        let mut wav = soundcraft_audio_io::wav_float_header(1, 48_000, 4800).unwrap();
+        wav.extend((0..4800).flat_map(|i| ((i % 20) as f32 / 40.0).to_le_bytes()));
+        std::fs::write(&audio, wav).unwrap();
+        let mut first = Engine::default();
+        first.execute("file.import_audio", &json!({"path": audio.to_str().unwrap()})).unwrap();
+        let tid = first.session().tracks[0].id;
+        let cid = first.session().tracks[0].clips()[0].id;
+        let save = base.join("My Sculpt Session.scraft");
+        first.execute("edit.select", &json!({"tracks":[tid.0], "start":0, "end":600})).unwrap();
+        first.execute("edit.fades_create", &json!({"tracks":[tid.0], "start":0,"end":600})).unwrap();
+        first.execute("session.save_as", &json!({"path":save.to_str().unwrap()})).unwrap();
+        assert!(save.is_file());
+        assert!(base.join("Audio Files").is_dir());
+        let mut reopened = Engine::default();
+        let missing = open_session(&mut reopened, save.to_str().unwrap()).unwrap();
+        assert!(missing.is_empty(), "missing media: {missing:?}");
+        assert_eq!(reopened.session().tracks[0].clips()[0].id, cid);
+        assert_eq!(reopened.session().tracks[0].clips()[0].fade_in.len, 600);
+        assert!(reopened.session().pool.get(reopened.session().sources[0].id).is_some());
+        reopened.execute("session.save", &json!({})).unwrap();
+        let mut again = Engine::default();
+        again.execute("session.open", &json!({"path":base.join("My Sculpt Session").to_str().unwrap()})).unwrap();
+        assert_eq!(again.session().tracks[0].clips()[0].fade_in.len, 600);
+        let _ = std::fs::remove_dir_all(base);
     }
 }

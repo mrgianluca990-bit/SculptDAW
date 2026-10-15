@@ -140,8 +140,9 @@ fn fixed(app: &mut SoundApp, key: Key, m: Modifiers, mac: bool) -> bool {
             let _ = app.run("window.toggle_mix_edit", json!({}));
             true
         }
+        // SCULPT_CORE_MAC_RETURN_RTZ_V1: Return is Return-to-Zero, not Add Marker.
         Key::Enter if plain => {
-            let _ = app.run("markers.add", json!({}));
+            let _ = app.run("transport.rtz", json!({}));
             true
         }
         Key::F1 | Key::F2 | Key::F3 | Key::F4 if plain => {

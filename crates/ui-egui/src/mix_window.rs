@@ -155,17 +155,19 @@ fn strip(app: &mut SoundApp, ui: &mut Ui, id: TrackId, snap: Option<&MeterSnapsh
     }
     for (key, title, off, is_send) in [
         ("inserts_ae", "INSERTS A-E", 0usize, false),
-        ("inserts_fj", "INSERTS F-J", 5, false),
+        ("inserts_fj", "INSERTS F-H", 5, false),
         ("sends_ae", "SENDS A-E", 0, true),
-        ("sends_fj", "SENDS F-J", 5, true),
+        ("sends_fj", "SENDS F-H", 5, true),
     ] {
         if !(all || has(key)) {
             continue;
         }
-        let sec = Rect::from_min_size(pos2(x0, y), vec2(inner_w, 16.0 + 5.0 * 17.0));
+        // SCULPT_CORE_EIGHT_SLOTS_V1: groups A-E (5) + F-H (3) = 8, never display I/J.
+        let visible = if off == 5 { 3usize } else { 5usize };
+        let sec = Rect::from_min_size(pos2(x0, y), vec2(inner_w, 16.0 + visible as f32 * 17.0));
         ui.painter().rect_filled(sec, 2.0, t.strip_section);
         section_label(ui, sec, title);
-        for k in 0..5 {
+        for k in 0..visible {
             let sr = Rect::from_min_size(pos2(x0 + 2.0, sec.min.y + 15.0 + k as f32 * 17.0), vec2(inner_w - 4.0, 15.0));
             if is_send {
                 send_slot(app, ui, &track, off + k, sr);

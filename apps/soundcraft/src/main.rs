@@ -246,6 +246,12 @@ fn main() -> eframe::Result {
     let engine = if demo { soundcraft_engine::demo::demo_engine() } else { Engine::default() };
     let prefs = load_prefs().unwrap_or_default();
     let mut options = eframe::NativeOptions {
+        // SCULPT_MAC_TOUCHBAR_EXIT_PILOT_V1: macOS 26 AppKit KVO crash on shutdown.
+        // Sculpt already saves its UI/window preferences separately via save_prefs.
+        #[cfg(target_os = "macos")]
+        persist_window: false,
+        #[cfg(target_os = "macos")]
+        run_and_return: false,
         viewport: egui::ViewportBuilder::default()
             .with_title("Sculpt DAW")
             .with_inner_size(sane_window_size(prefs.window_size))
@@ -280,6 +286,13 @@ fn main() -> eframe::Result {
             app.preset_dir = prefs_path().and_then(|p| p.parent().map(|d| d.join("Presets")));
             app.extra.ui_scale = prefs.ui_scale;
             app.ui = prefs;
+            // SCULPT_CORE_EIGHT_SLOTS_DEFAULT_V1: ensure F-H is available in Mix by default.
+            // Existing A-E toggles and custom UI preferences remain intact.
+            for (first, second) in [("inserts_ae", "inserts_fj"), ("sends_ae", "sends_fj")] {
+                if app.ui.mix_views.iter().any(|k| k == first) && !app.ui.mix_views.iter().any(|k| k == second) {
+                    app.ui.mix_views.push(second.to_string());
+                }
+            }
             if let Some(port) = control_port {
                 let rx = control_server::start(port, cc.egui_ctx.clone());
                 app = app.with_control(rx);

@@ -364,6 +364,16 @@ impl SoundApp {
                 if id == "app.quit" {
                     self.quit_requested = true;
                 }
+                // SCULPT_CORE_SESSION_OPEN_STATUS_V1: distinguish successful load and media missing.
+                if id == "session.open" {
+                    let missing = v.get("missing").and_then(Value::as_array).map_or(0, Vec::len);
+                    let name = &self.engine.session().name;
+                    self.ui.status = if missing == 0 {
+                        format!("Session opened: {name}")
+                    } else {
+                        format!("Session opened: {name} — {missing} missing audio file(s)")
+                    };
+                }
                 if id == "options.scrolling" {
                     // Re-selecting a scrolling mode resumes the playhead follow.
                     self.edit_layout.follow_hold = false;

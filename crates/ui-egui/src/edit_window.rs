@@ -1016,7 +1016,7 @@ fn header_column(app: &mut SoundApp, ui: &mut Ui, track: &Track, col: &str, r: R
         }
         "inserts_ae" | "inserts_fj" => {
             let off = if col == "inserts_ae" { 0 } else { 5 };
-            for i in 0..5.min(rows) {
+            for i in 0..(if off == 5 { 3 } else { 5 }).min(rows) {
                 let name = track
                     .mixer
                     .inserts
@@ -1052,7 +1052,7 @@ fn header_column(app: &mut SoundApp, ui: &mut Ui, track: &Track, col: &str, r: R
         }
         "sends_ae" | "sends_fj" => {
             let off = if col == "sends_ae" { 0 } else { 5 };
-            for i in 0..5.min(rows) {
+            for i in 0..(if off == 5 { 3 } else { 5 }).min(rows) {
                 let s = track
                     .mixer
                     .sends
@@ -1187,7 +1187,8 @@ fn sculpt_draw_crossfades(painter: &egui::Painter, s: &Session, track: &Track, t
         let x1 = x_of(s, tl, a.end());
         if x1 < tl.min.x || x0 > tl.max.x || (x1 - x0) < 3.0 { continue; }
         let area = Rect::from_min_max(pos2(x0, lane.min.y + 1.0), pos2(x1, lane.max.y - 1.0));
-        painter.rect_filled(area, 0.0, Color32::from_rgba_unmultiplied(234, 199, 116, 45));
+        // SCULPT_CORE_XFADE_PAINT_V1: subtle overlap with two distinguishable envelopes.
+        painter.rect_filled(area, 0.0, Color32::from_rgba_unmultiplied(210, 215, 220, 26));
         let chosen = selection.is_some_and(|f| f.track == track.id && f.clip == a.id && f.other == Some(b.id));
         painter.rect_stroke(area, 0.0, Stroke::new(if chosen { 3.0 } else { 1.5 }, if chosen { Color32::from_rgb(255, 248, 175) } else { Color32::from_rgb(230, 190, 105) }), StrokeKind::Inside);
         let mut outgoing = Vec::new();
@@ -1203,9 +1204,6 @@ fn sculpt_draw_crossfades(painter: &egui::Painter, s: &Session, track: &Track, t
         }
         painter.add(Shape::line(outgoing, Stroke::new(2.0, Color32::from_rgb(243, 155, 175))));
         painter.add(Shape::line(incoming, Stroke::new(2.0, Color32::from_rgb(132, 237, 179))));
-        if x1 - x0 > 45.0 && area.height() > 35.0 {
-            painter.text(pos2(area.center().x, area.min.y + 9.0), Align2::CENTER_CENTER, if chosen { "X-FADE SELECTED" } else { "X-FADE" }, bold(9.0), Color32::WHITE);
-        }
     }
 }
 
@@ -1350,19 +1348,25 @@ fn draw_clip(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track
         painter.rect_filled(Rect::from_center_size(pos2(icon.center().x, icon.center().y + 2.0), vec2(icon.width(), 3.0)), 1.0, col);
         painter.text(pos2(icon.max.x + 3.0, icon.center().y), Align2::LEFT_CENTER, format!("{:+.1} dB", clip.gain_db), regular(9.5), col);
     }
+    // SCULPT_CORE_XFADE_SINGLE_OVERLAY_V1: a crossfade is drawn only by sculpt_draw_crossfades.
+    // Prevent the same two envelopes from also looking like independent corner fades.
+    let crossfade_in = track.clips().windows(2).any(|p| p[1].id == clip.id && p[0].end() > p[1].start
+        && p[0].fade_out.len > 0 && p[1].fade_in.len > 0);
+    let crossfade_out = track.clips().windows(2).any(|p| p[0].id == clip.id && p[0].end() > p[1].start
+        && p[0].fade_out.len > 0 && p[1].fade_in.len > 0);
     // Sculpt: fades must stay legible against waveforms, even without selecting the clip.
     let fade_col = Color32::from_rgba_unmultiplied(255, 255, 255, 225);
     let select_in = app.ui.selected_fade.is_some_and(|f| f.track == track.id && f.clip == clip.id && f.other.is_none() && f.fade_in);
     let select_out = app.ui.selected_fade.is_some_and(|f| f.track == track.id && f.clip == clip.id && f.other.is_none() && !f.fade_in);
-    if clip.fade_in.len > 0 {
+    if clip.fade_in.len > 0 && !crossfade_in {
         let fx = x_of(s, tl, clip.start + clip.fade_in.len);
         if fx > x0 { painter.rect_filled(Rect::from_min_max(pos2(x0, body_r.min.y), pos2(fx, body_r.max.y)), 0.0, Color32::from_white_alpha(16)); }
     }
-    if clip.fade_out.len > 0 {
+    if clip.fade_out.len > 0 && !crossfade_out {
         let fx = x_of(s, tl, clip.end() - clip.fade_out.len);
         if x1 > fx { painter.rect_filled(Rect::from_min_max(pos2(fx, body_r.min.y), pos2(x1, body_r.max.y)), 0.0, Color32::from_white_alpha(16)); }
     }
-    if clip.fade_in.len > 0 {
+    if clip.fade_in.len > 0 && !crossfade_in {
         let fx = x_of(s, tl, clip.start + clip.fade_in.len);
         let pts: Vec<Pos2> = (0..=16)
             .map(|i| {
@@ -1373,7 +1377,7 @@ fn draw_clip(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track
         painter.add(Shape::line(pts, Stroke::new(if select_in { 3.0 } else { 2.0 }, if select_in { Color32::from_rgb(255, 224, 112) } else { fade_col })));
         painter.line_segment([pos2(x0, body_r.min.y), pos2(fx, body_r.min.y)], Stroke::new(1.0, fade_col));
     }
-    if clip.fade_out.len > 0 {
+    if clip.fade_out.len > 0 && !crossfade_out {
         let fx = x_of(s, tl, clip.end() - clip.fade_out.len);
         let pts: Vec<Pos2> = (0..=16)
             .map(|i| {
@@ -1550,14 +1554,16 @@ fn sculpt_fade_at_pointer(s: &Session, track: &Track, tl: Rect, lane: Rect, p: P
         if c.fade_in.len > 0 && c.start <= at && at < c.start + c.fade_in.len {
             let phase = (at - c.start) as f32 / c.fade_in.len as f32;
             let y = lane.max.y - h * c.fade_in.shape.gain(phase);
-            if (p.y - y).abs() <= 11.0 {
+            // SCULPT_CORE_FADE_HIT_V1: full area of the fade, instead of the thin curve.
+            if p.y >= top && p.y <= lane.max.y {
                 return Some(FadeSelection { track: track.id, clip: c.id, other: None, fade_in: true });
             }
         }
         if c.fade_out.len > 0 && c.end() - c.fade_out.len <= at && at < c.end() {
             let phase = (c.end() - at) as f32 / c.fade_out.len as f32;
             let y = lane.max.y - h * c.fade_out.shape.gain(phase);
-            if (p.y - y).abs() <= 11.0 {
+            // SCULPT_CORE_FADE_HIT_V1: full area of the fade, instead of the thin curve.
+            if p.y >= top && p.y <= lane.max.y {
                 return Some(FadeSelection { track: track.id, clip: c.id, other: None, fade_in: false });
             }
         }

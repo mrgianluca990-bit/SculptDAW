@@ -20,8 +20,13 @@ Track > New...
 Track > Delete
 View > Mix Window Views > Inserts A-E
 View > Mix Window Views > Sends A-E
+View > Mix Window Views > Inserts F-J
+View > Mix Window Views > Sends F-J
 View > Mix Window Views > I/O
 View > Edit Window Views > Inserts A-E
+View > Edit Window Views > Inserts F-J
+View > Edit Window Views > Sends A-E
+View > Edit Window Views > Sends F-J
 View > Edit Window Views > I/O
 Window > Edit
 Window > Mix
