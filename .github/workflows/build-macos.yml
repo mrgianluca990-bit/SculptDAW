@@ -1,4 +1,4 @@
-name: Sculpt DAW - Edit, Fades and Shutdown Pilot
+name: Sculpt DAW - Selectable Fades and Mac Delete
 
 on:
   push:
@@ -1214,6 +1214,318 @@ jobs:
           PYSHUTDOWN
           git diff --stat
 
+      - name: Enable selectable fades and macOS Delete / Backspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -q 'SCULPT_FADE_SELECTION_V1' crates/ui-egui/src/lib.rs; then
+            echo 'Selectable fades source already integrated.'
+            exit 0
+          fi
+          python3 - <<'PYFADE'
+          #!/usr/bin/env python3
+          """SCULPT_FADE_SELECTION_V1: select/delete individual fades and crossfades, Mac Backspace."""
+          from pathlib import Path
+          
+          def replace_one(path, before, after):
+              f=Path(path)
+              data=f.read_text()
+              hits=data.count(before)
+              if hits != 1:
+                  raise RuntimeError(f'{path}: expected one occurrence, got {hits}: {before[:110]!r}')
+              f.write_text(data.replace(before,after,1))
+              print(f'Patched: {path}')
+          
+          lib='crates/ui-egui/src/lib.rs'
+          replace_one(lib,'''/// UI state (serde, so agents can read and set it).
+          ''','''/// A timeline fade selection; `other` identifies the incoming clip in a crossfade.
+          /// This is transient UI state, never persisted as part of an audio session.
+          #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+          pub struct FadeSelection {
+              pub track: TrackId,
+              pub clip: soundcraft_model::ClipId,
+              pub other: Option<soundcraft_model::ClipId>,
+              pub fade_in: bool,
+          }
+          
+          /// UI state (serde, so agents can read and set it).
+          ''')
+          replace_one(lib,'''    pub plugin_windows: Vec<(TrackId, usize)>,
+          ''','''    pub plugin_windows: Vec<(TrackId, usize)>,
+              /// Fade/crossfade highlighted in Edit; selecting one does not select or delete its clip.
+              #[serde(skip)]
+              pub selected_fade: Option<FadeSelection>,
+          ''')
+          replace_one(lib,'''            plugin_windows: Vec::new(),
+          ''','''            plugin_windows: Vec::new(),
+                      selected_fade: None,
+          ''')
+          replace_one(lib,'''                    self.gesture = None;
+                              self.touched.clear();
+          ''','''                    self.gesture = None;
+                              self.ui.selected_fade = None;
+                              self.touched.clear();
+          ''')
+          
+          edit='crates/engine/src/edit.rs'
+          new_func='''/// Delete only the selected fade. A crossfade is addressed by both clip IDs,
+          /// not a time range that might inadvertently remove neighbouring fades.
+          /// The saved original join restores both audio clip boundaries exactly.
+          pub fn delete_selected_fade(s: &mut Session, track: TrackId, id: ClipId, other: Option<ClipId>, fade_in: bool) -> usize {
+              if let Some(next) = other {
+                  let key = sculpt_xfade_join_key(id, next);
+                  let original = s.edit.values.get(&key).copied();
+                  let Some(pl) = s.track_mut(track).and_then(|t| t.playlist_mut()) else { return 0 };
+                  let Some(i) = pl.clips.iter().position(|c| c.id == id) else { return 0 };
+                  let Some(j) = pl.clips.iter().position(|c| c.id == next) else { return 0 };
+                  if j != i + 1 { return 0; }
+                  let (a, b) = (&pl.clips[i], &pl.clips[j]);
+                  if !a.is_audio() || !b.is_audio() || a.end() <= b.start || a.fade_out.len == 0 || b.fade_in.len == 0 {
+                      return 0;
+                  }
+                  let seam = original.map_or(b.start + (a.end() - b.start) / 2, |v| v as Samples);
+                  if seam <= a.start || seam >= b.end() { return 0; }
+                  let left = &mut pl.clips[i];
+                  left.fade_out = Fade::default();
+                  left.trim_end_to(seam);
+                  let right = &mut pl.clips[j];
+                  right.fade_in = Fade::default();
+                  right.trim_start_to(seam);
+                  s.edit.values.remove(&key);
+                  return 1;
+              }
+              let Some(c) = s.track_mut(track).and_then(|t| t.playlist_mut()).and_then(|p| p.clips.iter_mut().find(|c| c.id == id)) else { return 0 };
+              let fade = if fade_in { &mut c.fade_in } else { &mut c.fade_out };
+              if fade.len <= 0 { return 0; }
+              *fade = Fade::default();
+              1
+          }
+          
+          '''
+          replace_one(edit,'''/// Remove only fades intersecting the requested range (or the cursor position).
+          ''',new_func+'''/// Remove only fades intersecting the requested range (or the cursor position).
+          ''')
+          replace_one(edit,'''    #[test]
+              fn sculpt_asymmetric_crossfade_restores_exact_junction() {
+          ''','''    #[test]
+              fn sculpt_selected_fade_delete_preserves_clip_and_opposite_fade() {
+                  let (mut s, t) = session_with_clip();
+                  let clip = s.track(t).unwrap().clips()[0].id;
+                  assert_eq!(create_fades(&mut s, t, Range::new(1000, 1750), FadeShape::EqualPower), 1);
+                  s.find_clip_mut(clip).unwrap().fade_out = Fade { len: 500, shape: FadeShape::Linear };
+                  let end_before = s.track(t).unwrap().clips()[0].end();
+                  assert_eq!(delete_selected_fade(&mut s, t, clip, None, true), 1);
+                  let c = &s.track(t).unwrap().clips()[0];
+                  assert_eq!(c.fade_in.len, 0);
+                  assert_eq!(c.fade_out.len, 500);
+                  assert_eq!(c.end(), end_before);
+                  assert_eq!(delete_selected_fade(&mut s, t, clip, None, true), 0);
+              }
+          
+              #[test]
+              fn sculpt_selected_crossfade_delete_restores_its_original_junction() {
+                  let (mut s, t) = session_with_clip();
+                  separate_at(&mut s, t, 3000);
+                  assert_eq!(create_fades(&mut s, t, Range::new(2850, 3090), FadeShape::EqualPower), 1);
+                  let ids: Vec<_> = s.track(t).unwrap().clips().iter().map(|c| c.id).collect();
+                  assert_eq!(delete_selected_fade(&mut s, t, ids[0], Some(ids[1]), false), 1);
+                  let c = s.track(t).unwrap().clips();
+                  assert_eq!((c[0].end(), c[1].start), (3000, 3000));
+                  assert_eq!((c[0].fade_out.len, c[1].fade_in.len), (0, 0));
+                  assert_eq!(delete_selected_fade(&mut s, t, ids[0], Some(ids[1]), false), 0);
+              }
+          
+              #[test]
+              fn sculpt_asymmetric_crossfade_restores_exact_junction() {
+          ''')
+          
+          cmd='crates/engine/src/cmd/edit.rs'
+          replace_one(cmd,'''        cmd!("edit.fades_delete", "Delete", ["Edit", "Fades"], None, "{tracks?, start?, end?}", has_selection, fades_delete),
+          ''','''        cmd!("edit.fades_delete", "Delete", ["Edit", "Fades"], None, "{tracks?, start?, end?}", has_selection, fades_delete),
+                  cmd!("edit.fade_delete_target", "Delete Selected Fade", [], None, "{track, clip, other?, fade_in?}", always, fade_delete_target),
+          ''')
+          replace_one(cmd,'''fn fades_delete(e: &mut Engine, p: &Value) -> Result<Value> {
+          ''','''fn fade_delete_target(e: &mut Engine, p: &Value) -> Result<Value> {
+              let cmd = "edit.fade_delete_target";
+              let track = p.get("track").and_then(Value::as_u64).map(TrackId).ok_or_else(|| bad(cmd, "missing track"))?;
+              let clip = p.get("clip").and_then(Value::as_u64).map(ClipId).ok_or_else(|| bad(cmd, "missing clip"))?;
+              let other = p.get("other").and_then(Value::as_u64).map(ClipId);
+              let fade_in = p.get("fade_in").and_then(Value::as_bool).unwrap_or(false);
+              let count = ops::delete_selected_fade(e.session_mut(), track, clip, other, fade_in);
+              if count == 0 { return Err(bad(cmd, "selected fade or crossfade no longer exists")); }
+              Ok(json!({"deleted": count}))
+          }
+          
+          fn fades_delete(e: &mut Engine, p: &Value) -> Result<Value> {
+          ''')
+          
+          editui='crates/ui-egui/src/edit_window.rs'
+          replace_one(editui,'''use crate::{Gesture, SoundApp, icons, toolbar};
+          ''','''use crate::{FadeSelection, Gesture, SoundApp, icons, toolbar};
+          ''')
+          replace_one(editui,'''    sculpt_draw_crossfades(&painter, &s, &track, tl, lane);
+          ''','''    sculpt_draw_crossfades(&painter, &s, &track, tl, lane, app.ui.selected_fade);
+          ''')
+          replace_one(editui,'''fn sculpt_draw_crossfades(painter: &egui::Painter, s: &Session, track: &Track, tl: Rect, lane: Rect) {
+          ''','''fn sculpt_draw_crossfades(painter: &egui::Painter, s: &Session, track: &Track, tl: Rect, lane: Rect, selection: Option<FadeSelection>) {
+          ''')
+          replace_one(editui,'''        painter.rect_stroke(area, 0.0, Stroke::new(1.5, Color32::from_rgb(230, 190, 105)), StrokeKind::Inside);
+          ''','''        let chosen = selection.is_some_and(|f| f.track == track.id && f.clip == a.id && f.other == Some(b.id));
+                  painter.rect_stroke(area, 0.0, Stroke::new(if chosen { 3.0 } else { 1.5 }, if chosen { Color32::from_rgb(255, 248, 175) } else { Color32::from_rgb(230, 190, 105) }), StrokeKind::Inside);
+          ''')
+          replace_one(editui,'''            painter.text(pos2(area.center().x, area.min.y + 9.0), Align2::CENTER_CENTER, "X-FADE", bold(9.0), Color32::WHITE);
+          ''','''            painter.text(pos2(area.center().x, area.min.y + 9.0), Align2::CENTER_CENTER, if chosen { "X-FADE SELECTED" } else { "X-FADE" }, bold(9.0), Color32::WHITE);
+          ''')
+          replace_one(editui,'''    let fade_col = Color32::from_rgba_unmultiplied(255, 255, 255, 225);
+          ''','''    let fade_col = Color32::from_rgba_unmultiplied(255, 255, 255, 225);
+              let select_in = app.ui.selected_fade.is_some_and(|f| f.track == track.id && f.clip == clip.id && f.other.is_none() && f.fade_in);
+              let select_out = app.ui.selected_fade.is_some_and(|f| f.track == track.id && f.clip == clip.id && f.other.is_none() && !f.fade_in);
+          ''')
+          replace_one(editui,'''        painter.add(Shape::line(pts, Stroke::new(2.0, fade_col)));
+                  painter.line_segment([pos2(x0, body_r.min.y), pos2(fx, body_r.min.y)], Stroke::new(1.0, fade_col));
+          ''','''        painter.add(Shape::line(pts, Stroke::new(if select_in { 3.0 } else { 2.0 }, if select_in { Color32::from_rgb(255, 224, 112) } else { fade_col })));
+                  painter.line_segment([pos2(x0, body_r.min.y), pos2(fx, body_r.min.y)], Stroke::new(1.0, fade_col));
+          ''')
+          replace_one(editui,'''        painter.add(Shape::line(pts, Stroke::new(2.0, fade_col)));
+              }
+              // Optional clip overlays (View › Clip).
+          ''','''        painter.add(Shape::line(pts, Stroke::new(if select_out { 3.0 } else { 2.0 }, if select_out { Color32::from_rgb(255, 224, 112) } else { fade_col })));
+              }
+              // Optional clip overlays (View › Clip).
+          ''')
+          
+          # Pointer hit-testing is based on painted curve geometry. Crossfade overlap takes priority;
+          # single fade hit-testing checks distance from the line, not the whole clip.
+          helper='''/// Locate the fade explicitly clicked, without selecting or deleting the audio clip.
+          fn sculpt_fade_at_pointer(s: &Session, track: &Track, tl: Rect, lane: Rect, p: Pos2) -> Option<FadeSelection> {
+              if !lane.contains(p) { return None; }
+              let at = sample_at(s, tl, p.x).max(0);
+              for pair in track.clips().windows(2) {
+                  let (a, b) = (&pair[0], &pair[1]);
+                  if a.is_audio() && b.is_audio() && a.end() > b.start && a.fade_out.len > 0 && b.fade_in.len > 0
+                      && b.start <= at && at < a.end()
+                  {
+                      return Some(FadeSelection { track: track.id, clip: a.id, other: Some(b.id), fade_in: false });
+                  }
+              }
+              let top = lane.min.y + if lane.height() >= 40.0 && s.edit.flag("view.clip.name") { 13.0 } else { 0.0 };
+              let h = (lane.max.y - top).max(1.0);
+              for c in track.clips() {
+                  if !c.is_audio() { continue; }
+                  if c.fade_in.len > 0 && c.start <= at && at < c.start + c.fade_in.len {
+                      let phase = (at - c.start) as f32 / c.fade_in.len as f32;
+                      let y = lane.max.y - h * c.fade_in.shape.gain(phase);
+                      if (p.y - y).abs() <= 11.0 {
+                          return Some(FadeSelection { track: track.id, clip: c.id, other: None, fade_in: true });
+                      }
+                  }
+                  if c.fade_out.len > 0 && c.end() - c.fade_out.len <= at && at < c.end() {
+                      let phase = (c.end() - at) as f32 / c.fade_out.len as f32;
+                      let y = lane.max.y - h * c.fade_out.shape.gain(phase);
+                      if (p.y - y).abs() <= 11.0 {
+                          return Some(FadeSelection { track: track.id, clip: c.id, other: None, fade_in: false });
+                      }
+                  }
+              }
+              None
+          }
+          
+          fn sculpt_delete_target(app: &mut SoundApp, target: FadeSelection) {
+              let result = app.run("edit.fade_delete_target", json!({
+                  "track": target.track.0,
+                  "clip": target.clip.0,
+                  "other": target.other.map(|id| id.0),
+                  "fade_in": target.fade_in,
+              }));
+              match result {
+                  Ok(_) => app.ui.selected_fade = None,
+                  Err(e) => app.ui.status = e,
+              }
+          }
+          
+          '''
+          replace_one(editui,'''fn lane_interaction(app: &mut SoundApp, ui: &mut Ui, track: &Track, lane: Rect, tl: Rect) {
+          ''',helper+'''fn lane_interaction(app: &mut SoundApp, ui: &mut Ui, track: &Track, lane: Rect, tl: Rect) {
+          ''')
+          # Use the fade target stored on right-click to offer precise removal for all three variants.
+          replace_one(editui,'''    let menu_xfade_id = id.with("sculpt_menu_xfade");
+          ''','''    let menu_xfade_id = id.with("sculpt_menu_xfade");
+              let menu_fade_id = id.with("sculpt_menu_fade");
+          ''')
+          replace_one(editui,'''        ui.ctx().data_mut(|d| d.insert_temp(menu_clip_id, clip));
+          ''','''        ui.ctx().data_mut(|d| d.insert_temp(menu_clip_id, clip));
+                  let target = resp.interact_pointer_pos().and_then(|p| sculpt_fade_at_pointer(app.engine.session(), track, tl, lane, p));
+                  ui.ctx().data_mut(|d| d.insert_temp(menu_fade_id, target));
+          ''')
+          replace_one(editui,'''    let menu_xfade = ui.ctx().data(|d| d.get_temp::<Option<(Samples, Samples)>>(menu_xfade_id)).flatten();
+              resp.context_menu(|ui| {
+                  if let Some((start, end)) = menu_xfade {
+                      ui.label("Crossfade");
+                      if ui.button("Delete Crossfade").clicked() {
+                          let _ = app.run("edit.fades_delete", json!({"tracks": [track.id.0], "start": start, "end": end}));
+                          ui.close();
+                      }
+                      ui.separator();
+                  }
+                  clip_context_menu(app, ui, menu_clip);
+              });
+          ''','''    let _menu_xfade = ui.ctx().data(|d| d.get_temp::<Option<(Samples, Samples)>>(menu_xfade_id)).flatten();
+              let menu_fade = ui.ctx().data(|d| d.get_temp::<Option<FadeSelection>>(menu_fade_id)).flatten();
+              resp.context_menu(|ui| {
+                  if let Some(target) = menu_fade {
+                      let label = if target.other.is_some() { "Delete Crossfade" } else if target.fade_in { "Delete Fade In" } else { "Delete Fade Out" };
+                      ui.label(if target.other.is_some() { "Crossfade" } else { "Fade" });
+                      if ui.button(label).clicked() {
+                          sculpt_delete_target(app, target);
+                          ui.close();
+                      }
+                      ui.separator();
+                  }
+                  clip_context_menu(app, ui, menu_clip);
+              });
+          ''')
+          replace_one(editui,'''    let hit = clip_at(track, at_origin).cloned();
+          ''','''    let hit = clip_at(track, at_origin).cloned();
+              if resp.clicked() {
+                  if let Some(fade) = sculpt_fade_at_pointer(&s, track, tl, lane, p) {
+                      app.ui.selected_fade = Some(fade);
+                      ui.ctx().request_repaint();
+                      return;
+                  }
+                  app.ui.selected_fade = None;
+              }
+          ''')
+          
+          short='crates/ui-egui/src/shortcuts.rs'
+          replace_one(short,'''    match key {
+                  Key::Space if !m.command && !m.alt => {
+          ''','''    match key {
+                  // macOS Delete sends Backspace; external keyboards can send Delete.
+                  // If a fade is selected, erase ONLY that fade (never its source clip).
+                  Key::Backspace | Key::Delete if plain && app.ui.window == MainWindow::Edit => {
+                      if let Some(fade) = app.ui.selected_fade {
+                          let args = json!({"track": fade.track.0, "clip": fade.clip.0,
+                              "other": fade.other.map(|id| id.0), "fade_in": fade.fade_in});
+                          match app.run("edit.fade_delete_target", args) {
+                              Ok(_) => app.ui.selected_fade = None,
+                              Err(e) => app.ui.status = e,
+                          }
+                      } else {
+                          // Pro Tools-style Delete for selected clips OR a non-empty edit range.
+                          let edit = &app.engine.session().edit;
+                          if !edit.selected_clips.is_empty() || (!edit.selected_tracks.is_empty() && !edit.selection.is_empty()) {
+                              let _ = app.run("edit.clear", json!({}));
+                          }
+                      }
+                      true
+                  }
+                  Key::Space if !m.command && !m.alt => {
+          ''')
+          
+          print('SCULPT_FADE_SELECTION_V1 integrated')
+          PYFADE
+          git diff --stat
+
       - name: Install Rust stable with both macOS targets
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -1230,6 +1542,14 @@ jobs:
           cargo test --locked --target x86_64-apple-darwin -p soundcraft-engine --lib fades_and_crossfades
           cargo test --locked --target x86_64-apple-darwin -p soundcraft-engine --lib sculpt_
           cargo test --locked --target x86_64-apple-darwin -p soundcraft-playback --lib
+
+      - name: Verify selected fade deletion and undo semantics
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --target x86_64-apple-darwin -p soundcraft-engine --lib sculpt_selected_fade_delete
+          cargo test --locked --target x86_64-apple-darwin -p soundcraft-engine --lib sculpt_selected_crossfade_delete
+          cargo test --locked --target x86_64-apple-darwin -p soundcraft-ui-egui --test shortcuts
 
       - name: Build the universal app and CLI
         run: bash sculpt/build-macos.sh
@@ -1255,7 +1575,7 @@ jobs:
       - name: Upload Sculpt DAW app
         uses: actions/upload-artifact@v4
         with:
-          name: Sculpt-DAW-Mac-Edit-Fades-Shutdown-Pilot
+          name: Sculpt-DAW-Mac-Selectable-Fades-Pilot
           path: |
             dist/sculpt/Sculpt_DAW_0.4.0_Mac_Universal.zip
             dist/sculpt/Sculpt_DAW_0.4.0_Mac_Universal.zip.sha256
