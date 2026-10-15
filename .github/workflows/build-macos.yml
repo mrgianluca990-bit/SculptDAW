@@ -1,4 +1,4 @@
-name: Sculpt DAW - Core Plugins VST3 and AU QA
+name: Sculpt DAW - Core 13 - Editing and Session Stabilization
 
 on:
   push:
@@ -192,6 +192,345 @@ jobs:
           PYSCULPTPLUGINS
           git diff --stat
 
+      - name: Patch Sculpt Core 13 - eight slots, fades, crossfade moves, Return, session and exit
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYSCULPT13'
+          #!/usr/bin/env python3
+          """Conservative fixes for Sculpt DAW Core #13. Applied to the checked-out source in GitHub Actions.
+          No new Show code, format migrations, plugin format changes or deletions of stable features.
+          """
+          from pathlib import Path
+
+          def file(p): return Path(p)
+
+          def change(p, old, new, count=1, already=None):
+              f=file(p); t=f.read_text(encoding='utf-8')
+              if already is not None and already in t: return False
+              n=t.count(old)
+              if n != count: raise RuntimeError(f'{p}: expected {count} occurrences, found {n}, anchor={old[:120]!r}')
+              f.write_text(t.replace(old,new,count), encoding='utf-8')
+              print(f'updated {p}'); return True
+
+          MENU='sculpt/qa-core-menu.txt'
+          s=file(MENU).read_text()
+          for entry in ['View > Mix Window Views > Inserts F-J','View > Mix Window Views > Sends F-J',
+                        'View > Edit Window Views > Inserts F-J','View > Edit Window Views > Sends A-E',
+                        'View > Edit Window Views > Sends F-J']:
+              if entry not in s:
+                  tag= 'View > Mix Window Views > I/O' if 'Mix Window' in entry else 'View > Edit Window Views > I/O'
+                  if tag not in s: raise RuntimeError('missing menu insertion point '+tag)
+                  s=s.replace(tag,entry+'\n'+tag,1)
+          file(MENU).write_text(s)
+
+          # Preserve original command IDs/paths while labeling the actual last three slots F-H.
+          MENUS='crates/ui-egui/src/menus.rs'
+          change(MENUS,
+                 '    let label = live_label(app, id.as_deref()).unwrap_or_else(|| n.label.clone());',
+                 '    let label = live_label(app, id.as_deref()).unwrap_or_else(|| match n.label.as_str() {\n'
+                 '        "Inserts F-J" => "Inserts F-H".to_string(),\n'
+                 '        "Sends F-J" => "Sends F-H".to_string(),\n'
+                 '        _ => n.label.clone(),\n'
+                 '    });'.replace("\\n", "\n"),
+                 already='"Inserts F-J" => "Inserts F-H".to_string()')
+          NATIVE='apps/soundcraft/src/native_menu.rs'
+          change(NATIVE,
+                 '        let item = CheckMenuItem::new(label, enabled, checked, None);',
+                 '        let display = match label { "Inserts F-J" => "Inserts F-H", "Sends F-J" => "Sends F-H", _ => label };\n'
+                 '        let item = CheckMenuItem::new(display, enabled, checked, None);'.replace("\\n", "\n"),
+                 already='let display = match label { "Inserts F-J"')
+
+          MIX='crates/ui-egui/src/mix_window.rs'
+          change(MIX,'''        ("inserts_fj", "INSERTS F-J", 5, false),''','''        ("inserts_fj", "INSERTS F-H", 5, false),''',already='("inserts_fj", "INSERTS F-H", 5, false)')
+          change(MIX,'''        ("sends_fj", "SENDS F-J", 5, true),''','''        ("sends_fj", "SENDS F-H", 5, true),''',already='("sends_fj", "SENDS F-H", 5, true)')
+          change(MIX,'''        let sec = Rect::from_min_size(pos2(x0, y), vec2(inner_w, 16.0 + 5.0 * 17.0));
+                  ui.painter().rect_filled(sec, 2.0, t.strip_section);
+                  section_label(ui, sec, title);
+                  for k in 0..5 {''','''        // SCULPT_CORE_EIGHT_SLOTS_V1: groups A-E (5) + F-H (3) = 8, never display I/J.
+                  let visible = if off == 5 { 3usize } else { 5usize };
+                  let sec = Rect::from_min_size(pos2(x0, y), vec2(inner_w, 16.0 + visible as f32 * 17.0));
+                  ui.painter().rect_filled(sec, 2.0, t.strip_section);
+                  section_label(ui, sec, title);
+                  for k in 0..visible {''',already='SCULPT_CORE_EIGHT_SLOTS_V1')
+
+          EDIT='crates/ui-egui/src/edit_window.rs'
+          # Also display only three slots in the Edit-view F-H columns.
+          change(EDIT,'''            for i in 0..5.min(rows) {''','''            for i in 0..(if off == 5 { 3 } else { 5 }).min(rows) {''',count=2,already='for i in 0..(if off == 5 { 3 } else { 5 }).min(rows) {')
+          # Click anywhere inside a single fade's bounded region, not within 11 px of the curve.
+          change(EDIT,'''            if (p.y - y).abs() <= 11.0 {''','''            // SCULPT_CORE_FADE_HIT_V1: full area of the fade, instead of the thin curve.
+                      if p.y >= top && p.y <= lane.max.y {''',count=2,already='SCULPT_CORE_FADE_HIT_V1')
+          # Avoid rendering two *independent* fades beneath one crossfade. Crossfade has its own overlay.
+          s=file(EDIT).read_text()
+          if 'SCULPT_CORE_XFADE_SINGLE_OVERLAY_V1' not in s:
+              needle='''    // Sculpt: fades must stay legible against waveforms, even without selecting the clip.'''
+              if s.count(needle)!=1: raise RuntimeError('no fade painter anchor')
+              insert='''    // SCULPT_CORE_XFADE_SINGLE_OVERLAY_V1: a crossfade is drawn only by sculpt_draw_crossfades.
+              // Prevent the same two envelopes from also looking like independent corner fades.
+              let crossfade_in = track.clips().windows(2).any(|p| p[1].id == clip.id && p[0].end() > p[1].start
+                  && p[0].fade_out.len > 0 && p[1].fade_in.len > 0);
+              let crossfade_out = track.clips().windows(2).any(|p| p[0].id == clip.id && p[0].end() > p[1].start
+                  && p[0].fade_out.len > 0 && p[1].fade_in.len > 0);
+          '''
+              s=s.replace(needle, insert+needle,1)
+              # Restrict rendering code inside draw_clip only, between anchor and next paint block.
+              i=s.index('    // SCULPT_CORE_XFADE_SINGLE_OVERLAY_V1')
+              j=s.index('fn sculpt_fade_at_pointer(',i)
+              v=s[i:j]
+              # these conditions appear twice (shade/curve), replace all in visual block.
+              if v.count('if clip.fade_in.len > 0 {')<1 or v.count('if clip.fade_out.len > 0 {')<1:
+                  raise RuntimeError('expected standalone fade draw conditions')
+              v=v.replace('if clip.fade_in.len > 0 {','if clip.fade_in.len > 0 && !crossfade_in {')
+              v=v.replace('if clip.fade_out.len > 0 {','if clip.fade_out.len > 0 && !crossfade_out {')
+              s=s[:i]+v+s[j:]
+              file(EDIT).write_text(s)
+          # Reduce extra crossfade text that clutters the edit timeline.
+          s=file(EDIT).read_text()
+          if 'SCULPT_CORE_XFADE_PAINT_V1' not in s:
+              old='''        painter.rect_filled(area, 0.0, Color32::from_rgba_unmultiplied(234, 199, 116, 45));'''
+              new='''        // SCULPT_CORE_XFADE_PAINT_V1: subtle overlap with two distinguishable envelopes.
+                  painter.rect_filled(area, 0.0, Color32::from_rgba_unmultiplied(210, 215, 220, 26));'''
+              if s.count(old)!=1:raise RuntimeError('crossfade painter anchor changed')
+              s=s.replace(old,new,1)
+              # Remove X-FADE label: highlighted region and two curves provide feedback.
+              a='''        if x1 - x0 > 45.0 && area.height() > 35.0 {
+                      painter.text(pos2(area.center().x, area.min.y + 9.0), Align2::CENTER_CENTER, if chosen { "X-FADE SELECTED" } else { "X-FADE" }, bold(9.0), Color32::WHITE);
+                  }
+          '''
+              if s.count(a)!=1:raise RuntimeError('crossfade label not found')
+              s=s.replace(a,'',1)
+              file(EDIT).write_text(s)
+
+          SHORT='crates/ui-egui/src/shortcuts.rs'
+          change(SHORT,'''        Key::Enter if plain => {
+                      let _ = app.run("markers.add", json!({}));
+                      true
+                  }''','''        // SCULPT_CORE_MAC_RETURN_RTZ_V1: Return is Return-to-Zero, not Add Marker.
+                  Key::Enter if plain => {
+                      let _ = app.run("transport.rtz", json!({}));
+                      true
+                  }''', already='SCULPT_CORE_MAC_RETURN_RTZ_V1')
+
+          # Make the default UI show the second group, without overwriting manual view preferences.
+          MAIN='apps/soundcraft/src/main.rs'
+          change(MAIN,'''            app.ui = prefs;
+                      if let Some(port) = control_port {''','''            app.ui = prefs;
+                      // SCULPT_CORE_EIGHT_SLOTS_DEFAULT_V1: ensure F-H is available in Mix by default.
+                      // Existing A-E toggles and custom UI preferences remain intact.
+                      for (first, second) in [("inserts_ae", "inserts_fj"), ("sends_ae", "sends_fj")] {
+                          if app.ui.mix_views.iter().any(|k| k == first) && !app.ui.mix_views.iter().any(|k| k == second) {
+                              app.ui.mix_views.push(second.to_string());
+                          }
+                      }
+                      if let Some(port) = control_port {''',already='SCULPT_CORE_EIGHT_SLOTS_DEFAULT_V1')
+          # Add just the extra Edit columns as options, don't force them on cramped track headers.
+          # Mac Touch Bar/AppKit KVO workaround already developed but NOT present in builds #11/#12.
+          change(MAIN,'''    let mut options = eframe::NativeOptions {
+          ''','''    let mut options = eframe::NativeOptions {
+                  // SCULPT_MAC_TOUCHBAR_EXIT_PILOT_V1: macOS 26 AppKit KVO crash on shutdown.
+                  // Sculpt already saves its UI/window preferences separately via save_prefs.
+                  #[cfg(target_os = "macos")]
+                  persist_window: false,
+                  #[cfg(target_os = "macos")]
+                  run_and_return: false,
+          ''',already='SCULPT_MAC_TOUCHBAR_EXIT_PILOT_V1')
+
+          ENGINE='crates/engine/src/edit.rs'
+          s=file(ENGINE).read_text()
+          start=s.index('pub fn move_clips(s: &mut Session, ids: &[ClipId], delta: Samples, to_track: Option<TrackId>) -> usize {')
+          end=s.index('\n/// Session-stable original cut location',start)
+          new_move='''pub fn move_clips(s: &mut Session, ids: &[ClipId], delta: Samples, to_track: Option<TrackId>) -> usize {
+              // SCULPT_CORE_GROUP_MOVE_PRESERVES_XFADE_V1: extract *all* moving clips first,
+              // clear destination material before inserting any, then append all moving clips together.
+              // The former per-clip place_clip() erased the overlap of the preceding moved clip.
+              let moving_ids: std::collections::HashSet<ClipId> = ids.iter().copied().collect();
+              let mut joints = Vec::new();
+              for t in &s.tracks {
+                  for pair in t.clips().windows(2) {
+                      let (a, b) = (&pair[0], &pair[1]);
+                      let key = sculpt_xfade_join_key(a.id, b.id);
+                      if s.edit.values.contains_key(&key) {
+                          joints.push((a.id, b.id, key));
+                      }
+                  }
+              }
+              // Moving only one side breaks the crossfade association intentionally; remove
+              // both linked fades so no misleading standalone fade remains.
+              for (a, b, key) in &joints {
+                  if moving_ids.contains(a) != moving_ids.contains(b) {
+                      if let Some(c) = s.find_clip_mut(*a) { c.fade_out = Fade::default(); }
+                      if let Some(c) = s.find_clip_mut(*b) { c.fade_in = Fade::default(); }
+                      s.edit.values.remove(key);
+                  }
+              }
+              let mut moving: Vec<(TrackId, Clip)> = Vec::new();
+              for t in &mut s.tracks {
+                  let tid = t.id;
+                  if let Some(pl) = t.playlist_mut() {
+                      pl.clips.retain(|c| {
+                          if moving_ids.contains(&c.id) && !c.time_locked && !c.edit_locked {
+                              moving.push((tid, c.clone()));
+                              false
+                          } else { true }
+                      });
+                  }
+              }
+              let n = moving.len();
+              let mut relocated = Vec::with_capacity(n);
+              for (tid, mut c) in moving {
+                  c.start = c.start.saturating_add(delta).max(0);
+                  relocated.push((to_track.unwrap_or(tid), c));
+              }
+              // Clear only STATIONARY material before any of the moved clips are inserted.
+              for (target, c) in &relocated { clear_range(s, *target, c.range(), false); }
+              for (target, c) in relocated {
+                  if let Some(pl) = s.track_mut(target).and_then(|t| t.playlist_mut()) { pl.clips.push(c); }
+              }
+              for t in &mut s.tracks { if let Some(pl) = t.playlist_mut() { pl.sort(); } }
+              // Keep the saved, undoable crossfade seam aligned with the pair when both move.
+              for (a, b, key) in joints {
+                  if moving_ids.contains(&a) && moving_ids.contains(&b)
+                      && let Some(v) = s.edit.values.get_mut(&key)
+                  { *v = (*v + delta as f64).max(0.0); }
+              }
+              n
+          }
+          '''
+          if 'SCULPT_CORE_GROUP_MOVE_PRESERVES_XFADE_V1' not in s:
+              s=s[:start]+new_move+s[end:];file(ENGINE).write_text(s)
+
+          # Test the saved .scraft file with real stored WAV media, not only JSON-to-JSON.
+          IO='crates/engine/src/io.rs'
+          s=file(IO).read_text()
+          if 'mod sculpt_core_session_roundtrip_tests {' not in s:
+              s+='''
+          #[cfg(test)]
+          mod sculpt_core_session_roundtrip_tests {
+              use super::*;
+              use serde_json::json;
+
+              #[test]
+              fn sculpt_core_save_and_open_session_with_audio_and_fades() {
+                  let base = std::env::temp_dir().join(format!("sculpt-core-reopen-{}", std::process::id()));
+                  let _ = std::fs::remove_dir_all(&base);
+                  std::fs::create_dir_all(&base).unwrap();
+                  let audio = base.join("incoming.wav");
+                  let mut wav = soundcraft_audio_io::wav_float_header(1, 48_000, 4800).unwrap();
+                  wav.extend((0..4800).flat_map(|i| ((i % 20) as f32 / 40.0).to_le_bytes()));
+                  std::fs::write(&audio, wav).unwrap();
+                  let mut first = Engine::default();
+                  first.execute("file.import_audio", &json!({"path": audio.to_str().unwrap()})).unwrap();
+                  let tid = first.session().tracks[0].id;
+                  let cid = first.session().tracks[0].clips()[0].id;
+                  let save = base.join("My Sculpt Session.scraft");
+                  first.execute("edit.select", &json!({"tracks":[tid.0], "start":0, "end":600})).unwrap();
+                  first.execute("edit.fades_create", &json!({"tracks":[tid.0], "start":0,"end":600})).unwrap();
+                  first.execute("session.save_as", &json!({"path":save.to_str().unwrap()})).unwrap();
+                  assert!(save.is_file());
+                  assert!(base.join("Audio Files").is_dir());
+                  let mut reopened = Engine::default();
+                  let missing = open_session(&mut reopened, save.to_str().unwrap()).unwrap();
+                  assert!(missing.is_empty(), "missing media: {missing:?}");
+                  assert_eq!(reopened.session().tracks[0].clips()[0].id, cid);
+                  assert_eq!(reopened.session().tracks[0].clips()[0].fade_in.len, 600);
+                  assert!(reopened.session().pool.get(reopened.session().sources[0].id).is_some());
+                  reopened.execute("session.save", &json!({})).unwrap();
+                  let mut again = Engine::default();
+                  again.execute("session.open", &json!({"path":save.to_str().unwrap()})).unwrap();
+                  assert_eq!(again.session().tracks[0].clips()[0].fade_in.len, 600);
+                  let _ = std::fs::remove_dir_all(base);
+              }
+          }
+          '''
+              file(IO).write_text(s)
+          # Source regression for moving overlapped clips and retaining the exact join.
+          s=file(ENGINE).read_text()
+          if 'fn sculpt_core_group_move_keeps_crossfade()' not in s:
+              idx=s.index('    #[test]',s.index('#[cfg(test)]\nmod tests {'))
+              test='''    #[test]
+              fn sculpt_core_group_move_keeps_crossfade() {
+                  let (mut s, t) = session_with_clip();
+                  let first = s.track(t).unwrap().clips()[0].id;
+                  let second = s.new_clip_id();
+                  if let Some(pl) = s.track_mut(t).and_then(|t| t.playlist_mut()) {
+                      pl.clips.push(Clip::audio(second, "b", SourceId(500), 5000, 5000, 2500));
+                      pl.sort();
+                  }
+                  let key = sculpt_xfade_join_key(first, second);
+                  assert!(create_fades(&mut s, t, Range::new(4750, 5250), FadeShape::EqualPower)>0);
+                  let original = *s.edit.values.get(&key).expect("crossfade seam");
+                  assert_eq!(move_clips(&mut s, &[first,second], 1000, None), 2);
+                  let v = s.track(t).unwrap().clips();
+                  assert_eq!(v.len(),2, "moving two clips must not delete one side");
+                  assert!(v[0].end()>v[1].start, "overlap must survive group move");
+                  assert!(v[0].fade_out.len>0 && v[1].fade_in.len>0, "both fades remain linked");
+                  assert_eq!(s.edit.values.get(&key).copied(),Some(original+1000.0));
+                  assert_eq!(move_clips(&mut s, &[second], 1500, None), 1);
+                  assert!(!s.edit.values.contains_key(&key));
+                  assert_eq!(s.find_clip(first).unwrap().1.fade_out.len,0);
+                  assert_eq!(s.find_clip(second).unwrap().1.fade_in.len,0);
+              }
+
+          '''
+              s=s[:idx]+test+s[idx:];file(ENGINE).write_text(s)
+
+          # Prevent past and future accidental removal of already functioning plugin support.
+          assert 'SCULPT_CORE_EIGHT_SLOTS_V1' in file(MIX).read_text()
+          assert 'SCULPT_CORE_FADE_HIT_V1' in file(EDIT).read_text()
+          assert 'SCULPT_MAC_TOUCHBAR_EXIT_PILOT_V1' in file(MAIN).read_text()
+          print('Sculpt Core #13 patch applied.')
+
+          # Sculpt Core #13: make Open Session use exactly the same path/extension normalization as Save.
+          IO = 'crates/engine/src/io.rs'
+          change(IO,
+              "    let text = std::fs::read_to_string(path).map_err(|err| EngineError::Io(format!(\"{path}: {err}\")))?;\n"
+              "    let mut s = Session::from_json(&text).map_err(|err| EngineError::Io(err.to_string()))?;\n"
+              "    let dir = Path::new(path).parent().map(Path::to_path_buf).unwrap_or_default();",
+              "    // SCULPT_CORE_SESSION_OPEN_PATH_V1: same path resolver used by Save As.\n"
+              "    let path = session_file(path);\n"
+              "    let text = std::fs::read_to_string(&path).map_err(|err| EngineError::Io(format!(\"{}: {err}\", path.display())))?;\n"
+              "    let mut s = Session::from_json(&text).map_err(|err| EngineError::Io(err.to_string()))?;\n"
+              "    let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();",
+              already='SCULPT_CORE_SESSION_OPEN_PATH_V1')
+          change(IO,
+              '    e.path = Some(path.to_string());',
+              '    e.path = Some(path.to_string_lossy().into_owned());',
+              already='e.path = Some(path.to_string_lossy().into_owned());')
+
+          # Show a positive confirmation or a concrete missing-media warning after Open.
+          LIB='crates/ui-egui/src/lib.rs'
+          change(LIB,
+              """                if id == "app.quit" {
+                              self.quit_requested = true;
+                          }""",
+              """                if id == "app.quit" {
+                              self.quit_requested = true;
+                          }
+                          // SCULPT_CORE_SESSION_OPEN_STATUS_V1: distinguish successful load and media missing.
+                          if id == "session.open" {
+                              let missing = v.get("missing").and_then(Value::as_array).map_or(0, Vec::len);
+                              let name = &self.engine.session().name;
+                              self.ui.status = if missing == 0 {
+                                  format!("Session opened: {name}")
+                              } else {
+                                  format!("Session opened: {name} — {missing} missing audio file(s)")
+                              };
+                          }""",
+              already='SCULPT_CORE_SESSION_OPEN_STATUS_V1')
+
+          # Regression: re-open even when the user types the path without the .scraft extension.
+          s=file(IO).read_text(encoding='utf-8')
+          old='again.execute("session.open", &json!({"path":save.to_str().unwrap()})).unwrap();'
+          new='again.execute("session.open", &json!({"path":base.join("My Sculpt Session").to_str().unwrap()})).unwrap();'
+          if old in s:
+              assert s.count(old)==1
+              file(IO).write_text(s.replace(old,new,1))
+          elif new not in s:
+              raise RuntimeError('session reopen regression test missing')
+          print('Sculpt Core #13 path normalization and load-status diagnostics applied.')
+          PYSCULPT13
+          git diff --stat
+
       - name: Install Rust for Apple Silicon and Intel
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -223,6 +562,15 @@ jobs:
           cargo test --locked --target x86_64-apple-darwin -p soundcraft-engine --lib sculpt_
           cargo test --locked --target x86_64-apple-darwin -p soundcraft-playback --lib
 
+      - name: Sculpt Core 13 - Project reopen and grouped crossfade regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --target x86_64-apple-darwin -p soundcraft-engine --lib sculpt_core_session_roundtrip_tests
+          cargo test --locked --target x86_64-apple-darwin -p soundcraft-engine --lib sculpt_core_group_move_keeps_crossfade
+          cargo test --locked --target x86_64-apple-darwin -p soundcraft-ui-egui --lib sculpt_
+          cargo test --locked --target x86_64-apple-darwin -p soundcraft-ui-egui --test shortcuts
+
       - name: Build universal Mac application
         run: bash sculpt/build-macos.sh
 
@@ -239,7 +587,7 @@ jobs:
       - name: Upload tested app
         uses: actions/upload-artifact@v4
         with:
-          name: Sculpt-DAW-Core-VST3-AU-Mac
+          name: Sculpt-DAW-Core-13-Stability-Mac
           path: |
             dist/sculpt/Sculpt_DAW_0.4.0_Mac_Universal.zip
             dist/sculpt/Sculpt_DAW_0.4.0_Mac_Universal.zip.sha256
@@ -252,9 +600,9 @@ jobs:
         continue-on-error: true
         run: |
           set -euo pipefail
-          git add crates/ui-egui/src/menus.rs crates/ui-egui/src/mix_window.rs crates/ui-egui/src/panels.rs apps/soundcraft/src/native_menu.rs sculpt/qa-core-menu.txt
+          git add crates/ui-egui/src/menus.rs crates/ui-egui/src/mix_window.rs crates/ui-egui/src/panels.rs crates/ui-egui/src/edit_window.rs crates/ui-egui/src/shortcuts.rs crates/ui-egui/src/lib.rs crates/engine/src/io.rs crates/engine/src/edit.rs apps/soundcraft/src/main.rs apps/soundcraft/src/native_menu.rs sculpt/qa-core-menu.txt
           if git diff --cached --quiet; then exit 0; fi
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git commit -m 'Sculpt DAW: QA Core menu and VST3/AU-only plugin selection'
+          git commit -m 'Sculpt DAW Core 13: session and editing stabilization'
           git push origin HEAD:main
