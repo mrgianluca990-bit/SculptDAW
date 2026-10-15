@@ -1,4 +1,4 @@
-name: Sculpt DAW Core 18 - Native Pickers, Right Markers and Track Groups
+name: Sculpt DAW Core 18 - Fixed Native Pickers, Markers, Group Reorder
 on:
   push:
     branches: [main]
@@ -181,7 +181,7 @@ jobs:
           python3 - <<'PY_CORE18'
           import base64, lzma
           payload = """
-          /Td6WFoAAATm1rRGAgAhARwAAAAQz1jM4DBnD7ddABGIQkeKIzPDdw8z/VWX7afH8OoqQzbKL4CvRnRoPhZvInA+bm8VCCCgRvZS
+          /Td6WFoAAATm1rRGAgAhARwAAAAQz1jM4DC1EARdABGIQkeKIzPDdw8z/VWX7afH8OoqQzbKL4CvRnRoPhZvInA+bm8VCCCgRvZS
           fRIYZLK9+89SZ7bu9Zqw2k7Qhdd6azaXfJmiiedt68NobxHWmbIEP9SvZP6T6lPQ5YwmSNznkSu8ai+xc4qkG1uM4wZe+5l0YM2Z
           zm9FPllRMkTvfq9VjMt4KsiSiRTfdfL7hTnEfzzv9mFlDeqqkN2MFGG6qIYPyExUqyfo3JjJVkt8OKl5nxrhtt08afnaYuWSX4lE
           msd2uejroq6K0Sneeo98swVI5BH4B0aYnQYsryvUe086/fWzHpXxbUZIYxLhTtSVdZcA1c2uiFcrgAdhC+7mTClhBA7bj9SdepWh
@@ -224,18 +224,19 @@ jobs:
           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
-          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
+          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
           """
           source=lzma.decompress(base64.b64decode(''.join(payload.split()))).decode('utf8')
           compile(source, 'SculptDAW_Core18_Patch.py', 'exec')
@@ -300,7 +301,7 @@ jobs:
       - name: Upload Sculpt DAW Core18 Mac (one artifact)
         uses: actions/upload-artifact@v4
         with:
-          name: Sculpt-DAW-Core18-Consolidated-Mac
+          name: Sculpt-DAW-Core18-Fixed-Mac
           path: |
             dist/sculpt/Sculpt_DAW_0.4.0_Mac_Universal.zip
             dist/sculpt/Sculpt_DAW_0.4.0_Mac_Universal.zip.sha256
@@ -310,4 +311,4 @@ jobs:
 
 # SCULPT_CORE17_FIXED_WORKFLOW_COMPLETE
 
-# SCULPT_CORE18_ONE_BUILD_WORKFLOW_COMPLETE
+# SCULPT_CORE18_FIXED_WORKFLOW_COMPLETE
