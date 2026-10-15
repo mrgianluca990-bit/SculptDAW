@@ -1,4 +1,4 @@
-name: Sculpt DAW - Core Menu QA
+name: Sculpt DAW - Core Plugins VST3 and AU QA
 
 on:
   push:
@@ -87,6 +87,111 @@ jobs:
           PYSCULPTCORE
           git diff --stat
 
+      - name: Limit visible plugins to VST3 and Audio Units
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYSCULPTPLUGINS'
+          #!/usr/bin/env python3
+          """Sculpt DAW Core: expose VST3 and Audio Units only in plugin pickers.
+          No destructive DSP/legacy session changes. Re-runnable.
+          """
+          from pathlib import Path
+
+
+          def replace_between(path, begin, end, replacement):
+              p = Path(path)
+              text = p.read_text(encoding='utf-8')
+              if text.count(begin) != 1:
+                  raise RuntimeError(f'{path}: expected 1 BEGIN anchor, found {text.count(begin)}: {begin[:100]!r}')
+              pos = text.index(begin)
+              if text.count(end, pos + len(begin)) < 1:
+                  raise RuntimeError(f'{path}: missing END anchor: {end[:100]!r}')
+              last = text.index(end, pos + len(begin))
+              p.write_text(text[:pos] + replacement + text[last:], encoding='utf-8')
+
+
+          mix = Path('crates/ui-egui/src/mix_window.rs')
+          code = mix.read_text(encoding='utf-8')
+          marker = '// SCULPT_CORE_VST3_AU_ONLY_V1'
+          if marker not in code:
+              replace_between(str(mix),
+                  '    let mut cats: Vec<soundcraft_dsp::Category> = Vec::new();\n',
+                  '    if let Some(plugin) = hosted_menus(ui, false) {\n',
+                  '    // SCULPT_CORE_VST3_AU_ONLY_V1: limited, auditable native-plugin interface.\n'
+                  '    // Built-in DSP remains compiled to preserve legacy project files.\n'
+                  '    ui.label("Effects · VST3 / Audio Units");\n')
+              replace_between(str(mix),
+                  '    ui.menu_button("Built-in", |ui| {\n',
+                  '    if let Some(p) = hosted_menus(ui, true) {\n',
+                  '    ui.label("Instruments · VST3 / Audio Units");\n')
+              replace_between(str(mix),
+                  '    ui.menu_button("CLAP", |ui| {\n',
+                  '    ui.menu_button("VST3", |ui| {\n',
+                  '')
+              code = mix.read_text(encoding='utf-8')
+              assert marker in code
+              assert 'ui.menu_button("CLAP", |ui| {' not in code
+              assert 'ui.menu_button("Built-in", |ui| {' not in code
+              print('Sculpt Core: only VST3 and AU in Edit/Mix plugin pickers')
+          else:
+              print('Sculpt Core plugin picker already updated; skipping')
+
+          panels = Path('crates/ui-egui/src/panels.rs')
+          text = panels.read_text(encoding='utf-8')
+          old = '        let native_editor = soundcraft_mix::is_third_party(&ins.plugin);'
+          new = ('        // VST3 exposes a native editor; Audio Units currently use generic controls.\n'
+                 '        // Do not wait two seconds for an AU native editor which is not implemented.\n'
+                 '        let native_editor = ins.plugin.starts_with("vst3:");')
+          if old in text:
+              assert text.count(old) == 1
+              text = text.replace(old, new, 1)
+          elif 'let native_editor = ins.plugin.starts_with("vst3:");' not in text:
+              raise RuntimeError('Unexpected plugin editor flow')
+          old = '                    if soundcraft_mix::is_third_party(&ins.plugin) {'
+          if old in text:
+              assert text.count(old) == 1
+              text = text.replace(old, '                    if native_editor {', 1)
+          elif '                    if native_editor {' not in text:
+              raise RuntimeError('Unexpected native editor button flow')
+          panels.write_text(text, encoding='utf-8')
+
+          # Regression guard for the visible plugin picker; actual audio-host tests run in Actions.
+          code = mix.read_text(encoding='utf-8')
+          a = code.index('fn hosted_menus(')
+          b = code.index('fn vendor_menus(', a)
+          hosted = code[a:b]
+          assert 'ui.menu_button("VST3", |ui|' in hosted
+          assert 'ui.menu_button("Audio Units", |ui|' in hosted
+          assert 'ui.menu_button("CLAP", |ui|' not in hosted
+          assert 'soundcraft_dsp::plugins()' not in code[code.index('pub fn plugin_menu('):b]
+
+          if 'mod sculpt_plugin_core_tests {' not in code:
+              code += '''
+          #[cfg(test)]
+          mod sculpt_plugin_core_tests {
+              // Checks that the GUI won't regress into the legacy broad plugin picker.
+              // VST3 & AU hosts are tested separately with real fixture/system plugins.
+              #[test]
+              fn only_vst3_and_audio_units_are_visible() {
+                  let src = include_str!("mix_window.rs");
+                  let menu = &src[src.find("pub fn plugin_menu(").unwrap()..src.find("fn vendor_menus(").unwrap()];
+                  let hosted = &src[src.find("fn hosted_menus(").unwrap()..src.find("fn vendor_menus(").unwrap()];
+                  assert!(hosted.contains("menu_button(\\\"VST3\\\""));
+                  assert!(hosted.contains("menu_button(\\\"Audio Units\\\""));
+                  assert!(!hosted.contains("menu_button(\\\"CLAP\\\""));
+                  assert!(!menu.contains("soundcraft_dsp::plugins()"));
+                  assert!(!menu.contains("menu_button(\\\"Built-in\\\""));
+                  assert!(menu.contains("mix.insert_bypass"));
+                  assert!(menu.contains("mix.insert_remove"));
+              }
+          }
+          '''
+              mix.write_text(code, encoding='utf-8')
+          print('Sculpt Core: AU generic UI available immediately, VST3 native editor unchanged')
+          PYSCULPTPLUGINS
+          git diff --stat
+
       - name: Install Rust for Apple Silicon and Intel
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -99,6 +204,17 @@ jobs:
           cargo check --locked --target x86_64-apple-darwin -p sculpt-daw
           cargo test --locked --target x86_64-apple-darwin -p soundcraft-ui-egui --lib sculpt_core_menu_tests
           cargo test --locked --target x86_64-apple-darwin -p soundcraft-ui-egui --test shortcuts
+
+      - name: Verify VST3 and Audio Units only, and test both plugin hosts
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --target x86_64-apple-darwin -p soundcraft-ui-egui --lib sculpt_plugin_core_tests
+          # A genuine, instrumented VST3 fixture is scanned, instantiated and processes audio.
+          cargo test --locked --target x86_64-apple-darwin -p soundcraft-vst3-host --test fixture_e2e
+          # Apple's Audio Units exercise discovery, DSP processing, state round-trip and MIDI.
+          cargo test --locked --target x86_64-apple-darwin -p soundcraft-au-host --test system_units
+          cargo test --locked --target x86_64-apple-darwin -p soundcraft-engine --lib audio_units_insert_by_id
 
       - name: Validate working fade and playback engine regressions
         shell: bash
@@ -123,7 +239,7 @@ jobs:
       - name: Upload tested app
         uses: actions/upload-artifact@v4
         with:
-          name: Sculpt-DAW-Core-Menu-QA-Mac
+          name: Sculpt-DAW-Core-VST3-AU-Mac
           path: |
             dist/sculpt/Sculpt_DAW_0.4.0_Mac_Universal.zip
             dist/sculpt/Sculpt_DAW_0.4.0_Mac_Universal.zip.sha256
@@ -136,9 +252,9 @@ jobs:
         continue-on-error: true
         run: |
           set -euo pipefail
-          git add crates/ui-egui/src/menus.rs apps/soundcraft/src/native_menu.rs sculpt/qa-core-menu.txt
+          git add crates/ui-egui/src/menus.rs crates/ui-egui/src/mix_window.rs crates/ui-egui/src/panels.rs apps/soundcraft/src/native_menu.rs sculpt/qa-core-menu.txt
           if git diff --cached --quiet; then exit 0; fi
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git commit -m 'Sculpt DAW: minimal QA-controlled Core menu'
+          git commit -m 'Sculpt DAW: QA Core menu and VST3/AU-only plugin selection'
           git push origin HEAD:main
