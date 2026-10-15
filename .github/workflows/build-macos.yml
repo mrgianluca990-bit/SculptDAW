@@ -1,4 +1,4 @@
-name: Sculpt DAW - Core 13 - Editing and Session Stabilization
+name: Sculpt DAW Core 15 - Consolidated REAPER Logic SoundCraft 0.7 Audit
 
 on:
   push:
@@ -531,6 +531,265 @@ jobs:
           PYSCULPT13
           git diff --stat
 
+      - name: Sculpt Core 15 - Shared Send, Meter and Crossfade Corrections
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYSCULPT14'
+          #!/usr/bin/env python3
+          """Sculpt DAW Core 14: correct eight send controls, meter parity and one-clip crossfade edits.
+          Never removes audio or inserts from sessions except the existing edit.move_clips semantics.
+          """
+          from pathlib import Path
+          
+          ROOT = Path('.')
+          def modify(rel, old, new, *, marker=None):
+              p = ROOT / rel
+              s = p.read_text(encoding='utf8')
+              if marker and marker in s:
+                  print(f'SKIP {rel}: {marker} already applied')
+                  return
+              n = s.count(old)
+              if n != 1:
+                  raise RuntimeError(f'Expected unique code anchor in {rel}: {old[:100]!r}, found {n}')
+              p.write_text(s.replace(old, new, 1), encoding='utf8')
+              print(f'PATCHED {rel}: {marker or old[:40]}')
+          
+          EDIT = 'crates/ui-egui/src/edit_window.rs'
+          MIX = 'crates/ui-egui/src/mix_window.rs'
+          ENGINE = 'crates/engine/src/edit.rs'
+          APP = 'crates/ui-egui/src/lib.rs'
+          
+          # Existing Edit sends only drew text; use the *same* interactive component as Mix.
+          modify(EDIT, '''                let s = track
+                              .mixer
+                              .sends
+                              .get(off + i)
+                              .cloned()
+                              .flatten()
+                              .map(|x| format!("{} {:.0}", route(&x.target), x.level_db.max(-99.0)))
+                              .unwrap_or_default();
+                          text(ui, item(i), &s, t.text);''', '''                // SCULPT_CORE14_EDIT_SEND_SHARED: one control implementation in Edit and Mix.
+                          // Empty send: click to assign a bus. Active send: destination, amount,
+                          // pre/post-fader, mute and pan all use the same controls as Mix.
+                          crate::mix_window::send_slot(app, ui, track, off + i, item(i));''', marker='SCULPT_CORE14_EDIT_SEND_SHARED')
+          
+          modify(MIX, 'fn send_slot(app: &mut SoundApp, ui: &mut Ui, track: &Track, slot: usize, r: Rect) {',
+                 '''// SCULPT_CORE14_SEND_SHARED_WIDGET: Edit and Mix must use this exact widget.
+          pub(crate) fn send_slot(app: &mut SoundApp, ui: &mut Ui, track: &Track, slot: usize, r: Rect) {''', marker='SCULPT_CORE14_SEND_SHARED_WIDGET')
+          
+          modify(MIX, '''            let name = route_name(app, &s.target);
+                      // Level bar.''', '''            // SCULPT_CORE14_SEND_PREPOST_READOUT: label the state on both surfaces.
+                      let name = format!("{} · {}", route_name(app, &s.target), if s.pre_fader { "PRE" } else { "POST" });
+                      // Level bar.''', marker='SCULPT_CORE14_SEND_PREPOST_READOUT')
+          
+          # Existing amount readout is editable but its right-click controls are hidden;
+          # show the full, EXISTING send options (slider, pre/post, pan, mute) on route click.
+          modify(MIX, '''            send_route_menu(app, ui, id, slot, Some(&send.target));
+                      ui.separator();
+                      if ui.button("Remove send").clicked() {''', '''            send_route_menu(app, ui, id, slot, Some(&send.target));
+                      ui.separator();
+                      // SCULPT_CORE14_SEND_OPTIONS: ordinary click exposes precise fader and pre/post.
+                      send_options_menu(app, ui, id, slot, send);
+                      ui.separator();
+                      if ui.button("Remove send").clicked() {''', marker='SCULPT_CORE14_SEND_OPTIONS')
+          
+          # Identical meter sampling in Edit and Mix. Both already render with widgets::meter,
+          # but Core 13 polled Edit at 20 Hz and Mix at 60 Hz.
+          modify(APP, '''            let meter_interval = if self.ui.window == MainWindow::Mix { 1.0 / 60.0 } else { 1.0 / 20.0 };''', '''            // SCULPT_CORE14_METER_PARITY: same sampling/ballistics in Edit and Mix.
+                      let meter_interval = 1.0 / 60.0;''', marker='SCULPT_CORE14_METER_PARITY')
+          
+          # Keep crossfades *while an actual overlap remains* even if only one clip moves.
+          # The Core 13 implementation prematurely deleted the link and paired fades.
+          # Moving apart necessarily ends the crossfade (no simultaneous playback exists).
+          start = '''    // Moving only one side breaks the crossfade association intentionally; remove
+              // both linked fades so no misleading standalone fade remains.
+              for (a, b, key) in &joints {
+                  if moving_ids.contains(a) != moving_ids.contains(b) {
+                      if let Some(c) = s.find_clip_mut(*a) { c.fade_out = Fade::default(); }
+                      if let Some(c) = s.find_clip_mut(*b) { c.fade_in = Fade::default(); }
+                      s.edit.values.remove(key);
+                  }
+              }
+          '''
+          modify(ENGINE, start, '''    // SCULPT_CORE14_LIVE_CROSSFADE: decide whether to unlink only AFTER moving.
+              // An unchanged physical overlap must remain a crossfade, not two broken fades.
+          ''', marker='SCULPT_CORE14_LIVE_CROSSFADE')
+          
+          modify(ENGINE, '''    // Clear only STATIONARY material before any of the moved clips are inserted.
+              for (target, c) in &relocated { clear_range(s, *target, c.range(), false); }
+              for (target, c) in relocated {''', '''    // Clear only STATIONARY material before any moved clips are inserted.
+              // SCULPT_CORE14_PROTECT_XFADE_PARTNER: moving one side of a linked crossfade
+              // must not trim its stationary partner while both still overlap on the same track.
+              for (target, c) in &relocated {
+                  let preserve_linked_partner = joints.iter().any(|(a, b, _)| {
+                      if moving_ids.contains(a) == moving_ids.contains(b) || (c.id != *a && c.id != *b) {
+                          return false;
+                      }
+                      let partner = if c.id == *a { *b } else { *a };
+                      s.find_clip(partner).is_some_and(|(tid, peer)| {
+                          tid == *target && c.is_audio() && peer.is_audio()
+                              && c.start < peer.end() && peer.start < c.end()
+                      })
+                  });
+                  if !preserve_linked_partner { clear_range(s, *target, c.range(), false); }
+              }
+              for (target, c) in relocated {''', marker='SCULPT_CORE14_PROTECT_XFADE_PARTNER')
+          
+          modify(ENGINE, '''    // Keep the saved, undoable crossfade seam aligned with the pair when both move.
+              for (a, b, key) in joints {
+                  if moving_ids.contains(&a) && moving_ids.contains(&b)
+                      && let Some(v) = s.edit.values.get_mut(&key)
+                  { *v = (*v + delta as f64).max(0.0); }
+              }
+              n
+          }''', '''    // SCULPT_CORE14_UPDATE_XFADE_OVERLAP: recalculate both fades from the real
+              // overlap. A crossfade never turns into an unpaired fade after a clip drag.
+              for (a, b, key) in joints {
+                  let updated = match (s.find_clip(a), s.find_clip(b)) {
+                      (Some((ta, left)), Some((tb, right)))
+                          if ta == tb && left.is_audio() && right.is_audio()
+                             && left.start <= right.start && left.end() > right.start => {
+                          Some((right.start, left.end(), left.length.min(right.length)))
+                      }
+                      _ => None,
+                  };
+                  if let Some((overlap_start, overlap_end, usable)) = updated {
+                      let len = (overlap_end - overlap_start).min(usable).max(1);
+                      if let Some(left) = s.find_clip_mut(a) { left.fade_out.len = len; }
+                      if let Some(right) = s.find_clip_mut(b) { right.fade_in.len = len; }
+                      if let Some(seam) = s.edit.values.get_mut(&key) {
+                          if moving_ids.contains(&a) && moving_ids.contains(&b) {
+                              *seam = (*seam + delta as f64).max(0.0);
+                          } else if moving_ids.contains(&a) || moving_ids.contains(&b) {
+                              *seam = (*seam).clamp(overlap_start as f64, overlap_end as f64);
+                          }
+                      }
+                  } else if moving_ids.contains(&a) || moving_ids.contains(&b) {
+                      // The overlap is gone: these fades are no longer a crossfade.
+                      if let Some(left) = s.find_clip_mut(a) { left.fade_out = Fade::default(); }
+                      if let Some(right) = s.find_clip_mut(b) { right.fade_in = Fade::default(); }
+                      s.edit.values.remove(&key);
+                  }
+              }
+              n
+          }''', marker='SCULPT_CORE14_UPDATE_XFADE_OVERLAP')
+          
+          # Test one-clip movement preserving a STILL-VALID crossfade. The old Core 13 test
+          # only checked moving both clips, then moving one all the way out of overlap.
+          p = ROOT / ENGINE
+          src = p.read_text(encoding='utf8')
+          if 'fn sculpt_core14_one_clip_move_keeps_actual_crossfade()' not in src:
+              marker = '    #[test]\n    fn sculpt_core_group_move_keeps_crossfade() {'
+              test = '''    #[test]
+              fn sculpt_core14_one_clip_move_keeps_actual_crossfade() {
+                  let (mut s, t) = session_with_clip();
+                  let a = s.track(t).unwrap().clips()[0].id;
+                  let b = s.new_clip_id();
+                  if let Some(pl) = s.track_mut(t).and_then(|t| t.playlist_mut()) {
+                      pl.clips.push(Clip::audio(b, "second", SourceId(500), 5000, 5000, 2500));
+                      pl.sort();
+                  }
+                  assert!(create_fades(&mut s, t, Range::new(4750, 5250), FadeShape::EqualPower) > 0);
+                  let key = sculpt_xfade_join_key(a, b);
+                  assert!(s.edit.values.contains_key(&key));
+                  assert_eq!(move_clips(&mut s, &[b], 100, None), 1);
+                  let (left, right) = (s.find_clip(a).unwrap().1, s.find_clip(b).unwrap().1);
+                  let overlap = left.end() - right.start;
+                  assert!(overlap > 0, "still overlapping after moving the incoming clip");
+                  assert_eq!(left.fade_out.len, overlap, "outgoing fade must follow overlap");
+                  assert_eq!(right.fade_in.len, overlap, "incoming fade must follow overlap");
+                  assert!(s.edit.values.contains_key(&key), "join must survive partial move");
+                  assert_eq!(move_clips(&mut s, &[b], 1000, None), 1);
+                  assert!(!s.edit.values.contains_key(&key), "join must go when overlap ends");
+                  assert_eq!(s.find_clip(a).unwrap().1.fade_out.len, 0);
+                  assert_eq!(s.find_clip(b).unwrap().1.fade_in.len, 0);
+              }
+          
+          '''
+              if src.count(marker) != 1:
+                  raise RuntimeError('Cannot locate Core13 engine regression suite')
+              p.write_text(src.replace(marker, test + marker, 1), encoding='utf8')
+              print('ADDED unilateral crossfade overlap regression')
+          
+          # When reopening fails after restarting the Mac app, retain the error's path in
+          # the visible status text so the tester can report what actually failed.
+          modify(APP, '''            Err(e) => {
+                          self.ui.status = e.to_string();
+                          log::warn!("{id}: {e}");
+                          Err(e.to_string())
+                      }
+          ''', '''            Err(e) => {
+                          if id == "session.open" {
+                              // SCULPT_CORE14_SESSION_ERROR_PATH: do not hide the exact restart error.
+                              let path = params.get("path").and_then(Value::as_str).unwrap_or("(unknown path)");
+                              self.ui.status = format!("Unable to open session [{}]: {}", path, e);
+                          } else {
+                              self.ui.status = e.to_string();
+                          }
+                          log::warn!("{id}: {e}");
+                          Err(e.to_string())
+                      }
+          ''', marker='SCULPT_CORE14_SESSION_ERROR_PATH')
+          
+          # Static QA fails hard before compiling if the source regresses.
+          send_src = (ROOT / EDIT).read_text(encoding='utf8')
+          mix_src = (ROOT / MIX).read_text(encoding='utf8')
+          engine_src = (ROOT / ENGINE).read_text(encoding='utf8')
+          assert 'SCULPT_CORE14_EDIT_SEND_SHARED' in send_src
+          assert 'pub(crate) fn send_slot(' in mix_src
+          assert 'send_options_menu(app, ui, id, slot, send);' in mix_src
+          assert 'SCULPT_CORE14_METER_PARITY' in (ROOT / APP).read_text(encoding='utf8')
+          assert 'SCULPT_CORE14_UPDATE_XFADE_OVERLAP' in engine_src
+          print('SCULPT_CORE14_PATCH_OK')
+          PYSCULPT14
+          git diff --stat
+
+      - name: Sculpt Core 15 - Targeted SoundCraft 0.7 trim fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYSCULPT15'
+          from pathlib import Path
+          # SoundCraft v0.7.0 PR #379: sorted clip order after Trim to Selection.
+          path = Path('crates/engine/src/edit.rs')
+          src = path.read_text(encoding='utf-8')
+          marker = 'SCULPT_CORE15_UPSTREAM_070_TRIM_ORDER'
+          if marker not in src:
+              first = src.index('pub fn trim_to(s: &mut Session')
+              last = src.index('/// Trim the start', first)
+              region = src[first:last]
+              old = '    n\n}\n'
+              if region.count(old) != 1:
+                  raise RuntimeError('Unexpected trim_to implementation; fail safely')
+              new = '    // '+marker+': retain chronological order.\n    pl.sort();\n    n\n}\n'
+              src = src[:first] + region.replace(old, new, 1) + src[last:]
+          test_name = 'sculpt_core15_trim_keeps_chronological_order'
+          if test_name not in src:
+              where = '    #[test]\n    fn sculpt_core_group_move_keeps_crossfade() {'
+              test = '''    #[test]
+              fn sculpt_core15_trim_keeps_chronological_order() {
+                  let (mut s, t) = session_with_clip();
+                  let second = s.new_clip_id();
+                  if let Some(pl) = s.track_mut(t).and_then(|t| t.playlist_mut()) {
+                      pl.clips.push(Clip::audio(second, "earlier", SourceId(500), 0, 500, 2000));
+                  }
+                  let _ = trim_to(&mut s, t, Range::new(100, 8000));
+                  let list = s.track(t).unwrap().clips();
+                  assert_eq!(list.len(), 2);
+                  assert!(list.windows(2).all(|w| w[0].start <= w[1].start));
+              }
+          
+          '''
+              if src.count(where) != 1:
+                  raise RuntimeError('Cannot find expected engine test suite')
+              src = src.replace(where, test + where, 1)
+          path.write_text(src, encoding='utf-8')
+          assert marker in src and test_name in src
+          print('SoundCraft 0.7.0 safe clip-sort fix + test installed')
+          PYSCULPT15
+          git diff --stat
+
       - name: Install Rust for Apple Silicon and Intel
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -571,6 +830,17 @@ jobs:
           cargo test --locked --target x86_64-apple-darwin -p soundcraft-ui-egui --lib sculpt_
           cargo test --locked --target x86_64-apple-darwin -p soundcraft-ui-egui --test shortcuts
 
+      - name: Sculpt Core 15 - One-clip crossfade and Send UI QA
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --target x86_64-apple-darwin -p soundcraft-engine --lib sculpt_core14_one_clip_move_keeps_actual_crossfade
+          cargo test --locked --target x86_64-apple-darwin -p soundcraft-engine --lib sculpt_core15_trim_keeps_chronological_order
+          cargo test --locked --target x86_64-apple-darwin -p soundcraft-ui-egui --lib sculpt_
+          grep -q 'SCULPT_CORE14_EDIT_SEND_SHARED' crates/ui-egui/src/edit_window.rs
+          grep -q 'SCULPT_CORE14_METER_PARITY' crates/ui-egui/src/lib.rs
+          grep -q 'SCULPT_CORE14_SEND_OPTIONS' crates/ui-egui/src/mix_window.rs
+
       - name: Build universal Mac application
         run: bash sculpt/build-macos.sh
 
@@ -587,22 +857,9 @@ jobs:
       - name: Upload tested app
         uses: actions/upload-artifact@v4
         with:
-          name: Sculpt-DAW-Core-13-Stability-Mac
+          name: Sculpt-DAW-Core-15-Consolidated-Mac
           path: |
             dist/sculpt/Sculpt_DAW_0.4.0_Mac_Universal.zip
             dist/sculpt/Sculpt_DAW_0.4.0_Mac_Universal.zip.sha256
           if-no-files-found: error
           retention-days: 30
-
-      - name: Permanently save simple Core menu sources (after successful compile)
-        if: success()
-        shell: bash
-        continue-on-error: true
-        run: |
-          set -euo pipefail
-          git add crates/ui-egui/src/menus.rs crates/ui-egui/src/mix_window.rs crates/ui-egui/src/panels.rs crates/ui-egui/src/edit_window.rs crates/ui-egui/src/shortcuts.rs crates/ui-egui/src/lib.rs crates/engine/src/io.rs crates/engine/src/edit.rs apps/soundcraft/src/main.rs apps/soundcraft/src/native_menu.rs sculpt/qa-core-menu.txt
-          if git diff --cached --quiet; then exit 0; fi
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git commit -m 'Sculpt DAW Core 13: session and editing stabilization'
-          git push origin HEAD:main
