@@ -676,8 +676,12 @@ fn fades_create(e: &mut Engine, p: &Value) -> Result<Value> {
     let shape = str_param(p, "shape")
         .map_or(Some(FadeShape::EqualPower), FadeShape::from_id)
         .ok_or_else(|| bad("edit.fades_create", "unknown fade shape"))?;
+    let shape_out = str_param(p, "shape_out").map_or(Some(shape), FadeShape::from_id)
+        .ok_or_else(|| bad("edit.fades_create", "unknown fade-out shape"))?;
+    let shape_in = str_param(p, "shape_in").map_or(Some(shape), FadeShape::from_id)
+        .ok_or_else(|| bad("edit.fades_create", "unknown fade-in shape"))?;
     let s = e.session_mut();
-    let n: usize = tracks.iter().map(|t| ops::create_fades(s, *t, r, shape)).sum();
+    let n: usize = tracks.iter().map(|t| ops::create_fades_with_shapes(s, *t, r, shape_out, shape_in)).sum();
     if n == 0 {
         return Err(bad("edit.fades_create", "the selection must cover a clip start, end or the boundary between two clips"));
     }

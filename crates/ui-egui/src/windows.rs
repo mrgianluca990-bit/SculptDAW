@@ -441,46 +441,97 @@ pub fn playback_engine(app: &mut SoundApp, ctx: &egui::Context) {
 /// Setup › I/O: busses and output paths.
 pub fn io_setup(app: &mut SoundApp, ctx: &egui::Context) {
     let mut open = app.ui.show_io_setup;
-    win(ctx, &mut open, "I/O Setup", vec2(420.0, 300.0), |ui| {
-        ui.label(egui::RichText::new("Busses").strong());
-        let busses: Vec<(String, String)> = app.engine.session().busses.iter().map(|b| (b.name.clone(), b.format.label().to_string())).collect();
-        egui::Grid::new("busses").num_columns(3).striped(true).show(ui, |ui| {
-            for (name, fmt) in busses {
-                let key = egui::Id::new(("bus_name", name.clone()));
-                let mut edit: String = ui.ctx().memory(|m| m.data.get_temp(key)).unwrap_or_else(|| name.clone());
-                let r = ui.text_edit_singleline(&mut edit);
-                ui.ctx().memory_mut(|m| m.data.insert_temp(key, edit.clone()));
-                if r.lost_focus() && edit != name {
-                    let _ = app.run("setup.io", json!({"action": "rename_bus", "name": name, "new_name": edit}));
+    win(ctx, &mut open, "Sculpt DAW · I/O Setup", vec2(690.0, 490.0), |ui| {
+        let tab_key = egui::Id::new("sculpt_io_setup_tab");
+        let mut tab: String = ui.ctx().data(|d| d.get_temp(tab_key)).unwrap_or_else(|| "Output".into());
+        ui.horizontal(|ui| {
+            for page in ["Input", "Output", "Bus"] {
+                if ui.selectable_label(tab == page, page.to_uppercase()).clicked() {
+                    tab = page.to_string();
                 }
-                ui.label(fmt);
-                if ui.small_button("Delete").clicked() {
-                    let _ = app.run("setup.io", json!({"action": "delete_bus", "name": name}));
-                }
-                ui.end_row();
             }
         });
-        if ui.button("New Bus").clicked() {
-            let n = app.engine.session().busses.len() + 1;
-            let _ = app.run("mix.new_bus", json!({"name": format!("Bus {n}")}));
-        }
+        ui.ctx().data_mut(|d| d.insert_temp(tab_key, tab.clone()));
         ui.separator();
-        ui.label(egui::RichText::new("Outputs").strong());
-        // Main output format: stereo, or a surround format (the mix and master faders follow).
-        let main = app.engine.session().main_format();
-        ui.horizontal(|ui| {
-            ui.label("Main output");
-            egui::ComboBox::from_id_salt("main_output_format").selected_text(main.label()).show_ui(ui, |ui| {
-                for f in soundcraft_model::ChannelFormat::ALL.into_iter().filter(|f| (2..=16).contains(&f.channels())) {
-                    if ui.selectable_label(f == main, f.label()).clicked() && f != main {
-                        let _ = app.run("setup.main_format", json!({"format": f.label()}));
-                    }
+        match tab.as_str() {
+            "Input" => {
+                ui.heading("Hardware Inputs");
+                ui.label("Audio inputs are provided by the active CoreAudio interface.");
+                ui.label("Per-channel input patching is not implemented in this version.");
+                if ui.button("Open Playback Engine / Hardware…").clicked() {
+                    app.ui.show_playback_engine = true;
                 }
-            });
-            ui.label(egui::RichText::new(format!("{} ch", main.channels())).small());
-        });
-        for o in app.engine.session().outputs.clone() {
-            ui.label(format!("{} — {} from channel {}", o.name, o.format.label(), o.first_channel + 1));
+            }
+            "Output" => {
+                ui.heading("Output Paths");
+                ui.label("Main output format");
+                let main = app.engine.session().main_format();
+                egui::ComboBox::from_id_salt("sculpt_main_output_format")
+                    .selected_text(main.label())
+                    .show_ui(ui, |ui| {
+                        for f in soundcraft_model::ChannelFormat::ALL.into_iter().filter(|f| (2..=16).contains(&f.channels())) {
+                            if ui.selectable_label(f == main, f.label()).clicked() && f != main {
+                                let _ = app.run("setup.main_format", json!({"format": f.label()}));
+                            }
+                        }
+                    });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.strong("Path");
+                    ui.add_space(240.0);
+                    ui.strong("Hardware channels");
+                });
+                let paths = app.engine.session().outputs.clone();
+                egui::ScrollArea::vertical().max_height(250.0).show(ui, |ui| {
+                    for p in paths {
+                        ui.horizontal(|ui| {
+                            let key = egui::Id::new(("sculpt_output_name", &p.name));
+                            let mut name: String = ui.ctx().data(|d| d.get_temp(key)).unwrap_or_else(|| p.name.clone());
+                            let response = ui.add(egui::TextEdit::singleline(&mut name).desired_width(250.0));
+                            ui.ctx().data_mut(|d| d.insert_temp(key, name.clone()));
+                            if response.lost_focus() && !name.trim().is_empty() && name != p.name {
+                                let _ = app.run("setup.io", json!({"action": "rename_output", "name": p.name, "new_name": name}));
+                            }
+                            ui.label(format!("{}–{} · {}", p.first_channel + 1, p.first_channel + p.format.channels() as u16, p.format.label()));
+                            if ui.small_button("Delete").clicked() {
+                                let _ = app.run("setup.io", json!({"action": "delete_output", "name": p.name}));
+                            }
+                        });
+                    }
+                });
+                if ui.button("+ Add Stereo Output Path").clicked() {
+                    let paths = &app.engine.session().outputs;
+                    let first = paths.iter().map(|p| p.first_channel as usize + p.format.channels()).max().unwrap_or(0);
+                    let name = format!("Out {}-{}", first + 1, first + 2);
+                    let _ = app.run("setup.io", json!({"action": "create_output", "name": name, "first_channel": first, "format": "stereo"}));
+                }
+            }
+            _ => {
+                ui.heading("Internal Busses");
+                ui.label("Rename a bus by editing its label, or create a stereo bus.");
+                let busses: Vec<(String, String)> = app.engine.session().busses.iter().map(|b| (b.name.clone(), b.format.label().to_string())).collect();
+                egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
+                    for (name, fmt) in busses {
+                        ui.horizontal(|ui| {
+                            let key = egui::Id::new(("sculpt_bus_name", &name));
+                            let mut edit: String = ui.ctx().data(|d| d.get_temp(key)).unwrap_or_else(|| name.clone());
+                            let response = ui.add(egui::TextEdit::singleline(&mut edit).desired_width(250.0));
+                            ui.ctx().data_mut(|d| d.insert_temp(key, edit.clone()));
+                            if response.lost_focus() && !edit.trim().is_empty() && edit != name {
+                                let _ = app.run("setup.io", json!({"action": "rename_bus", "name": name, "new_name": edit}));
+                            }
+                            ui.label(fmt);
+                            if ui.small_button("Delete").clicked() {
+                                let _ = app.run("setup.io", json!({"action": "delete_bus", "name": name}));
+                            }
+                        });
+                    }
+                });
+                if ui.button("+ New Stereo Bus").clicked() {
+                    let n = app.engine.session().busses.len() + 1;
+                    let _ = app.run("setup.io", json!({"action": "create_bus", "name": format!("Bus {n}"), "format": "stereo"}));
+                }
+            }
         }
     });
     app.ui.show_io_setup = open;

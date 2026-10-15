@@ -169,6 +169,7 @@ impl Default for UiState {
 #[derive(Default)]
 pub struct Services {
     pub pick_open: Option<Box<dyn Fn(&str, &[&str]) -> Option<String>>>,
+    pub pick_open_many: Option<Box<dyn Fn(&str, &[&str]) -> Option<Vec<String>>>>,
     pub pick_save: Option<Box<dyn Fn(&str, &str) -> Option<String>>>,
     pub pick_folder: Option<Box<dyn Fn(&str) -> Option<String>>>,
 }
@@ -209,6 +210,7 @@ pub enum Gesture {
     TrimStart { clip: soundcraft_model::ClipId, track: TrackId, to: Samples },
     TrimEnd { clip: soundcraft_model::ClipId, track: TrackId, to: Samples },
     Fade { clip: soundcraft_model::ClipId, track: TrackId, fade_in: bool, to: Samples },
+    Crossfade { track: TrackId, seam: Samples, to: Samples },
     Scrub { last: Samples },
     Fader { track: TrackId, start_db: f32 },
     ClipGain { clip: soundcraft_model::ClipId, track: TrackId, pos: f32, anchor: (f32, f32), fine: bool, fader_bottom: egui::Pos2 },

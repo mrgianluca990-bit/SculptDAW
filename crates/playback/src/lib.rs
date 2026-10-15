@@ -57,6 +57,8 @@ enum Cmd {
     Session(Arc<Session>, Vec<PreparedInstance>),
     /// Read every plugin state and reply.
     CaptureStates(Sender<PluginStates>),
+    /// Return every hosted plugin to the UI thread, then acknowledge cleanup.
+    Shutdown(Sender<()>),
     Input(Arc<record::InputRing>),
     Recording(bool),
     Play {
@@ -136,6 +138,21 @@ impl AudioState {
             match c {
                 Cmd::Input(r) => self.input = Some(r),
                 Cmd::Recording(r) => self.recording = r,
+                Cmd::Shutdown(reply) => {
+                    self.playing = false;
+                    self.recording = false;
+                    self.input = None;
+                    self.end = None;
+                    self.looped = None;
+                    self.pending_len = 0;
+                    let rate = self.session.sample_rate.as_f64() as f32;
+                    let mut old = std::mem::replace(&mut self.mix, new_engine(rate));
+                    let plugins = old.drain_plugins();
+                    if !plugins.is_empty() {
+                        let _ = self.garbage.send(plugins);
+                    }
+                    let _ = reply.send(());
+                }
                 Cmd::CaptureStates(reply) => {
                     self.mix.ensure_synced(&self.session);
                     let _ = reply.send(self.mix.capture_states());
@@ -605,6 +622,32 @@ impl Player {
 
     pub fn set_recording(&self, on: bool) {
         let _ = self.tx.send(Cmd::Recording(on));
+    }
+
+    /// Graceful application shutdown: release editors on the main thread,
+    /// drain audio-thread plugin instances back to the main thread,
+    /// and only then destroy the audio stream.
+    /// SCULPT_ORDERLY_PLUGIN_SHUTDOWN_V1
+    pub fn shutdown(&mut self) {
+        self.stop();
+        {
+            let mut side = self.side();
+            for editor in side.editors.values_mut() {
+                editor.close();
+            }
+            side.editors.clear();
+            side.shadow.clear();
+        }
+        let (reply, done) = channel();
+        if self.tx.send(Cmd::Shutdown(reply)).is_ok()
+            && done.recv_timeout(std::time::Duration::from_secs(2)).is_err()
+        {
+            log::warn!("audio shutdown timed out; leaving still-referenced VST3 modules loaded");
+        }
+        // Dropping the stream stops further callbacks. The callback has
+        // already surrendered plugin instances in the acknowledged path.
+        self._stream.take();
+        self.side().collect_garbage();
     }
 
     pub fn stop(&self) {

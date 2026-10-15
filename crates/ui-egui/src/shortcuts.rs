@@ -112,6 +112,11 @@ fn fixed(app: &mut SoundApp, key: Key, m: Modifiers, mac: bool) -> bool {
             let _ = app.run("window.search", json!({}));
             true
         }
+        Key::F if mac && m.command && m.ctrl && !m.alt => {
+            // Pro Tools: apply the default crossfade without opening the Fades dialog.
+            let _ = app.run("edit.fades_create", json!({"shape": "equal power"}));
+            true
+        }
         Key::Equals if m.command && !(mac && m.ctrl) => {
             let _ = app.run("window.toggle_mix_edit", json!({}));
             true
@@ -147,17 +152,27 @@ fn fixed(app: &mut SoundApp, key: Key, m: Modifiers, mac: bool) -> bool {
             let _ = app.run("edit.nudge", json!({"direction": dir}));
             true
         }
-        Key::Tab if plain || m.alt => {
+        Key::Tab if plain || m.alt || (m.shift && !m.command && !m.ctrl) => {
             // Tab to next clip boundary (or transient when enabled).
             let s = app.engine.session();
             let at = s.edit.selection.start;
-            let back = m.alt;
+            let back = m.alt || m.shift;
+            let active_track = s.edit.selected_tracks.first().copied().or_else(|| {
+                s.edit.selected_clips.first().and_then(|c| s.find_clip(*c).map(|(t, _)| t))
+            });
             if s.edit.tab_to_transient
-                && !back
-                && let Some(t) = s.edit.selected_tracks.first().copied()
+                && let Some(t) = active_track
             {
-                let r = soundcraft_time::Range::new(at + 1, s.content_end());
-                if let Some(n) = soundcraft_engine::io::transients_in(s, t, r, 0.5).into_iter().find(|x| *x > at + 64) {
+                let start = if back { 0 } else { at.saturating_add(1) };
+                let end = if back { at } else { s.content_end() };
+                let r = soundcraft_time::Range::new(start, end);
+                let points = soundcraft_engine::io::transients_in(s, t, r, 0.4);
+                let found = if back {
+                    points.into_iter().rev().find(|x| *x < at.saturating_sub(64))
+                } else {
+                    points.into_iter().find(|x| *x > at + 64)
+                };
+                if let Some(n) = found {
                     let _ = app.run("transport.locate", json!({"at": n}));
                     return true;
                 }

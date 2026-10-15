@@ -367,6 +367,48 @@ fn plugin_windows(app: &mut SoundApp, ctx: &egui::Context) {
             continue;
         };
         let Some(info) = crate::mix_window::plugin_info(&ins.plugin) else { continue };
+        // Sculpt: a hosted plugin should display its native GUI OR a generic fallback,
+        // never both. A click on an insert is an open request, not a persistent window.
+        let native_editor = soundcraft_mix::is_third_party(&ins.plugin);
+        let fallback_key = egui::Id::new(("sculpt_native_fallback", tid.0, slot));
+        let pending_key = egui::Id::new(("sculpt_native_pending", tid.0, slot));
+        if native_editor {
+            let fallback = ctx.data(|d| d.get_temp::<bool>(fallback_key).unwrap_or(false));
+            if !fallback {
+                if let Some(player) = &app.player {
+                    if player.has_editor(tid, slot) {
+                        // A closed native editor is reopened on *every* new insert click.
+                        // Do not keep a generic window around after opening the native one.
+                        ctx.data_mut(|d| d.remove::<f64>(pending_key));
+                        if player.editor_open(tid, slot) {
+                            continue;
+                        }
+                        match player.open_editor(tid, slot) {
+                            Ok(()) => continue,
+                            Err(e) => {
+                                app.ui.status = format!("{} native editor: {e}", info.name);
+                                ctx.data_mut(|d| d.insert_temp(fallback_key, true));
+                            }
+                        }
+                    } else {
+                        // The audio thread asynchronously prepares hosted plugin instances.
+                        // Give it time before deciding this particular plugin has no GUI.
+                        let now = ctx.input(|i| i.time);
+                        let started = ctx.data(|d| d.get_temp::<f64>(pending_key));
+                        let since = started.unwrap_or(now);
+                        if started.is_none() {
+                            ctx.data_mut(|d| d.insert_temp(pending_key, now));
+                        }
+                        if now - since < 2.0 {
+                            keep.push((tid, slot));
+                            ctx.request_repaint_after_secs(0.05);
+                            continue;
+                        }
+                        ctx.data_mut(|d| d.insert_temp(fallback_key, true));
+                    }
+                }
+            }
+        }
         let place = if instrument { "instrument".to_string() } else { char::from(b'a'.saturating_add(slot as u8)).to_string() };
         let mut open = true;
         egui::Window::new(format!("{tname} · {place} · {}", info.name))
@@ -397,8 +439,11 @@ fn plugin_windows(app: &mut SoundApp, ctx: &egui::Context) {
                         {
                             if open {
                                 p.close_editor(tid, slot);
-                            } else if let Err(e) = p.open_editor(tid, slot) {
-                                app.ui.status = format!("{}: {e}", info.name);
+                            } else {
+                                match p.open_editor(tid, slot) {
+                                    Ok(()) => { ctx.data_mut(|d| { d.remove::<bool>(fallback_key); }); }
+                                    Err(e) => { app.ui.status = format!("{}: {e}", info.name); }
+                                }
                             }
                         }
                     }
@@ -456,6 +501,11 @@ fn plugin_windows(app: &mut SoundApp, ctx: &egui::Context) {
             });
         if open {
             keep.push((tid, slot));
+        } else {
+            ctx.data_mut(|d| {
+                d.remove::<f64>(pending_key);
+                d.remove::<bool>(fallback_key);
+            });
         }
     }
     app.ui.plugin_windows = keep;

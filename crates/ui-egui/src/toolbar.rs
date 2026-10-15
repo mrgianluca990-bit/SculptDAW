@@ -140,8 +140,8 @@ fn tools(app: &mut SoundApp, ui: &mut Ui) {
             let rr = row.response.rect;
             let bx0 = rr.min.x + 38.0;
             let bx1 = bx0 + 38.0 * 3.0 - 2.0;
-            let bracket = Rect::from_min_max(pos2(bx0 - 2.0, r.min.y + 1.0), pos2(bx1 + 2.0, r.min.y + 5.0));
-            let resp = ui.interact(bracket.expand2(vec2(0.0, 2.0)), ui.id().with("smart"), Sense::click());
+            let bracket = Rect::from_min_max(pos2(bx0 - 2.0, r.min.y + 1.0), pos2(bx1 + 2.0, r.min.y + 9.0));
+            let resp = ui.interact(bracket.expand2(vec2(0.0, 5.0)), ui.id().with("smart"), Sense::click());
             ui.painter().rect_filled(bracket, 1.0, if cur == Tool::Smart { t.accent } else { t.tool_bracket_off });
             if resp.on_hover_text("Smart Tool (F6+F7 / F7+F8)").clicked() {
                 let _ = app.run("edit.tool", json!({"tool": "smart"}));

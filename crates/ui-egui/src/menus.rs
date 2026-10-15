@@ -425,6 +425,28 @@ pub fn invoke_menu(app: &mut SoundApp, id: &str, path: &str) {
         app.ui.audiosuite = p.get("process").and_then(Value::as_str).map(str::to_string);
         return;
     }
+    // Sculpt: the native audio import picker supports selecting multiple files.
+    if id == "file.import_audio" {
+        if let Some(pick) = &app.services.pick_open_many {
+            if let Some(paths) = pick(id, &[]) {
+                let at = app.engine.session().edit.selection.start;
+                let mut imported = 0usize;
+                let mut failed = 0usize;
+                for file in paths {
+                    if app.run("file.import_audio", json!({"path": file, "at": at})).is_ok() {
+                        imported += 1;
+                    } else {
+                        failed += 1;
+                    }
+                }
+                app.ui.status = format!("Imported {imported} audio file(s)" );
+                if failed > 0 {
+                    app.ui.status.push_str(&format!("; {failed} failed"));
+                }
+            }
+            return;
+        }
+    }
     if wants_dialog(id) && app.dialogs.open_for_command(&app.engine, id) {
         return;
     }

@@ -19,7 +19,7 @@ pub enum Dialog {
     PathPrompt { cmd: String, title: String, path: String, key: String },
     Number { cmd: String, title: String, key: String, value: f64, suffix: String },
     TempoChange { at: Samples, bpm: f64 }, // from double-clicking the tempo ruler
-    Fades { shape: String },
+    Fades { shape_in: String, shape_out: String, link: bool },
     StripSilence { threshold: f64, min_ms: f64, pre_ms: f64, post_ms: f64 },
     Group { name: String, edit: bool, mix: bool, members: Vec<(u64, String, bool)> },
     Session { frame_rate: String, bit_depth: String },
@@ -112,7 +112,7 @@ impl Dialogs {
             "event.quantize" => {
                 Dialog::Number { cmd: id.into(), title: "Quantize strength".into(), key: "strength".into(), value: 100.0, suffix: "%".into() }
             }
-            "edit.fades_create" => Dialog::Fades { shape: "equal power".into() },
+            "edit.fades_create" => Dialog::Fades { shape_in: "equal power".into(), shape_out: "equal power".into(), link: true },
             "edit.strip_silence" => Dialog::StripSilence { threshold: -48.0, min_ms: 50.0, pre_ms: 5.0, post_ms: 20.0 },
             "track.group" => {
                 let s = e.session();
@@ -388,10 +388,33 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                 }
                 Dialog::PathPrompt { cmd, path, key, .. } => {
                     ui.add(egui::TextEdit::singleline(path).desired_width(420.0));
+                    if cmd == "file.import_audio"
+                        && let Some(pick) = &app.services.pick_open_many
+                        && ui.button("Browse multiple audio files…").clicked()
+                        && let Some(paths) = pick(cmd, &[])
+                    {
+                        let at = app.engine.session().edit.selection.start;
+                        let mut imported = 0usize;
+                        let mut failed = 0usize;
+                        for file in paths {
+                            if app.run("file.import_audio", json!({"path": file, "at": at})).is_ok() {
+                                imported += 1;
+                            } else {
+                                failed += 1;
+                            }
+                        }
+                        app.ui.status = format!("Imported {imported} audio file(s)");
+                        if failed > 0 {
+                            app.ui.status.push_str(&format!("; {failed} failed"));
+                        }
+                        // Files were imported immediately; do not ask for an extra OK click.
+                        keep = false;
+                    }
                     if let Some(pick) = &app.services.pick_open
                         && cmd != "session.save_as"
                         && cmd != "session.save_copy"
                         && key != "dir"
+                        && cmd != "file.import_audio"
                         && ui.button("Browse…").clicked()
                         && let Some(p) = pick(cmd, &[])
                     {
@@ -445,12 +468,56 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                         action = Some(tempo_change_action(*at, *bpm));
                     }
                 }
-                Dialog::Fades { shape } => {
-                    for s in soundcraft_model::FadeShape::ALL {
-                        ui.radio_value(shape, s.label().to_lowercase(), s.label());
+                Dialog::Fades { shape_in, shape_out, link } => {
+                    ui.heading("Crossfade / Fade Editor");
+                    ui.checkbox(link, "Link Fade In and Fade Out curves");
+                    ui.horizontal(|ui| {
+                        ui.label("FADE OUT");
+                        egui::ComboBox::from_id_salt("sculpt_fade_out_shape")
+                            .selected_text(shape_out.as_str()).show_ui(ui, |ui| {
+                                for s in soundcraft_model::FadeShape::ALL {
+                                    if ui.selectable_value(shape_out, s.label().to_lowercase(), s.label()).changed() && *link {
+                                        *shape_in = shape_out.clone();
+                                    }
+                                }
+                            });
+                        ui.separator();
+                        ui.label("FADE IN");
+                        egui::ComboBox::from_id_salt("sculpt_fade_in_shape")
+                            .selected_text(shape_in.as_str()).show_ui(ui, |ui| {
+                                for s in soundcraft_model::FadeShape::ALL {
+                                    if ui.selectable_value(shape_in, s.label().to_lowercase(), s.label()).changed() && *link {
+                                        *shape_out = shape_in.clone();
+                                    }
+                                }
+                            });
+                    });
+                    let out_shape = soundcraft_model::FadeShape::from_id(shape_out).unwrap_or_default();
+                    let in_shape = soundcraft_model::FadeShape::from_id(shape_in).unwrap_or_default();
+                    let (rect, _) = ui.allocate_exact_size(vec2(420.0, 125.0), egui::Sense::hover());
+                    ui.painter().rect_filled(rect, 4.0, egui::Color32::from_rgb(28, 34, 42));
+                    let left = rect.min.x + 10.0;
+                    let right = rect.max.x - 10.0;
+                    let top = rect.min.y + 10.0;
+                    let bottom = rect.max.y - 10.0;
+                    ui.painter().line_segment([egui::pos2(left, bottom), egui::pos2(right, bottom)], egui::Stroke::new(1.0, egui::Color32::GRAY));
+                    let mut out_pts = Vec::new();
+                    let mut in_pts = Vec::new();
+                    for i in 0..=60 {
+                        let k = i as f32 / 60.0;
+                        let x = left + (right - left) * k;
+                        out_pts.push(egui::pos2(x, bottom - (bottom - top) * out_shape.gain(1.0 - k)));
+                        in_pts.push(egui::pos2(x, bottom - (bottom - top) * in_shape.gain(k)));
                     }
-                    if buttons(ui, "OK", enter) {
-                        action = Some(("edit.fades_create".into(), json!({"shape": shape})));
+                    ui.painter().add(egui::Shape::line(out_pts, egui::Stroke::new(2.5, egui::Color32::from_rgb(235, 145, 175))));
+                    ui.painter().add(egui::Shape::line(in_pts, egui::Stroke::new(2.5, egui::Color32::from_rgb(125, 215, 175))));
+                    ui.horizontal(|ui| {
+                        ui.colored_label(egui::Color32::from_rgb(235, 145, 175), "● Fade Out");
+                        ui.colored_label(egui::Color32::from_rgb(125, 215, 175), "● Fade In");
+                        ui.label("Curves preview");
+                    });
+                    if buttons(ui, "Apply Fade", enter) {
+                        action = Some(("edit.fades_create".into(), json!({"shape_out": shape_out, "shape_in": shape_in})));
                     }
                 }
                 Dialog::StripSilence { threshold, min_ms, pre_ms, post_ms } => {

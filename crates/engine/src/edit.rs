@@ -303,11 +303,53 @@ pub fn move_clips(s: &mut Session, ids: &[ClipId], delta: Samples, to_track: Opt
     n
 }
 
+/// Session-stable original cut location for a crossfade between these two clip IDs.
+/// Stored in the undoable session edit state; no irreversible "split at midpoint" deletion.
+fn sculpt_xfade_join_key(a: ClipId, b: ClipId) -> String {
+    format!("sculpt.xfade.join.{}.{}", a.0, b.0)
+}
+
 /// Create fades from a selection (the incumbent's Edit › Fades › Create semantics):
 /// a range across a clip boundary makes a crossfade; at a clip start a fade-in; at its end a fade-out.
 pub fn create_fades(s: &mut Session, track: TrackId, range: Range, shape: FadeShape) -> usize {
+    create_fades_with_shapes(s, track, range, shape, shape)
+}
+
+/// Fade-out and fade-in curves can be independently selected, as in the Pro Tools fade dialog.
+pub fn create_fades_with_shapes(
+    s: &mut Session, track: TrackId, range: Range, shape_out: FadeShape, shape_in: FadeShape,
+) -> usize {
     if range.is_empty() {
         return 0;
+    }
+    // Resizing an existing crossfade must be one undoable edit. Restore the saved
+    // original cut before recomputing handles, so previous extensions do not accumulate.
+    let rebuild: Vec<(ClipId, ClipId, Samples)> = s.track(track).map_or_else(Vec::new, |tr| {
+        tr.clips().windows(2).filter_map(|pair| {
+            let (a, b) = (&pair[0], &pair[1]);
+            let original = s.edit.values.get(&sculpt_xfade_join_key(a.id, b.id))?;
+            let seam = *original as Samples;
+            (range.start < seam && seam < range.end && a.end() > b.start && a.fade_out.len > 0 && b.fade_in.len > 0)
+                .then_some((a.id, b.id, seam))
+        }).collect()
+    });
+    if let Some(pl) = s.track_mut(track).and_then(|t| t.playlist_mut()) {
+        for (aid, bid, seam) in rebuild {
+            let left = pl.clips.iter().position(|c| c.id == aid);
+            let right = pl.clips.iter().position(|c| c.id == bid);
+            if let (Some(i), Some(j)) = (left, right) {
+                if i != j {
+                    if let Some(a) = pl.clips.get_mut(i) {
+                        a.fade_out = Fade::default();
+                        a.trim_end_to(seam);
+                    }
+                    if let Some(b) = pl.clips.get_mut(j) {
+                        b.fade_in = Fade::default();
+                        b.trim_start_to(seam);
+                    }
+                }
+            }
+        }
     }
     let handles: Vec<(ClipId, Samples)> = {
         let Some(tr) = s.track(track) else { return 0 };
@@ -333,6 +375,7 @@ pub fn create_fades(s: &mut Session, track: TrackId, range: Range, shape: FadeSh
     pl.sort();
     let mut made = 0;
     let mut xfaded: Vec<ClipId> = Vec::new();
+    let mut remembered_joins: Vec<(String, f64)> = Vec::new();
     let n = pl.clips.len();
     // Crossfades between adjacent clips whose boundary is inside the range.
     for i in 0..n.saturating_sub(1) {
@@ -348,58 +391,83 @@ pub fn create_fades(s: &mut Session, track: TrackId, range: Range, shape: FadeSh
             let ext_b = before.min(b_handle).max(0);
             if let Some(ca) = pl.clips.get_mut(i) {
                 ca.length += ext_a;
-                ca.fade_out = Fade { len: (ext_a + before).min(ca.length), shape };
+                ca.fade_out = Fade { len: (ext_a + before).min(ca.length), shape: shape_out };
             }
             if let Some(cb) = pl.clips.get_mut(i + 1) {
                 let old = cb.start;
                 cb.trim_start_to(old - ext_b);
-                cb.fade_in = Fade { len: (ext_b + after).min(cb.length), shape };
+                cb.fade_in = Fade { len: (ext_b + after).min(cb.length), shape: shape_in };
             }
             made += 1;
             xfaded.push(a.id);
             xfaded.push(b.id);
+            remembered_joins.push((sculpt_xfade_join_key(a.id, b.id), boundary as f64));
         }
     }
     for c in pl.clips.iter_mut().filter(|c| !xfaded.contains(&c.id)) {
         if range.start <= c.start && range.end > c.start && range.end < c.end() {
-            c.fade_in = Fade { len: range.end - c.start, shape };
+            c.fade_in = Fade { len: range.end - c.start, shape: shape_in };
             made += 1;
         } else if range.end >= c.end() && range.start > c.start && range.start < c.end() {
-            c.fade_out = Fade { len: c.end() - range.start, shape };
+            c.fade_out = Fade { len: c.end() - range.start, shape: shape_out };
             made += 1;
         }
+    }
+    for (key, seam) in remembered_joins {
+        s.edit.values.insert(key, seam);
     }
     made
 }
 
-/// Remove fades on clips touching `range`.
+/// Remove only fades intersecting the requested range (or the cursor position).
+/// Crossfades restore the *original* edit boundary, not the middle of the overlap.
 pub fn delete_fades(s: &mut Session, track: TrackId, range: Range) -> usize {
+    let remembered = s.edit.values.clone();
+    let mut used_keys = Vec::new();
     let Some(pl) = s.track_mut(track).and_then(|t| t.playlist_mut()) else { return 0 };
-    let mut n = 0;
-    for c in &mut pl.clips {
-        if c.range().overlaps(&range) || (range.is_empty() && c.range().contains(range.start)) {
-            if c.fade_in.len > 0 || c.fade_out.len > 0 {
-                n += 1;
-            }
-            c.fade_in = Fade::default();
-            c.fade_out = Fade::default();
+    let selected = |start: Samples, end: Samples| -> bool {
+        if end <= start { return false; }
+        if range.is_empty() {
+            start <= range.start && range.start < end
+        } else {
+            start < range.end && range.start < end
         }
-    }
-    // Overlapping (crossfaded) neighbours are trimmed back to the midpoint.
+    };
+    let mut changed = 0usize;
     pl.sort();
     for i in 0..pl.clips.len().saturating_sub(1) {
-        let (Some(a_end), Some(b_start)) = (pl.clips.get(i).map(Clip::end), pl.clips.get(i + 1).map(|c| c.start)) else { continue };
-        if a_end > b_start {
-            let mid = b_start + (a_end - b_start) / 2;
-            if let Some(a) = pl.clips.get_mut(i) {
-                a.trim_end_to(mid);
-            }
-            if let Some(b) = pl.clips.get_mut(i + 1) {
-                b.trim_start_to(mid);
-            }
+        let (a, b) = (&pl.clips[i], &pl.clips[i + 1]);
+        if a.end() <= b.start || a.fade_out.len <= 0 || b.fade_in.len <= 0 || !selected(b.start, a.end()) {
+            continue;
         }
+        let key = sculpt_xfade_join_key(a.id, b.id);
+        let seam = remembered.get(&key).map_or(b.start + (a.end() - b.start) / 2, |x| *x as Samples);
+        if seam <= a.start || seam >= b.end() { continue; }
+        if let Some(left) = pl.clips.get_mut(i) {
+            left.fade_out = Fade::default();
+            left.trim_end_to(seam);
+        }
+        if let Some(right) = pl.clips.get_mut(i + 1) {
+            right.fade_in = Fade::default();
+            right.trim_start_to(seam);
+        }
+        used_keys.push(key);
+        changed += 1;
     }
-    n
+    for c in &mut pl.clips {
+        let mut erased = false;
+        if c.fade_in.len > 0 && selected(c.start, c.start + c.fade_in.len) {
+            c.fade_in = Fade::default();
+            erased = true;
+        }
+        if c.fade_out.len > 0 && selected(c.end() - c.fade_out.len, c.end()) {
+            c.fade_out = Fade::default();
+            erased = true;
+        }
+        if erased { changed += 1; }
+    }
+    for key in used_keys { s.edit.values.remove(&key); }
+    changed
 }
 
 #[cfg(test)]
@@ -480,6 +548,31 @@ mod tests {
         let (mut s, t) = session_with_clip();
         trim_to(&mut s, t, Range::new(1500, 2000));
         assert_eq!(clips(&s, t), vec![(1500, 500, 1500)]);
+    }
+
+    #[test]
+    fn sculpt_asymmetric_crossfade_restores_exact_junction() {
+        let (mut s, t) = session_with_clip();
+        separate_at(&mut s, t, 3000);
+        assert_eq!(create_fades(&mut s, t, Range::new(2850, 3080), FadeShape::EqualPower), 1);
+        let c = s.track(t).unwrap().clips();
+        assert_eq!((c[0].end(), c[1].start), (3080, 2850));
+        assert_eq!(delete_fades(&mut s, t, Range::new(2900, 3050)), 1);
+        let c = s.track(t).unwrap().clips();
+        assert_eq!((c[0].end(), c[1].start), (3000, 3000));
+    }
+
+    #[test]
+    fn sculpt_repeated_crossfade_resize_does_not_accumulate_handles() {
+        let (mut s, t) = session_with_clip();
+        separate_at(&mut s, t, 3000);
+        assert_eq!(create_fades(&mut s, t, Range::new(2900, 3100), FadeShape::EqualPower), 1);
+        assert_eq!(create_fades(&mut s, t, Range::new(2800, 3050), FadeShape::SCurve), 1);
+        let c = s.track(t).unwrap().clips();
+        assert_eq!((c[0].end(), c[1].start), (3050, 2800));
+        assert_eq!(delete_fades(&mut s, t, Range::new(2800, 3050)), 1);
+        let c = s.track(t).unwrap().clips();
+        assert_eq!((c[0].end(), c[1].start), (3000, 3000));
     }
 
     #[test]

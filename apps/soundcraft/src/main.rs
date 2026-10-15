@@ -94,7 +94,11 @@ impl eframe::App for App {
         }
         // The system Quit (⌘Q) ends the process from inside the event loop, so `run_native` never
         // returns: release the player's plugin instances and shut plugin hosting down here.
-        self.0.player = None;
+        // SCULPT_ORDERLY_PLUGIN_SHUTDOWN_V1: synchronize plugin ownership before
+        // calling VST3 bundle exits, which are sensitive to thread ordering.
+        if let Some(mut player) = self.0.player.take() {
+            player.shutdown();
+        }
         soundcraft_engine::shutdown_plugin_hosts();
     }
 }
@@ -166,6 +170,12 @@ fn services() -> Services {
                 ),
             };
             d.pick_file().map(|p| p.to_string_lossy().into_owned())
+        })),
+        pick_open_many: Some(Box::new(|_purpose: &str, _exts: &[&str]| {
+            rfd::FileDialog::new()
+                .add_filter("Audio", &["wav", "wave", "bwf", "aif", "aiff", "aifc", "flac", "mp3", "ogg", "oga", "m4a", "aac", "mp4", "caf", "mkv", "webm"])
+                .pick_files()
+                .map(|files| files.into_iter().map(|p| p.to_string_lossy().into_owned()).collect())
         })),
         pick_save: Some(Box::new(|_purpose: &str, default: &str| {
             let path = std::path::Path::new(default);
@@ -257,6 +267,15 @@ fn main() -> eframe::Result {
         Box::new(move |cc| {
             let player = if no_audio { None } else { Some(soundcraft_playback::Player::new(Arc::new(engine.session().clone()))) };
             let mut app = SoundApp::new(engine, player, services());
+            for (flag, cmd) in [
+                ("edit_view.io", "view.edit_io"),
+                ("edit_view.inserts_ae", "view.edit_inserts_ae"),
+                ("edit_view.inserts_fj", "view.edit_inserts_fj"),
+            ] {
+                if !app.engine.session().edit.flag(flag) {
+                    let _ = app.run(cmd, serde_json::json!({}));
+                }
+            }
             app.autosave_dir = prefs_path().and_then(|p| p.parent().map(|d| d.join("Autosave")));
             app.preset_dir = prefs_path().and_then(|p| p.parent().map(|d| d.join("Presets")));
             app.extra.ui_scale = prefs.ui_scale;

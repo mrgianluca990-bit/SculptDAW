@@ -458,13 +458,23 @@ fn insert_slot(app: &mut SoundApp, ui: &mut Ui, track: &Track, slot: usize, r: R
         Stroke::new(1.0, t.slot_border),
         StrokeKind::Inside,
     );
+    let mut bypass_clicked = false;
+    if let Some(current) = &ins {
+        let brect = Rect::from_min_max(pos2(r.min.x + 1.0, r.min.y + 1.0), pos2(r.min.x + 16.0, r.max.y - 1.0));
+        let toggle = ui.interact(brect, ui.id().with(("sculpt_insert_bypass", id.0, slot)), Sense::click());
+        ui.painter().circle_filled(brect.center(), 4.0, if current.bypass { t.text_dim } else { t.accent });
+        if toggle.on_hover_text("Bypass insert (on/off)").clicked() {
+            bypass_clicked = true;
+            let _ = app.run("mix.insert_bypass", json!({"track": id.0, "slot": slot}));
+        }
+    }
     let label = ins.as_ref().and_then(|i| plugin_info(&i.plugin)).map_or("", |p| p.short_name);
     if label.is_empty() {
         ui.painter().circle_filled(pos2(r.min.x + 6.0, r.center().y), 1.5, t.text_dim);
     } else {
         ui.painter().with_clip_rect(r).text(r.center(), Align2::CENTER_CENTER, label, regular(10.5), t.text);
     }
-    if resp.clicked() && ins.is_some() && !app.ui.plugin_windows.contains(&(id, slot)) {
+    if resp.clicked() && !bypass_clicked && ins.is_some() && !app.ui.plugin_windows.contains(&(id, slot)) {
         app.ui.plugin_windows.push((id, slot));
     }
     let menu_resp = if ins.is_none() { resp.clone() } else { resp.clone().on_hover_text("Click: open plugin · right-click: change") };
@@ -492,15 +502,24 @@ pub fn plugin_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, slot: usize, oc
         ui.menu_button(format!("{c:?}"), |ui| {
             for p in soundcraft_dsp::plugins().iter().filter(|p| p.category == c && !p.is_instrument) {
                 if ui.button(p.name).clicked() {
-                    let _ = app.run("mix.insert", json!({"track": id.0, "slot": slot, "plugin": p.id}));
+                    if app.run("mix.insert", json!({"track": id.0, "slot": slot, "plugin": p.id})).is_ok()
+                        && !app.ui.plugin_windows.contains(&(id, slot))
+                    {
+                        app.ui.plugin_windows.push((id, slot));
+                    }
                 }
             }
         });
     }
-    if let Some(plugin) = hosted_menus(ui, false)
-        && let Err(e) = app.run("mix.insert", json!({"track": id.0, "slot": slot, "plugin": plugin}))
-    {
-        app.ui.status = e;
+    if let Some(plugin) = hosted_menus(ui, false) {
+        match app.run("mix.insert", json!({"track": id.0, "slot": slot, "plugin": plugin})) {
+            Ok(_) => {
+                if !app.ui.plugin_windows.contains(&(id, slot)) {
+                    app.ui.plugin_windows.push((id, slot));
+                }
+            }
+            Err(e) => app.ui.status = e,
+        }
     }
 }
 
@@ -537,10 +556,15 @@ pub fn instrument_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId) {
     if let Some(p) = hosted_menus(ui, true) {
         picked = Some(p);
     }
-    if let Some(plugin) = picked
-        && let Err(e) = app.run("mix.instrument", json!({"track": id.0, "plugin": plugin}))
-    {
-        app.ui.status = e;
+    if let Some(plugin) = picked {
+        match app.run("mix.instrument", json!({"track": id.0, "plugin": plugin})) {
+            Ok(_) => {
+                if !app.ui.plugin_windows.contains(&(id, slot)) {
+                    app.ui.plugin_windows.push((id, slot));
+                }
+            }
+            Err(e) => app.ui.status = e,
+        }
     }
 }
 
