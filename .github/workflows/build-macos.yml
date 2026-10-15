@@ -1,4 +1,4 @@
-name: Sculpt DAW Core 17 - Fixed Mac Build
+name: Sculpt DAW Core 18 - Native Pickers, Right Markers and Track Groups
 on:
   push:
     branches: [main]
@@ -6,11 +6,11 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: sculpt-core17-${{ github.ref }}
+  group: sculpt-core18-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   macos:
-    name: Sculpt DAW Core17 Mac Universal (one build)
+    name: Sculpt DAW Core18 Mac Universal (one build)
     runs-on: macos-15-intel
     timeout-minutes: 120
     steps:
@@ -174,6 +174,73 @@ jobs:
           assert 'Window > Memory Locations' in Path('sculpt/qa-core-menu.txt').read_text()
           print('CORE17: patch + plist + marker UI verified BEFORE compile')
           PY_AUDIT
+      - name: Apply Core18 - direct session pickers, right markers, multi-track reorder
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_CORE18'
+          import base64, lzma
+          payload = """
+          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
+          """
+          source=lzma.decompress(base64.b64decode(''.join(payload.split()))).decode('utf8')
+          compile(source, 'SculptDAW_Core18_Patch.py', 'exec')
+          exec(source, {'__name__':'__main__'})
+          PY_CORE18
       - name: Install Rust for both Mac architectures
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -195,6 +262,8 @@ jobs:
           cargo test --locked --target x86_64-apple-darwin -p soundcraft-engine --lib sculpt_
           # All new Core17 regression cases are included in the same library test set.
           cargo test --locked --target x86_64-apple-darwin -p soundcraft-engine --lib sculpt_core17_
+          cargo test --locked --target x86_64-apple-darwin -p soundcraft-engine --lib sculpt_core18_
+          cargo test --locked --target x86_64-apple-darwin -p soundcraft-ui-egui --lib sculpt_core18_
           cargo test --locked --target x86_64-apple-darwin -p soundcraft-mix --lib
           cargo test --locked --target x86_64-apple-darwin -p soundcraft-ui-egui --lib sculpt_
           cargo test --locked --target x86_64-apple-darwin -p soundcraft-ui-egui --test shortcuts
@@ -228,10 +297,10 @@ jobs:
           assert any('audio.sculpt.daw.session' in t.get('LSItemContentTypes',[]) for t in info.get('CFBundleDocumentTypes',[])), info.get('CFBundleDocumentTypes')
           print('CORE17: signed ZIP, app icon, native UTI, .scdaw document type verified')
           PY_PLIST
-      - name: Upload Sculpt DAW Core17 Mac (one artifact)
+      - name: Upload Sculpt DAW Core18 Mac (one artifact)
         uses: actions/upload-artifact@v4
         with:
-          name: Sculpt-DAW-Core17-Fixed-Mac
+          name: Sculpt-DAW-Core18-Consolidated-Mac
           path: |
             dist/sculpt/Sculpt_DAW_0.4.0_Mac_Universal.zip
             dist/sculpt/Sculpt_DAW_0.4.0_Mac_Universal.zip.sha256
@@ -240,3 +309,5 @@ jobs:
 # SCULPT_CORE17_WORKFLOW_COMPLETE
 
 # SCULPT_CORE17_FIXED_WORKFLOW_COMPLETE
+
+# SCULPT_CORE18_ONE_BUILD_WORKFLOW_COMPLETE
