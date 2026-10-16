@@ -3,21 +3,13 @@ SCULPT DAW — CORE 21 COMBINED BUILD PATCH / 16 OCT 2026
 SOURCE UPDATE FOR YOUR EXISTING GITHUB ACTIONS BUILD.
 THIS IS NOT A COMPILED OR MAC-TESTED APPLICATION.
 
-EXACT CAUSE OF THE LATEST FAILED BUILD (OCTOBER 16)
-GitHub Actions run 38909007749, job 116999789930, failed at
-"Build Sculpt DAW Mac app" after the baseline Core19 Rust tests passed.
-Error from QA/SculptDAW_Core20_Patch.py, line 313:
-  RuntimeError: crates/ui-egui/src/docking.rs:
-  could not identify exactly one Memory default side: 0
-
-The previous fix still attempted to text-match `Self::Memory => Zone::Bottom/Right`
-after Core19 restored the layout. That check was unnecessary and brittle.
-It has NOW BEEN REMOVED ENTIRELY. The marker migration already moves the
-panel to the right once per window, without touching the Core19 match arm
-or the user's layout thereafter. The expected verification marker is
-placed inside this one-time migration and is no longer tied to a Rust
-source pattern. This is an overlay-script failure, not a Rust compiler
-error. Core21 did not execute in the failed job and its Rust remains unverified.
+EXACT CAUSE OF THE PREVIOUS FAILED BUILD
+GitHub Actions run 38902806444, job 116978918634, failed in
+"Build Sculpt DAW Mac app" (not during the Core19 Rust tests).
+The Core20 script expected precisely one:
+  Self::Memory => Zone::Bottom,
+But Core19 had already placed the Memory/Marker panel on the Right.
+The anchor was absent and the Python overlay aborted.
 
 Additional failures prevented in this combined candidate:
 * Core21 playback source has TWO AudioState::new(...) call sites.
@@ -54,7 +46,7 @@ for compatibility with the existing workflow's ZIP checks.
 CHANGES INCLUDED
 Core20:
   - Finder / Open With .scdaw handler
-  - Marker/Memory one-time migration to RIGHT (Core19 default unchanged)
+  - Marker/Memory default and one-time migration to RIGHT
   - Visible selected channel strip and fader in Edit view
   - Embedded signed CLI in Sculpt DAW.app/Contents/Helpers/
   - Sculpt DAW bridge protocol/capability handshake
@@ -91,9 +83,9 @@ LIMITATIONS
 VALIDATION PERFORMED IN THIS PACKAGE
   - Both overlay Python scripts pass AST/py_compile.
   - Bash package script passes bash -n.
-  - Marker layout handling no longer depends on a specific match-arm
-    syntax; static guards verify its tag occurs in the migration.
-    This is NOT a substitute for compilation of Rust code.
+  - A synthetic reproduction of Core19-right-layout + Core20 + Core21
+    applies successfully, and applying the scripts a second time is
+    idempotent. This is NOT a substitute for compilation of Rust code.
   - The new build script runs a post-overlay cargo check and the
     channel-64 DSP test before expensive release compilation.
   - The build script checks embedded CLI signature and the single-app
