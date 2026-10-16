@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Sculpt DAW macOS universal build and packaging (Apple Silicon + Intel)
+# Sculpt Bridge: the CLI is nested in the app bundle, not shipped as a sidecar.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -13,6 +14,14 @@ export CARGO_TARGET_DIR="$ROOT/target"
 export SOUNDCRAFT_BUILD_SHA="$(git rev-parse HEAD 2>/dev/null || echo source-archive)"
 VERSION=0.4.0
 
+# CORE20 must overlay the full Core19 source restored by the GitHub workflow.
+# The patch aborts immediately if the upstream file shapes have drifted.
+python3 -m py_compile QA/SculptDAW_Core20_Patch.py
+python3 QA/SculptDAW_Core20_Patch.py
+# We validate the final, actually packaged source (the earlier workflow tests
+# run before the patch for historical reasons).
+cargo check --locked --target x86_64-apple-darwin -p sculpt-daw
+
 for target in aarch64-apple-darwin x86_64-apple-darwin; do
   rustup target add "$target"
   cargo build --release --locked --target "$target" -p sculpt-daw -p soundcraft-cli
@@ -22,11 +31,9 @@ mkdir -p "$ROOT/target" "$ROOT/dist/sculpt"
 WORK="$(mktemp -d "$ROOT/target/sculpt-package.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 APP="$WORK/Sculpt DAW.app"
-CLI="$WORK/soundcraft-cli"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+CLI="$APP/Contents/Helpers/soundcraft-cli"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Helpers" "$APP/Contents/Resources"
 
-# A macOS application bundle contains only its own primary executable in Contents/MacOS.
-# The independent command-line tool is distributed alongside the app, not inside it.
 for bin in sculpt-daw soundcraft-cli; do
   if [[ "$bin" == sculpt-daw ]]; then
     dest="$APP/Contents/MacOS/sculpt-daw"
@@ -37,6 +44,7 @@ for bin in sculpt-daw soundcraft-cli; do
     "$CARGO_TARGET_DIR/aarch64-apple-darwin/release/$bin" \
     "$CARGO_TARGET_DIR/x86_64-apple-darwin/release/$bin" \
     -output "$dest"
+  chmod 755 "$dest"
   lipo "$dest" -verify_arch arm64 x86_64
   otool -L "$dest"
 done
@@ -79,23 +87,34 @@ plutil -lint "$APP/Contents/Info.plist"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 xattr -cr "$APP"
 
-# Sign the application bundle as a single unit: codesign signs CFBundleExecutable.
-# Signing a second independent executable in Contents/MacOS confuses deep validation.
-codesign --force --sign - --timestamp=none \
-  --entitlements packaging/macos/entitlements.plist "$APP"
-codesign --verify --strict --verbose=2 "$APP"
-codesign --verify --strict --verbose=2 "$APP/Contents/MacOS/sculpt-daw"
-
-# The CLI is a separate, independently signed binary.
+# Signing order matters: first sign nested helpers, THEN the enclosing .app.
+# Signing the CLI after the app would invalidate the enclosing bundle seal.
 codesign --force --sign - --timestamp=none "$CLI"
 codesign --verify --strict --verbose=2 "$CLI"
 "$CLI" --version
 
+codesign --force --sign - --timestamp=none \
+  --entitlements packaging/macos/entitlements.plist "$APP"
+codesign --verify --deep --strict --verbose=2 "$APP"
+codesign --verify --strict --verbose=2 "$APP/Contents/MacOS/sculpt-daw"
+codesign --verify --strict --verbose=2 "$CLI"
+
 OUTPUT="$ROOT/dist/sculpt/Sculpt_DAW_${VERSION}_Mac_Universal.zip"
 rm -f "$OUTPUT" "$OUTPUT.sha256"
-# Include Sculpt DAW.app and the CLI as siblings in the downloadable ZIP.
+# One deliverable: the signed app including its signed CLI helper.
 ditto -c -k --keepParent "$APP" "$OUTPUT"
-zip -q -j "$OUTPUT" "$CLI"
 unzip -t "$OUTPUT" >/dev/null
+python3 - "$OUTPUT" <<'PY_ZIP'
+import sys
+import zipfile
+with zipfile.ZipFile(sys.argv[1]) as z:
+    names = z.namelist()
+    cli = [p for p in names if p.endswith('/soundcraft-cli') or p == 'soundcraft-cli']
+    expected = 'Sculpt DAW.app/Contents/Helpers/soundcraft-cli'
+    assert cli == [expected], f'CLI must be bundled once under Contents/Helpers: {cli}'
+    assert 'Sculpt DAW.app/Contents/MacOS/sculpt-daw' in names, 'Missing DAW executable'
+    assert 'soundcraft-cli' not in names, 'Unexpected standalone CLI'
+print('SCULPT BRIDGE: one app bundle, embedded signed CLI; no standalone CLI')
+PY_ZIP
 shasum -a 256 "$OUTPUT" > "$OUTPUT.sha256"
-echo "Created: $OUTPUT (ad-hoc signed; not notarized)."
+echo "Created: $OUTPUT (CLI integrated; ad-hoc signed; not notarized)."
