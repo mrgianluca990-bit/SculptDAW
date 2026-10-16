@@ -1,4 +1,4 @@
-name: Sculpt DAW Core 18 - Fixed Native Pickers, Markers, Group Reorder
+name: Sculpt DAW Core 19 - Finder, Shared Markers, Edit Channel and Mixer
 on:
   push:
     branches: [main]
@@ -6,11 +6,11 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: sculpt-core18-${{ github.ref }}
+  group: sculpt-core19-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   macos:
-    name: Sculpt DAW Core18 Mac Universal (one build)
+    name: Sculpt DAW Core19 Mac Universal (one build)
     runs-on: macos-15-intel
     timeout-minutes: 120
     steps:
@@ -242,6 +242,121 @@ jobs:
           compile(source, 'SculptDAW_Core18_Patch.py', 'exec')
           exec(source, {'__name__':'__main__'})
           PY_CORE18
+      - name: Apply Core19 - Finder documents, shared markers, selected strip, groups and insert DnD
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_CORE19'
+          import base64,lzma
+          payload = """
+          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
+          """
+          content=lzma.decompress(base64.b64decode(''.join(payload.split()))).decode('utf-8')
+          compile(content, 'SculptDAW_Core19_Patch.py', 'exec')
+          exec(content, {'__name__':'__main__'})
+          PY_CORE19
       - name: Install Rust for both Mac architectures
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -264,6 +379,7 @@ jobs:
           # All new Core17 regression cases are included in the same library test set.
           cargo test --locked --target x86_64-apple-darwin -p soundcraft-engine --lib sculpt_core17_
           cargo test --locked --target x86_64-apple-darwin -p soundcraft-engine --lib sculpt_core18_
+          cargo test --locked --target x86_64-apple-darwin -p soundcraft-engine --lib sculpt_core19_
           cargo test --locked --target x86_64-apple-darwin -p soundcraft-ui-egui --lib sculpt_core18_
           cargo test --locked --target x86_64-apple-darwin -p soundcraft-mix --lib
           cargo test --locked --target x86_64-apple-darwin -p soundcraft-ui-egui --lib sculpt_
@@ -301,7 +417,7 @@ jobs:
       - name: Upload Sculpt DAW Core18 Mac (one artifact)
         uses: actions/upload-artifact@v4
         with:
-          name: Sculpt-DAW-Core18-Fixed-Mac
+          name: Sculpt-DAW-Core19-Mac-Universal
           path: |
             dist/sculpt/Sculpt_DAW_0.4.0_Mac_Universal.zip
             dist/sculpt/Sculpt_DAW_0.4.0_Mac_Universal.zip.sha256
@@ -311,4 +427,4 @@ jobs:
 
 # SCULPT_CORE17_FIXED_WORKFLOW_COMPLETE
 
-# SCULPT_CORE18_FIXED_WORKFLOW_COMPLETE
+# SCULPT_CORE19_WORKFLOW_COMPLETE
