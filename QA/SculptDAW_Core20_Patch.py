@@ -299,29 +299,16 @@ edit(UI, '            show_memory_locations: false,',
             sculpt_core20_marker_placed_mix: false,''',
      'SCULPT_CORE20_LAYOUT_DEFAULT')
 DOCK = 'crates/ui-egui/src/docking.rs'
-# Core19 (Repaired) already changed Memory's default side to Right.
-# Prior candidate wrongly required Zone::Bottom and aborted the build even
-# though all Cargo tests passed. Accept both historical source states, and
-# annotate the existing Right arm rather than altering it a second time.
-import re
-p = ROOT / DOCK
-src = p.read_text(encoding='utf8')
-if 'SCULPT_CORE20_MARKER_DEFAULT_RIGHT' not in src:
-    pattern = r'(?m)^(\s*Self::Memory\s*=>\s*Zone::)(Bottom|Right)(,)([^\n]*)$'
-    hits = list(re.finditer(pattern, src))
-    if len(hits) != 1:
-        raise RuntimeError(f'{DOCK}: could not identify exactly one Memory default side: {len(hits)}')
-    before = hits[0]
-    line = f'{before.group(1)}Right{before.group(3)} // SCULPT_CORE20_MARKER_DEFAULT_RIGHT'
-    # Preserve prior Core18/19 comments as source annotations, if any.
-    if before.group(4).strip():
-        line += ' | ' + before.group(4).strip().removeprefix('//').strip()
-    src = src[:before.start()] + line + src[before.end():]
-    p.write_text(src, encoding='utf8')
-    print('CORE20: right-side marker default verified and tagged')
+# SCULPT_CORE21_FIX_20261016: Core18/19 already provide right-side Marker
+# placement. Their restored source may use a match arm or a generated layout
+# that is not `Self::Memory => Zone::Right,`. Never inspect/rewrite that arm:
+# doing so repeatedly aborted otherwise successful macOS builds.
+# The one-time persisted-layout migration below is sufficient and does not
+# require a particular textual representation of a default panel side.
 edit(DOCK,
      '    let before_sync = workspace.clone();',
-     '''    // SCULPT_CORE20_MARKER_RIGHT_MIGRATION: move a pre-Core20 Marker/Memory
+     '''    // SCULPT_CORE20_MARKER_DEFAULT_RIGHT: Core18's right default is preserved.
+    // SCULPT_CORE20_MARKER_RIGHT_MIGRATION: move a pre-Core20 Marker/Memory
     // panel to the right once, while leaving subsequent operator panel moves intact.
     if (edit && !app.ui.sculpt_core20_marker_placed)
         || (!edit && !app.ui.sculpt_core20_marker_placed_mix) {
