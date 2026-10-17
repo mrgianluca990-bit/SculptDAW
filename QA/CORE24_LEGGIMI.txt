@@ -1,4 +1,37 @@
-SCULPT DAW CORE 24 — COMPILATION FIX (18/10/2026)
+SCULPT DAW CORE 24 — FIX COMPILAZIONE 2 (18/10/2026)
+
+Build GitHub Actions #39077897389: errore reale individuato:
+  RuntimeError: crates/ui-egui/src/menus.rs:
+  SCULPT_CORE24_IMPORT_MENU_COUNT expected exactly one anchor; found 0
+
+Correzione: l'overlay aggiunge un intercettatore dedicato all'inizio
+di invoke_menu, invece di sostituire tre righe soggette a differenze
+fra Core19 e Core23. Non altera il ramo di importazione preesistente,
+che resta come fallback. Il picker multiplo riporta le frequenze
+originali dei file convertiti al sample rate della sessione.
+
+Consegna: soltanto repository SculptDAW, con percorsi GitHub:
+  QA/SculptDAW_Core24_Patch.py
+  QA/sculpt_publish.rs
+  QA/CORE24_LEGGIMI.txt
+  sculpt/build-macos.sh
+
+Carica/sostituisci i file ai percorsi indicati ed esegui la pipeline macOS.
+Il file scout/build-macos.sh non esiste: il percorso corretto e' sculpt/build-macos.sh.
+La base funzionante rimane Core23 fino al successo della nuova build.
+
+Verifiche: py_compile, bash -n, due applicazioni consecutive
+in un albero sintetico comprendente un ramo import con impaginazione
+alternativa, presenza di tutti i tag Core24 e integrita' ZIP.
+Non e' stata compilata localmente la versione macOS/Rust.
+
+NOTA: la selezione e cancellazione dei fade di gruppo e' inclusa.
+Lo spostamento manuale indipendente dei fade di gruppo non e' ancora
+implementato, quindi non va considerato collaudato con questo fix.
+
+---
+
+SCULPT DAW CORE 24 — COMPILATION FIX PRECEDENTE (18/10/2026)
 
 Errore GitHub Actions #39075298999:
   RuntimeError: SCULPT_CORE24_STRIP_HEIGHT: expected exactly one anchor; found 0
@@ -65,7 +98,7 @@ TEST DA EFFETTUARE
 3. Publish as a New Cue: crea outbox distinta, nuovo cueID, stesso cueListID.
 4. Nessuna sovrascrittura del manifest di origine e dei file della sessione.
 5. Group fade: selezione evidenziata su tutte le tracce e cancellazione dal
-   menu contestuale. Trascinamento fade anche sui membri di gruppo.
+   menu contestuale. Lo spostamento manuale dei fade non e' implementato.
 6. Group trim: accorcia/allunga, poi Undo, anche su clip non perfettamente allineate.
 7. WAV 88.2k e MP3 44.1k in sessione 48k: mostra avviso con frequenze.
 8. Fader Edit: scrolling verticale, nessun accavallamento in alto.

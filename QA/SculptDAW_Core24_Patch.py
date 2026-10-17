@@ -302,35 +302,50 @@ patch('crates/ui-egui/src/lib.rs',
                     } else {format!("Imported audio at {} Hz",rate)};
                 }
                 if id == "options.scrolling" {''', 'SCULPT_CORE24_IMPORT_UI_WARNING')
-patch('crates/ui-egui/src/menus.rs',
-'''                let mut imported = 0usize;
-                let mut failed = 0usize;''',
-'''                let mut imported = 0usize;
-                let mut failed = 0usize;
-                let mut resampled = 0usize; // SCULPT_CORE24_IMPORT_MENU_COUNT
-                let mut conversions=Vec::<String>::new();''', 'SCULPT_CORE24_IMPORT_MENU_COUNT')
-patch('crates/ui-egui/src/menus.rs',
-'''                    if app.run("file.import_audio", json!({"path": file, "at": at})).is_ok() {
-                        imported += 1;
-                    } else {
-                        failed += 1;
-                    }''',
-'''                    // SCULPT_CORE24_IMPORT_MENU_RATES: record each converter ratio.
+# SCULPT_CORE24_IMPORT_MENU_COUNT / _RATES / _NOTICE:
+# The Core18/19 import handler varies; install a narrowly scoped dispatcher
+# at the start of invoke_menu instead of replacing any existing code.
+# The old handler remains the fallback when a multi-file picker is unavailable.
+import_file=ROOT/'crates/ui-egui/src/menus.rs'
+menus_source=import_file.read_text(encoding='utf-8')
+if 'SCULPT_CORE24_IMPORT_MENU_NOTICE' not in menus_source:
+    entry='pub fn invoke_menu(app: &mut SoundApp, id: &str, path: &str) {'
+    if menus_source.count(entry)!=1:
+        raise RuntimeError(f'Core24: expected one invoke_menu entry, got {menus_source.count(entry)}')
+    interception='''pub fn invoke_menu(app: &mut SoundApp, id: &str, path: &str) {
+    // SCULPT_CORE24_IMPORT_MENU_COUNT: intercept native & egui multi-file import.
+    if id == "file.import_audio" {
+        if let Some(pick) = &app.services.pick_open_many {
+            if let Some(paths) = pick(id, &[]) {
+                let at=app.engine.session().edit.selection.start;
+                let mut imported=0usize;
+                let mut failed=0usize;
+                let mut conversions=Vec::<String>::new();
+                for file in paths {
+                    // SCULPT_CORE24_IMPORT_MENU_RATES: engine returns original and session rate.
                     match app.run("file.import_audio",json!({"path":file,"at":at})) {
                         Ok(v)=>{
                             imported+=1;
-                            let a=v.get("source_sample_rate").and_then(Value::as_u64);
-                            let b=v.get("session_sample_rate").and_then(Value::as_u64);
-                            if let (Some(a),Some(b))=(a,b) {
-                                if a!=b {resampled+=1;conversions.push(format!("{a}→{b} Hz"));}
+                            let source=v.get("source_sample_rate").and_then(Value::as_u64);
+                            let session=v.get("session_sample_rate").and_then(Value::as_u64);
+                            if let (Some(a),Some(b))=(source,session) {
+                                if a!=b {conversions.push(format!("{a} → {b} Hz"));}
                             }
-                        }
-                        Err(_)=>failed+=1,
-                    }''', 'SCULPT_CORE24_IMPORT_MENU_RATES')
-patch('crates/ui-egui/src/menus.rs',
-'''                app.ui.status = format!("Imported {imported} audio file(s)" );''',
-'''                app.ui.status = format!("Imported {imported} audio file(s) at session {} Hz; {resampled} RESAMPLED: {}",app.engine.session().sample_rate.hz(),conversions.join(", ")); // SCULPT_CORE24_IMPORT_MENU_NOTICE''',
-'SCULPT_CORE24_IMPORT_MENU_NOTICE')
+                        },
+                        Err(_)=>{failed+=1;},
+                    }
+                }
+                let count=conversions.len();
+                app.ui.status=format!("Imported {imported} audio file(s) at {} Hz; {count} converted: {}",app.engine.session().sample_rate.hz(),conversions.join(", ")); // SCULPT_CORE24_IMPORT_MENU_NOTICE
+                if failed>0 {app.ui.status.push_str(&format!("; {failed} failed"));}
+            }
+            return;
+        }
+    }'''
+    import_file.write_text(menus_source.replace(entry,interception,1),encoding='utf-8')
+    print('PATCH SCULPT_CORE24_IMPORT_MENU_COUNT / SCULPT_CORE24_IMPORT_MENU_RATES / SCULPT_CORE24_IMPORT_MENU_NOTICE')
+else:
+    print('ALREADY SCULPT_CORE24_IMPORT_MENU_COUNT / RATES / NOTICE')
 
 # Ensure Main-route rendering for separately-bounced hardware-routed stems.
 patch('crates/engine/src/io.rs',
