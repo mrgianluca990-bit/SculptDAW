@@ -20,6 +20,9 @@ python3 -m py_compile QA/SculptDAW_Core20_Patch.py
 python3 QA/SculptDAW_Core20_Patch.py
 python3 -m py_compile QA/SculptDAW_Core21_IO_Patch.py
 python3 QA/SculptDAW_Core21_IO_Patch.py
+# Core22 must run after all legacy overlays, before the universal release build.
+python3 -m py_compile QA/SculptDAW_Core22_Patch.py
+python3 QA/SculptDAW_Core22_Patch.py
 # We validate the final, actually packaged source (the earlier workflow tests
 # run before the patch for historical reasons).
 cargo check --locked --target x86_64-apple-darwin -p sculpt-daw
@@ -118,7 +121,9 @@ with zipfile.ZipFile(sys.argv[1]) as z:
     assert cli == [expected], f'CLI must be bundled once under Contents/Helpers: {cli}'
     assert 'Sculpt DAW.app/Contents/MacOS/sculpt-daw' in names, 'Missing DAW executable'
     assert 'soundcraft-cli' not in names, 'Unexpected standalone CLI'
-print('SCULPT BRIDGE: one app bundle, embedded signed CLI; no standalone CLI')
+    assert {p.split('/')[0] for p in names if p.strip('/')} == {'Sculpt DAW.app'}, 'Archive contains more than Sculpt DAW.app'
+    assert not any(p.lower().endswith(('.zip','.tar','.gz')) for p in names), 'Nested archive detected'
+print('SCULPT CORE22: one app bundle, embedded signed CLI; no standalone CLI')
 PY_ZIP
 shasum -a 256 "$OUTPUT" > "$OUTPUT.sha256"
 echo "Created: $OUTPUT (CLI integrated; ad-hoc signed; not notarized)."
