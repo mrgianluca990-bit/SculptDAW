@@ -231,7 +231,9 @@ pub(crate) fn sculpt_core22_selected_strip(app: &mut SoundApp, ui: &mut Ui) {
     let snap=app.player.as_ref().filter(|_|app.meters_live()).map(|p|p.meters());
     egui::ScrollArea::vertical().id_salt("sculpt_edit_strip_scroll")
         .auto_shrink([false,false]).show(ui, |ui| {
-            strip(app,ui,id,snap.as_ref());
+            // Core19/21 use a five-argument strip signature: explicit width for Edit.
+            let strip_width = ui.available_width().clamp(108.0,178.0);
+            strip(app, ui, id, snap.as_ref(), Some(strip_width));
         });
     app.ui.narrow_mix=old_narrow;
     app.ui.mix_views=old_views;
@@ -254,10 +256,11 @@ transform(mix,
 edit='crates/ui-egui/src/edit_window.rs';s=(ROOT/edit).read_text(encoding='utf-8')
 pattern=r'(?s)    // SCULPT_CORE20_VISIBLE_STRIP: reserve a dedicated channel strip in Edit,.*?    crate::docking::show\(app, ui, crate::MainWindow::Edit\);'
 new='''    // SCULPT_CORE22_EDIT_LEFT_STRIP: channel strip identical to the mixer, never bottom docked.
-    egui::SidePanel::left("sculpt_core22_channel_strip").resizable(true).default_width(118.0)
-        .min_width(108.0).max_width(178.0)
+    // egui 0.36 uses Panel::{left,right}, default_size/min_size/max_size.
+    egui::Panel::left("sculpt_core22_channel_strip").resizable(true).default_size(118.0)
+        .min_size(108.0).max_size(178.0)
         .frame(egui::Frame::NONE.fill(t.panel_bg2))
-        .show_inside(ui,|ui|crate::mix_window::sculpt_core22_selected_strip(app,ui));
+        .show(ui,|ui|crate::mix_window::sculpt_core22_selected_strip(app,ui));
     crate::docking::show(app, ui, crate::MainWindow::Edit);'''
 if s.count('SCULPT_CORE22_EDIT_LEFT_STRIP')==0:
     s,n=re.subn(pattern,new,s,count=1)
@@ -357,8 +360,13 @@ transform('crates/ui-egui/src/lib.rs',
 p=ROOT/'crates/ui-egui/src/panels.rs';s=p.read_text(encoding='utf-8')
 if 'SCULPT_CORE22_GROUPS_ONLY' not in s:
     begin=s.find('    panel_header(ui, "GROUPS");')
-    end=s.find('\n}\n\npub fn clip_list(',begin)
+    # Bound the group extraction by the END OF tracks_and_groups ONLY.
+    # Core19 injected groups_and_selected_channel between this function and
+    # clip_list; copying up to clip_list cloned that function and broke Rust.
+    end=s.find('\n}\n',begin)
     if begin<0 or end<0:raise RuntimeError('groups block not found')
+    if 'fn groups_and_selected_channel' in s[begin:end]:
+        raise RuntimeError('groups extraction entered a neighboring Core19 function')
     group=s[begin:end]
     s+='''
 /// SCULPT_CORE22_GROUPS_ONLY: separate dedicated right-hand Groups panel.
@@ -508,5 +516,19 @@ for f,tags in checks.items():
     txt=(ROOT/f).read_text(encoding='utf-8')
     for tag in tags:
         assert tag in txt,f'{f}: missing {tag}'
+# CORE22_COMPILE_GUARDS_20261017: guards derived from actual failed Rust build #39054567271.
+# These checks run AFTER all Core20/Core21/Core22 modifications, before cargo check.
+final_panels=(ROOT/'crates/ui-egui/src/panels.rs').read_text(encoding='utf-8')
+final_edit=(ROOT/'crates/ui-egui/src/edit_window.rs').read_text(encoding='utf-8')
+final_mix=(ROOT/'crates/ui-egui/src/mix_window.rs').read_text(encoding='utf-8')
+for function_name in ('groups_and_selected_channel','groups_only'):
+    found=len(re.findall(r'(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?fn\s+'+function_name+r'\s*\(',final_panels))
+    if found!=1:raise RuntimeError(f'{function_name}: expected exactly one definition; got {found}')
+assert 'egui::SidePanel' not in final_edit, 'legacy egui::SidePanel unsupported in 0.36'
+assert 'egui::Panel::left("sculpt_core22_channel_strip")' in final_edit
+assert '.default_size(118.0)' in final_edit and '.min_size(108.0).max_size(178.0)' in final_edit
+assert 'strip(app, ui, id, snap.as_ref(), Some(strip_width));' in final_mix
+assert re.search(r'fn strip\([^\n]*width: Option<f32>',final_mix), 'unexpected Core21 strip signature'
+print('CORE22 COMPILE GUARDS: no duplicate Groups fn, egui 0.36 Panel API, 5-argument mixer strip OK')
 assert 'sculpt_core21_output_matrix' not in (ROOT/'crates/ui-egui/src/windows.rs').read_text(), 'old matrix survived'
 print('SCULPT CORE22: Audio Settings, direct I/O, Edit right stack, shared selected strip source guards OK')
