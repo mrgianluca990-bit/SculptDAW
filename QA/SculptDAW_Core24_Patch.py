@@ -132,12 +132,14 @@ patch('crates/ui-egui/src/lib.rs',
 '''pub mod score_editor;
 pub mod sculpt_publish; // SCULPT_CORE24_PUBLISH_MODULE''', 'SCULPT_CORE24_PUBLISH_MODULE')
 
-# Make the EDIT inspector scroll to the actual fader rather than overpainting it.
+# Give the EDIT inspector its own scrollable vertical allocation, without rewriting
+# the Core19 mix strip's height expression (its text varies between patched builds).
+# The Core23 strip-width line is a known, versioned anchor in the final overlaid source.
 patch('crates/ui-egui/src/mix_window.rs',
-'''    let h = ui.available_height().max(560.0);''',
-'''    // SCULPT_CORE24_STRIP_HEIGHT: 4 banks of slots plus fader must not overlap.
-    // The Edit inspector has a vertical ScrollArea; Mix retains its existing sizing.
-    let h = ui.available_height().max(if width.is_some() { 1020.0 } else { 560.0 });''',
+'''            let strip_width = ui.available_width().clamp(155.0,240.0); // SCULPT_CORE23_STRIP_FIT''',
+'''            // SCULPT_CORE24_STRIP_HEIGHT: allow full controls + fader in the Edit ScrollArea.
+            ui.set_min_height(1100.0);
+            let strip_width = ui.available_width().clamp(155.0,240.0); // SCULPT_CORE23_STRIP_FIT''',
 'SCULPT_CORE24_STRIP_HEIGHT')
 
 # Correct group-relative trim rather than applying one absolute mouse timestamp to every track.

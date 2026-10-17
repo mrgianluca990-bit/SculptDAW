@@ -1,3 +1,24 @@
+SCULPT DAW CORE 24 — COMPILATION FIX (18/10/2026)
+
+Errore GitHub Actions #39075298999:
+  RuntimeError: SCULPT_CORE24_STRIP_HEIGHT: expected exactly one anchor; found 0
+
+Correzione:
+  - il fader Edit usa ui.set_min_height(1100.0) nel contenitore ScrollArea
+    del channel strip, ancorato al codice realmente creato dalla Core23;
+  - corretto il prestito dell'Engine.path nel modulo Rust Publish, che deve
+    possedere una copia prima delle chiamate mutabili su SoundApp.
+
+Sostituire su GitHub i due file QA/SculptDAW_Core24_Patch.py e
+QA/sculpt_publish.rs. Il file sculpt/build-macos.sh e' incluso per
+mantenere il percorso di distribuzione Core24 completo, ma e' invariato.
+
+Verifiche locali: sintassi Python, bash -n, applicazione simulata due volte
+senza duplicazioni, controllo integrita ZIP. Rust/macOS: DA VERIFICARE
+con GitHub Actions. Nessuna modifica al repository Sculpt Show.
+
+---
+
 SCULPT DAW CORE 24 — AGGIORNAMENTO DEL SOLO REPOSITORY SculptDAW
 
 Struttura dello ZIP:

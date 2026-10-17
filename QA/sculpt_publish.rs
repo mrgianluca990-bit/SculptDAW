@@ -72,8 +72,10 @@ pub fn publish(app:&mut SoundApp,new_cue:bool)->Result<Value,String>{
     if app.engine.is_dirty() {
         return Err("Save your Sculpt DAW session before publishing to Show".into());
     }
-    let current=app.engine.path.as_ref().ok_or("Save your session before publishing to Show")?;
-    let session_file=Path::new(current);
+    // Own the path: capture_plugin_states and file.bounce_stems mutate SoundApp later.
+    // Keeping a borrow of app.engine.path here would fail Rust's borrow checker.
+    let current=app.engine.path.clone().ok_or("Save your session before publishing to Show")?;
+    let session_file=Path::new(&current);
     let session_dir=session_file.parent().ok_or("The saved session has no parent folder")?;
     let origin_path=session_dir.join("sculpt-cue-bridge.json");
     let origin_data=fs::read(&origin_path).map_err(|_|format!(
