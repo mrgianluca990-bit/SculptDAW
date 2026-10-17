@@ -26,6 +26,9 @@ python3 QA/SculptDAW_Core22_Patch.py
 # DAW Core23: tested field corrections after the stable Core22 overlay.
 python3 -m py_compile QA/SculptDAW_Core23_Patch.py
 python3 QA/SculptDAW_Core23_Patch.py
+# Sculpt DAW Core24: publish handoff, menu order and regression fixes.
+python3 -m py_compile QA/SculptDAW_Core24_Patch.py
+python3 QA/SculptDAW_Core24_Patch.py
 # We validate the final, actually packaged source (the earlier workflow tests
 # run before the patch for historical reasons).
 cargo check --locked --target x86_64-apple-darwin -p sculpt-daw

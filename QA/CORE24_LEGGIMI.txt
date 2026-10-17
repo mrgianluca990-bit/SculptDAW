@@ -1,0 +1,56 @@
+SCULPT DAW CORE 24 — AGGIORNAMENTO DEL SOLO REPOSITORY SculptDAW
+
+Struttura dello ZIP:
+  QA/SculptDAW_Core24_Patch.py
+  QA/sculpt_publish.rs
+  QA/CORE24_LEGGIMI.txt
+  sculpt/build-macos.sh
+
+Caricare i file MANTENENDO IL PERCORSO e sostituire sculpt/build-macos.sh.
+GitHub Actions applica Core20, Core21, Core22, Core23, poi Core24.
+Il sorgente QA/sculpt_publish.rs viene copiato nella crate ui-egui dalla patch
+PRIMA della compilazione. Non modificare il repository Sculpt Show qui.
+
+MODIFICHE
+* Menu macOS/egui: Sculpt DAW | File | Setup | Edit | ...
+* File > Publish in Show > Publish in Show
+* File > Publish in Show > Publish in Show as a New Cue
+* Publish genera un pacchetto in <cartella sessione>/Sculpt Publish to Show/
+  con WAV allineati + sculpt-cue-bridge.json. Aggiornamento cue: stesso UUID;
+  Nuova cue: UUID nuovo, cue-list d'origine.
+* Importante: Show NON importa automaticamente il pacchetto finché
+  un ricevitore Show separato non sarà implementato. Stato nella DAW:
+  'Show handoff prepared ... Pending Show import'. Nessun file Show modificato.
+* Per pubblicare, la sessione deve essere salvata, provenire da Show
+  e avere sculpt-cue-bridge.json accanto al file della sessione.
+* Audio stems: bounce stereo post editing/fader/inserts, senza cambiare la
+  sessione. Output fisici su Main durante rendering, conservati nel manifest.
+  In questa prima versione, tracce mute o inattive bloccano la pubblicazione
+  per evitare perdite silenziose di stem. Se la registrazione ha canali >2,
+  la pubblicazione stereo e' provvisoria. Max 64 stem e 4 ore.
+* Gruppi: trim relativo clip-per-clip, fade selezionati per gruppo e cancellazione
+  congiunta dal menu contestuale, senza cancellare le clip.
+* Fader Edit: area verticale aumentata con scrolling, per non sovrapporsi.
+* Import file MP3/WAV: mostra nel messaggio di stato tasso originale e
+  tasso della sessione quando e' eseguito il ricampionamento.
+
+COME CANCELLARE UNA TRACCIA
+Seleziona nome traccia e scegli Track > Delete.
+Non usare Delete sulla timeline per eliminare l'intera traccia.
+
+TEST DA EFFETTUARE
+1. Menu Setup subito dopo File (anche nella barra menu nativa).
+2. Publish in Show: crea outbox, mantiene cueID; controlla marker e 2-3 stem.
+3. Publish as a New Cue: crea outbox distinta, nuovo cueID, stesso cueListID.
+4. Nessuna sovrascrittura del manifest di origine e dei file della sessione.
+5. Group fade: selezione evidenziata su tutte le tracce e cancellazione dal
+   menu contestuale. Trascinamento fade anche sui membri di gruppo.
+6. Group trim: accorcia/allunga, poi Undo, anche su clip non perfettamente allineate.
+7. WAV 88.2k e MP3 44.1k in sessione 48k: mostra avviso con frequenze.
+8. Fader Edit: scrolling verticale, nessun accavallamento in alto.
+9. Regressione: Finder, Mix, audio device 64 canali, Save, I/O, Show->DAW.
+
+VERIFICA
+Sintassi patch Python e Bash, test di overlay su albero simulato (due applicazioni),
+controlli di integrita' ZIP. NON significa che Rust/macOS sia stato compilato.
+La verifica definitiva e' cargo check + universal build in GitHub Actions.
