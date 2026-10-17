@@ -269,12 +269,17 @@ dock='crates/ui-egui/src/docking.rs'
 # Core18-21 may already have moved Marker to the right. Never require the old
 # Zone::Bottom form: that caused several historical compile failures.
 p=ROOT/dock; existing=p.read_text(encoding='utf-8')
+# The proven Core18/Core20 source may represent Memory's default side via a
+# match arm, a persisted-layout migration, or a generated layout.
+# Never inspect it textually again. Insert only the new Groups default side
+# at History's stable arm, and retain the proven Memory behavior unchanged.
 if 'SCULPT_CORE22_MEMORY_RIGHT' not in existing:
-    hit=list(re.finditer(r'(?m)^(\s*Self::Memory\s*=>\s*Zone::)(Right|Bottom)(,)([^\n]*)$',existing))
-    if len(hit)!=1:raise RuntimeError(f'{dock}: Memory side anchor missing: {len(hit)}')
-    m=hit[0]; patched=f'{m.group(1)}Right, // SCULPT_CORE22_MEMORY_RIGHT\n            Self::Groups => Zone::Right,'
-    existing=existing[:m.start()]+patched+existing[m.end():]
-    p.write_text(existing,encoding='utf-8')
+    anchor = '            Self::History => Zone::Right,'
+    if existing.count(anchor) != 1:
+        raise RuntimeError(f'{dock}: Groups default side anchor missing: {existing.count(anchor)}')
+    existing = existing.replace(anchor,
+        '            Self::Groups => Zone::Right, // SCULPT_CORE22_MEMORY_RIGHT\n' + anchor, 1)
+    p.write_text(existing, encoding='utf-8')
 for old,new,tag in [
  ('    Memory,\n    History,','    Memory,\n    Groups, // SCULPT_CORE22_GROUP_PANEL\n    History,','SCULPT_CORE22_GROUP_PANEL'),
  ('&[Self::Canvas, Self::Tracks, Self::Clips, Self::Midi, Self::Memory, Self::History];',
