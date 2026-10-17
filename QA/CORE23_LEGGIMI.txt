@@ -1,0 +1,54 @@
+SCULPT DAW — CORE 23 / CORREZIONI COLLAUDO CORE 22
+
+DESTINAZIONE: repository mrgianluca990-bit/SculptDAW (solo DAW)
+Carica il contenuto dello ZIP mantenendo questi percorsi dalla ROOT del repository:
+
+QA/SculptDAW_Core23_Patch.py   (NUOVO)
+sculpt/build-macos.sh         (SOSTITUIRE)
+
+I due script Core20, Core21 e Core22 RESTANO al loro posto.
+Lo script build-macos.sh esegue Core23 dopo Core22 e prima di cargo check.
+NON sostituire la Core22 compilata funzionante fino a nuovo collaudo.
+
+CORREZIONI incluse:
+- Edit: strip Mix reale a sinistra senza sezioni PREAMP/INSTRUMENT/OBJECT;
+  layout rigenerato una volta con Memory Locations alto-dx e Groups basso-dx.
+- CoreAudio: enumerazione output fisici senza il precedente limite ai percorsi
+  sessione (fino a 64 canali quando hardware/driver lo supportano).
+- Menu Setup: Audio Settings e I/O Setup visibili nella barra menu macOS
+  e nel menu di ripiego egui.
+- Session rate vs device rate: warning; import con ricampionamento segnalato.
+- Gruppi EDIT attivi: selezione delle clip e gesture di spostamento, fade,
+  crossfade, trim estesi a clip/tracce appartenenti al gruppo.
+
+NON inclusi / da diagnosticare separatamente:
+- FabFilter VST3: animazioni dei plugin. Non è stata introdotta una
+  workaround non verificata sul bridge delle finestre native macOS.
+- Correzioni del codice Sculpt Show. L'errore 'selected soundcraft-cli is
+  not an executable file' è emesso da Show: deve essere corretto nella
+  chat e nel repository Show. La DAW include già
+  Sculpt DAW.app/Contents/Helpers/soundcraft-cli.
+- Compatibilità CoreAudio di un dispositivo senza supporto f32: resta
+  quella esistente e richiede un test hardware specifico.
+
+CONTROLLI REALIZZATI:
+- py_compile dello script Core23
+- bash -n di sculpt/build-macos.sh
+- Test su fixture dell'overlay applicato due volte senza duplicazioni
+- NO compilazione macOS, NO test audio su interfaccia 64ch
+
+TEST MAC SUGGERITI:
+1. Avvio con preferenze della Core22: Memory Locations a destra in alto;
+   Groups a destra in basso; channel strip Edit a sinistra.
+2. Strip Edit: I/O, Inserts A-H, Sends A-H, Pan, Meter, Fader.
+   Nessuna sezione PREAMP, INSTRUMENT, OBJECT.
+3. Setup > Audio Settings e Setup > I/O Setup nella barra menu Mac.
+4. Device con 64 uscite: verificare numero mostrato in Audio Settings e
+   destinazioni realmente selezionabili nell'I/O Setup.
+5. 44.1 kHz file su sessione 48 kHz: import ricampionato, messaggio visibile.
+6. Cambio device rate a 44.1 con sessione a 48: warning, nessuna perdita
+   di contenuti della sessione.
+7. Group EDIT ON: selezionare una clip e muoverla; i clip sovrapposti
+   sulle tracce del gruppo devono seguire. Fade/crossfade/trim nel gruppo.
+8. Group EDIT OFF o inattivo: le altre tracce devono restare indipendenti.
+9. Salvare, riaprire la DAW e ripetere test layout e routing.
