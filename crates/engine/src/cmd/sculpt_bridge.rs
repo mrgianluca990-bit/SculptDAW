@@ -105,6 +105,7 @@ mod tests {
             let bytes = soundcraft_audio_io::encode(&buffer, &soundcraft_audio_io::EncodeOptions::default()).unwrap();
             crate::io::import_audio_bytes(&mut engine, "Same", &bytes, None, None, 0).unwrap();
         }
+        engine.session_mut().tracks[1].name = engine.session().tracks[0].name.clone();
         engine.session_mut().tracks[0].mixer.mute = true;
         let before = engine.session().clone();
         let dir = std::env::temp_dir().join(format!("sculpt-bridge-render-{}", std::process::id()));

@@ -89,7 +89,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "New Memory Location",
             [],
             Some("Enter"),
-            "{name?, at?, start?, end?, kind?: marker|selection|none, ruler?: 1..5}",
+            "{name?, at?, start?, end?, kind?: marker|selection|none, ruler?: 1..5, comments?}",
             always,
             add_marker
         ),
@@ -284,6 +284,9 @@ fn add_marker(e: &mut Engine, p: &Value) -> Result<Value> {
     let id = s.add_marker(&name, kind, a.max(0), b.max(a).max(0));
     if let Some(m) = s.markers.iter_mut().find(|m| m.id == id) {
         m.ruler = i64_or(p, "ruler", 1).clamp(1, 5) as u8;
+        if let Some(comments) = str_param(p, "comments") {
+            m.comments = comments.to_owned();
+        }
     }
     let number = s.marker(id).map_or(0, |m| m.number);
     Ok(json!({"id": id, "number": number}))

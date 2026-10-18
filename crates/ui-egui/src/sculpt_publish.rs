@@ -75,6 +75,7 @@ pub fn publish(app: &mut SoundApp, new_cue: bool) -> Result<Value, String> {
     // Own the path: capture_plugin_states and file.bounce_stems mutate SoundApp later.
     // Keeping a borrow of app.engine.path here would fail Rust's borrow checker.
     let current = app.engine.path.clone().ok_or("Save your session before publishing to Show")?;
+    let current = fs::canonicalize(&current).map_err(|e| format!("Locate saved session: {e}"))?.to_string_lossy().into_owned();
     let session_file = Path::new(&current);
     let session_dir = session_file.parent().ok_or("The saved session has no parent folder")?;
     let origin_path = session_dir.join("sculpt-cue-bridge.json");
@@ -104,8 +105,14 @@ pub fn publish(app: &mut SoundApp, new_cue: bool) -> Result<Value, String> {
     let prior_markers = value_array(&origin, "markers")?.clone();
     // Repeated updates use the previously acknowledged cue revision.
     let last_path = session_dir.join("sculpt-last-publish.json");
+    let mut previous_tracks = json!({});
     if let Ok(bytes) = fs::read(&last_path) {
         if let Ok(last) = serde_json::from_slice::<Value>(&bytes) {
+            if last.get("mode").and_then(Value::as_str) == Some("updateCue")
+                && last.get("cueID").and_then(Value::as_str).is_some_and(|id| id.eq_ignore_ascii_case(&old_cue))
+            {
+                previous_tracks = last.get("trackElements").cloned().unwrap_or_else(|| json!({}));
+            }
             if let Some(folder) = last.get("folder").and_then(Value::as_str) {
                 let receipt = Path::new(folder).join("receipt.json");
                 if let Ok(bytes) = fs::read(receipt) {
@@ -150,6 +157,8 @@ pub fn publish(app: &mut SoundApp, new_cue: bool) -> Result<Value, String> {
         return Err(format!("Incomplete offline export: {} file(s) for {} track(s)", paths.len(), tracks.len()));
     }
     let mut stems = Vec::<Value>::new();
+    let mut track_elements = json!({});
+    let mut used_elements = std::collections::HashSet::<String>::new();
     for track in tracks.iter() {
         let rendered =
             paths.iter().find(|v| v.get("trackID").and_then(Value::as_u64) == Some(track.id.0)).ok_or("Missing rendered track identifier")?;
@@ -158,14 +167,14 @@ pub fn publish(app: &mut SoundApp, new_cue: bool) -> Result<Value, String> {
             return Err(format!("Missing bounce file: {wav}"));
         }
         let old = original_stem(&origin, track);
-        let element_id = if new_cue {
-            fresh_uuid()?
-        } else {
-            match old.and_then(|v| v.get("elementID")).and_then(Value::as_str) {
-                Some(id) if valid_uuid(id) => id.to_owned(),
-                _ => fresh_uuid()?,
-            }
+        let track_key = track.id.0.to_string();
+        let prior = previous_tracks.get(&track_key).and_then(Value::as_str).or_else(|| old.and_then(|v| v.get("elementID")).and_then(Value::as_str));
+        let element_id = match prior {
+            Some(id) if !new_cue && valid_uuid(id) && !used_elements.contains(&id.to_ascii_uppercase()) => id.to_owned(),
+            _ => fresh_uuid()?,
         };
+        used_elements.insert(element_id.to_ascii_uppercase());
+        track_elements[&track_key] = json!(element_id.clone());
         let first = physical_output(track, &s, old);
         if first < 1 || first + track.channels() - 1 > 64 {
             return Err(format!("{}: bounce cannot start at hardware channel {}", track.name, first));
@@ -181,7 +190,14 @@ pub fn publish(app: &mut SoundApp, new_cue: bool) -> Result<Value, String> {
         if m.kind != soundcraft_model::MarkerKind::Marker {
             continue;
         }
-        let old = prior_markers.iter().find(|v| v.get("name").and_then(Value::as_str) == Some(m.name.as_str()));
+        let marker_id = m.comments.strip_prefix("Sculpt Show marker UUID: ").filter(|id| valid_uuid(id));
+        let old = prior_markers.iter().find(|v| {
+            if let Some(id) = marker_id {
+                v.get("id").and_then(Value::as_str).is_some_and(|v| v.eq_ignore_ascii_case(id))
+            } else {
+                v.get("name").and_then(Value::as_str) == Some(m.name.as_str())
+            }
+        });
         let id = if new_cue {
             fresh_uuid()?
         } else {
@@ -212,7 +228,8 @@ pub fn publish(app: &mut SoundApp, new_cue: bool) -> Result<Value, String> {
     let manifest = folder.join("publication.sculptbridge");
     let body = serde_json::to_vec_pretty(&origin).map_err(|e| e.to_string())?;
     write_atomic(&manifest, &body)?;
-    let pointer = json!({"folder":folder,"publicationID":publication_id});
+    let pointer = json!({"folder":folder,"publicationID":publication_id,"cueID":old_cue,
+        "mode":if new_cue{"newCue"}else{"updateCue"},"trackElements":track_elements});
     write_atomic(&last_path, &serde_json::to_vec(&pointer).map_err(|e| e.to_string())?)?;
     let opened = Command::new("/usr/bin/open").args(["-b", "com.gianlucavergalito.sculptshow"]).arg(&manifest).status();
     let delivered = opened.is_ok_and(|status| status.success());
