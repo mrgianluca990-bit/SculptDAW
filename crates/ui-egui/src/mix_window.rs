@@ -42,7 +42,7 @@ pub(crate) fn selected_channel(app: &mut SoundApp, ui: &mut Ui) {
     };
     let snap = app.player.as_ref().filter(|_| app.meters_live()).map(|p| p.meters());
     let available = ui.available_width();
-    let width = if available.is_nan() { 150.0 } else { available.clamp(150.0, 260.0) };
+    let width = if available.is_finite() { available.clamp(32.0, 260.0) } else { 150.0 };
     egui::ScrollArea::vertical().id_salt("sculpt19-selected-strip").auto_shrink([false, false]).show(ui, |ui| {
         strip(app, ui, id, snap.as_ref(), Some(width));
     });
@@ -103,13 +103,36 @@ fn route_name(app: &SoundApp, r: &Route) -> String {
     }
 }
 
+/// Reserve the fader and readout after every visible section, including all eight slots.
+pub fn strip_required_height(views: &[String], pan_height: f32) -> f32 {
+    let all = views.iter().any(|v| v == "all");
+    let has = |key: &str| all || views.iter().any(|v| v == key);
+    let mut height = 4.0 + 22.0 + 48.0 + pan_height.max(0.0) + 160.0 + 64.0;
+    for (key, size) in [
+        ("mic_preamps", 38.0), ("instruments", 38.0), ("object", 24.0),
+        ("inserts_ae", 105.0), ("inserts_fj", 71.0),
+        ("sends_ae", 105.0), ("sends_fj", 71.0),
+        ("eq_curve", 44.0), ("comments", 48.0), ("io", 86.0),
+    ] { if has(key) { height += size; } }
+    height
+}
+
 fn strip(app: &mut SoundApp, ui: &mut Ui, id: TrackId, snap: Option<&MeterSnapshot>, width: Option<f32>) {
     // SCULPT_CORE19_REUSABLE_STRIP
     let t = Tokens::current();
     let Some(track) = app.engine.session().track(id).cloned() else { return };
-    let narrow = app.ui.narrow_mix;
+    let narrow = width.is_none() && app.ui.narrow_mix;
     let w = width.unwrap_or_else(|| strip_width(narrow)); // SCULPT_CORE19_CONTEXT_STRIP_WIDTH
-    let h = if width.is_some() { 640.0 } else { ui.available_height().max(560.0) }; // SCULPT_CORE19_CONTEXT_STRIP_HEIGHT
+    let out_fmt = output_format(app, &track);
+    let surround = out_fmt.channels() > 2 && !out_fmt.is_ambisonic()
+        && !matches!(track.kind, TrackKind::Master | TrackKind::Vca) && track.channels() <= 2;
+    let pan_height = if surround {
+        (w - 12.0).min(88.0) + if out_fmt.has_height() { 28.0 } else { 17.0 }
+    } else if !track.mixer.pan.is_empty() && track.kind != TrackKind::Vca {
+        if track.mixer.pan.len() >= 2 { ((w - 8.0) / 2.0 - 6.0).min(32.0) + 20.0 } else { 54.0 }
+    } else { 0.0 };
+    let minimum = strip_required_height(&app.ui.mix_views, pan_height);
+    let h = if width.is_some() { minimum.max(640.0) } else { ui.available_height().max(minimum) };
     let (r, strip_response) = ui.allocate_exact_size(vec2(w, h), Sense::click()); // SCULPT_CORE22_CLICK_STRIP
     let selected = app.engine.session().edit.selected_tracks.contains(&id);
     ui.painter().rect_filled(r, 0.0, if selected { t.strip_selected } else { t.strip_bg });

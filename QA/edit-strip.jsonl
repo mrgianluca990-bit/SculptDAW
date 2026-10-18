@@ -1,0 +1,3 @@
+{"method":"engine.execute","params":{"command":"edit.select","params":{"tracks":[1]}}}
+{"method":"ui.set","params":{"mix_views":["inserts_ae","inserts_fj","sends_ae","sends_fj","io"],"show_track_list":true}}
+{"steps":5}

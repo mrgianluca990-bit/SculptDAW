@@ -208,6 +208,21 @@ fn state_saves_component_and_controller_and_restores_them() {
     assert_eq!(q.param("7"), Some(1.0));
 }
 
+// SCULPT_CORE25_VST3_REGRESSION: adapted from SoundCraft PR #400.
+#[test]
+fn host_set_controller_param_survives_state_round_trip() {
+    let id = id_of("Fixture Gain");
+    let mut p = soundcraft_vst3_host::create(&id).unwrap();
+    p.prepare(48_000.0, 64, 2);
+    assert!(p.set_param("7", 1.5));
+    assert!(p.set_param("12", 200.0));
+    let blob = p.save_state().expect("plugin state");
+    let mut q = soundcraft_vst3_host::create(&id).unwrap();
+    assert!(q.load_state(&blob));
+    assert!((q.param("7").unwrap() - 1.5).abs() < 1e-4);
+    assert!((q.param("12").unwrap() - 200.0).abs() < 0.01);
+}
+
 #[test]
 fn editor_view_is_probed_and_edits_come_back_as_plain_values() {
     let id = id_of("Fixture Gain");

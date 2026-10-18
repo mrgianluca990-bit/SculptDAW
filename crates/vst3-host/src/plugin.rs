@@ -33,6 +33,8 @@ pub struct Vst3Plugin {
     values: Vec<f32>,
     /// Normalized values waiting for the next block (coalesced per id; bounded).
     pending: Vec<(u32, f64)>,
+    /// Host parameters pending synchronization with the VST3 controller.
+    unsynced: Vec<bool>, // SCULPT_CORE25_VST3_FLAGS
     /// Pending notes, kept sorted by time. Never grows past `EVENT_CAP`.
     notes: Vec<NoteEvent>,
     inputs: BusBuffers,
@@ -76,6 +78,7 @@ impl Vst3Plugin {
             info,
             values: Vec::with_capacity(ids.len()),
             pending: Vec::with_capacity(ids.len().min(PARAM_QUEUE_CAP)),
+            unsynced: vec![false; ids.len()], // SCULPT_CORE25_VST3_ALLOC
             notes: Vec::with_capacity(EVENT_CAP),
             inputs: BusBuffers::new(&[], 0),
             outputs: BusBuffers::new(&[], 0),
@@ -145,6 +148,7 @@ impl Vst3Plugin {
             }
         }
         self.pending.clear();
+        self.unsynced.fill(false); // SCULPT_CORE25_VST3_RESET
     }
 
     /// Inserts keeping the queue time-sorted; drops the event when the queue is full (never
@@ -204,6 +208,9 @@ impl Plugin for Vst3Plugin {
         let v = pi.clamp(value);
         if let Some(slot) = self.values.get_mut(i) {
             *slot = v;
+        }
+        if let Some(unsynced) = self.unsynced.get_mut(i) {
+            *unsynced = true; // SCULPT_CORE25_VST3_SET
         }
         let Some(n) = self.normalized_from_plain(i, v) else { return true };
         if let Some(e) = self.pending.iter_mut().find(|(pid, _)| *pid == vid) {
@@ -319,6 +326,20 @@ impl Plugin for Vst3Plugin {
     }
 
     fn save_state(&mut self) -> Option<Vec<u8>> {
+        // SCULPT_CORE25_VST3_SAVE: controller-only parameters must survive a session save.
+        // set_param can run on the real-time thread; only do COM work during save_state.
+        for i in 0..self.ids.len() {
+            if !self.unsynced.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            if let (Some(&id), Some(n)) = (
+                self.ids.get(i),
+                self.values.get(i).and_then(|&v| self.normalized_from_plain(i, v)),
+            ) {
+                self.inst.set_normalized(id, n);
+            }
+        }
+        self.unsynced.fill(false);
         self.inst.save_state()
     }
 

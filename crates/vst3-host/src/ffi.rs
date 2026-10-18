@@ -1239,6 +1239,15 @@ impl Instance {
         v.is_finite().then(|| v.clamp(0.0, 1.0))
     }
 
+    /// SCULPT_CORE25_VST3_CONTROLLER: sync a host-set value to IEditController.
+    pub fn set_normalized(&self, id: u32, normalized: f64) {
+        let Some(controller) = &self.controller else { return };
+        if normalized.is_finite() {
+            // SAFETY: controller was validated during instance creation.
+            unsafe { controller.setParamNormalized(id, normalized.clamp(0.0, 1.0)) };
+        }
+    }
+
     pub fn value_text(&self, id: u32, normalized: f64) -> Option<String> {
         let c = self.controller.as_ref()?;
         let mut s: sv::String128 = [0; 128];

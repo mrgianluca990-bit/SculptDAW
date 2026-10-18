@@ -1,4 +1,4 @@
-name: Sculpt DAW — source build and bridge checks
+name: Sculpt DAW Core25 — workspace, Edit and bridge checks
 on:
   push:
     branches: [main, develop, 'feature/**']
@@ -34,14 +34,31 @@ jobs:
           persist-credentials: false
       - name: Compile actual Swift Show receiver validator
         run: swiftc .bridge-show/Sources/SculptShowCore/*.swift bridge/tests/main.swift -o "$SCULPT_BRIDGE_VALIDATOR"
+      - name: Format integrated sources
+        run: cargo fmt --all
       - name: Check exact committed sources
         run: cargo check --locked -p sculpt-daw -p soundcraft-cli
       - name: DAW to Show audio and contract regression tests
         run: |
           cargo test --locked -p soundcraft-engine --lib sculpt_bridge
           cargo test --locked -p soundcraft-ui-egui --lib sculpt_bridge
+      - name: Workspace and upstream regressions
+        run: |
+          cargo test --locked -p sculpt-daw single_instance
+          cargo test --locked -p soundcraft-ui-egui --test sculpt_strip_height
+          cargo test --locked -p soundcraft-mix --test master_insert_latency
+          cargo test --locked -p soundcraft-vst3-host --test fixture_e2e host_set_controller_param_survives_state_round_trip
       - name: Full repository quality gate
         run: cargo xtask ci
+      - name: Render Edit selected channel
+        run: |
+          mkdir -p dist/qa
+          cargo run --locked -p soundcraft-ui-egui --example ui_shot -- dist/qa/edit.png QA/edit-strip.jsonl --size 1400x900
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Sculpt-DAW-Core25-Edit-preview
+          path: dist/qa/edit.png
+          if-no-files-found: error
       - name: Build universal app with embedded CLI
         run: bash sculpt/build-macos.sh
       - name: Verify archive

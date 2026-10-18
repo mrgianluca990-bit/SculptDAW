@@ -4,6 +4,8 @@
      @SHORT_VERSION@ (numeric X.Y.Z) and @BUILD_SHA@. -->
 <plist version="1.0">
 <dict>
+  <key>LSMultipleInstancesProhibited</key>
+  <true/>
   <key>CFBundleDevelopmentRegion</key>
   <string>en</string>
   <key>CFBundleDisplayName</key>

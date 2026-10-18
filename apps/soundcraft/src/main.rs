@@ -19,6 +19,8 @@ mod logging;
 #[cfg(target_os = "macos")]
 mod native_menu;
 #[cfg(target_os = "macos")]
+mod single_instance;
+#[cfg(target_os = "macos")]
 #[allow(unsafe_code)] // SCULPT_CORE21_FINDER_FFI_SCOPE: this one FFI module only
 mod sculpt_open_documents; // SCULPT_CORE20_FINDER_MODULE
 
@@ -26,7 +28,12 @@ use soundcraft_engine::Engine;
 use soundcraft_ui_egui::{Services, SoundApp, UiState, dialogs};
 use std::sync::Arc;
 
-struct App(SoundApp, Option<&'static logging::AppLogger>, #[cfg(target_os = "macos")] Option<native_menu::NativeMenu>);
+struct App(
+    SoundApp,
+    Option<&'static logging::AppLogger>,
+    #[cfg(target_os = "macos")] Option<native_menu::NativeMenu>,
+    #[cfg(target_os = "macos")] Option<single_instance::Instance>,
+);
 
 /// Sends the title only when it changes, remembered here as X11 and Wayland can't read it back.
 fn set_title(ctx: &egui::Context, title: String) {
@@ -46,6 +53,13 @@ impl eframe::App for App {
         #[cfg(target_os = "macos")]
         if let Some(menu) = &mut self.2 {
             menu.process(&mut self.0);
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(instance) = &self.3 {
+            let requests = instance.requests();
+            if !requests.is_empty() { ctx.send_viewport_cmd(egui::ViewportCommand::Focus); }
+            for files in requests { open_files(&mut self.0, &files); }
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         self.0.logic(ctx);
         #[cfg(target_os = "macos")]
@@ -161,6 +175,19 @@ fn sculpt_restore_show_routes(app: &mut SoundApp) {
                 log::warn!("Sculpt Show route annotation {id}: {e}");
             }
         }
+    }
+}
+
+/// One document per request; non-document paths import into that workspace.
+fn open_files(app: &mut SoundApp, files: &[String]) {
+    let mut document_opened = false;
+    for path in files {
+        let lower = path.to_ascii_lowercase();
+        if lower.ends_with(".scdaw") || lower.ends_with(".scraft") {
+            if document_opened { continue; }
+            document_opened = true;
+        }
+        open_path(app, path);
     }
 }
 
@@ -336,6 +363,22 @@ fn main() -> eframe::Result {
         .filter(|(i, a)| !(a.starts_with("--") || (i > &0 && args.get(i - 1).is_some_and(|p| p == "--control"))))
         .map(|(_, a)| a.clone())
         .collect();
+    #[cfg(target_os = "macos")]
+    let instance = if prefs_enabled() {
+        let result = config_dir().ok_or_else(|| std::io::Error::other("Settings directory is unavailable"))
+            .and_then(|directory| single_instance::Instance::acquire(&directory, &files));
+        match result {
+            Ok(Some(instance)) => Some(instance),
+            Ok(None) => return Ok(()),
+            Err(error) => {
+                log::error!("Cannot open the shared workspace: {error}");
+                rfd::MessageDialog::new().set_title("Sculpt DAW")
+                    .set_description(format!("Cannot open the shared workspace: {error}"))
+                    .set_level(rfd::MessageLevel::Error).show();
+                return Ok(());
+            }
+        }
+    } else { None };
     log::info!("SoundCraft {} ({} {})", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH);
     // The log file lives in the settings directory; opened after the arguments, so `--version`
     // leaves no file behind. Records logged until now are written to it first. Runs without
@@ -411,9 +454,7 @@ fn main() -> eframe::Result {
                 let rx = control_server::start(port, cc.egui_ctx.clone());
                 app = app.with_control(rx);
             }
-            for f in &files {
-                open_path(&mut app, f);
-            }
+            open_files(&mut app, &files);
             // If the system menu bar cannot be built, keep the egui menu bar rather than fail to start.
             #[cfg(target_os = "macos")]
             let menu = match native_menu::NativeMenu::new(&app, &cc.egui_ctx) {
@@ -431,6 +472,8 @@ fn main() -> eframe::Result {
                 logger,
                 #[cfg(target_os = "macos")]
                 menu,
+                #[cfg(target_os = "macos")]
+                instance,
             )))
         }),
     )

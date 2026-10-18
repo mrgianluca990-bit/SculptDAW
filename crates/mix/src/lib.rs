@@ -641,11 +641,21 @@ impl MixEngine {
                 }
             }
         }
+        // SCULPT_CORE25_MASTER_LATENCY: master insert lookahead delays the entire main bus.
+        let mut lmax_master = 0usize;
+        if pdc {
+            for t in s.tracks.iter().filter(|t| t.kind == TrackKind::Master && !t.inactive) {
+                if let Some(st) = self.strips.get_mut(&t.id) {
+                    note_insert_latency(t, st, pos);
+                    lmax_master = lmax_master.saturating_add(st.latency);
+                }
+            }
+        }
         let lmax_t = if pdc { work.iter().map(|(_, st)| st.latency).max().unwrap_or(0) } else { 0 };
         let lmax_a =
             if pdc { self.strips.iter().filter(|(id, _)| s.track(**id).is_some_and(is_aux)).map(|(_, st)| st.latency).max().unwrap_or(0) } else { 0 };
         self.track_latency = lmax_t;
-        self.latency = lmax_t + lmax_a;
+        self.latency = lmax_t.saturating_add(lmax_a).saturating_add(lmax_master); // SCULPT_CORE25_MASTER_TOTAL
         for (i, st) in work.iter_mut() {
             let Some(t) = s.tracks.get(*i) else { continue };
             let ch = st.buf.len();
