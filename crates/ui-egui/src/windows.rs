@@ -408,115 +408,176 @@ fn configurations(app: &mut SoundApp, ctx: &egui::Context) {
     app.ui.show_configurations = open;
 }
 
-/// Setup › Playback Engine / Hardware.
-/// SCULPT_CORE22_AUDIO_SETTINGS: CoreAudio setup MUST precede I/O routing.
+/// Setup › Playback Engine. The shared Show profile is committed only after a successful trial.
 pub fn playback_engine(app: &mut SoundApp, ctx: &egui::Context) {
+    use soundcraft_playback::sculpt_audio_settings::{AudioDeviceInfo, AudioSettings, available_devices};
     let mut open = app.ui.show_playback_engine;
-    win(ctx, &mut open, "Sculpt · Audio Settings", vec2(580.0, 435.0), |ui| {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            use soundcraft_playback::sculpt_audio_settings::{AudioSettings, available_output_devices};
-            let id = egui::Id::new("sculpt_core22_audio_settings_draft");
-            let mut cfg: AudioSettings = ui.ctx().data(|d| d.get_temp(id)).unwrap_or_else(AudioSettings::read);
-            ui.heading("CoreAudio interface");
-            ui.label("A shared device profile is used by Sculpt Show and Sculpt DAW.");
-            let devices = available_output_devices();
-            ui.horizontal(|ui| {
-                ui.label("Output device");
-                egui::ComboBox::from_id_salt("sculpt_core22_audio_output")
-                    .selected_text(if cfg.output_name.is_empty() { "System default" } else { &cfg.output_name })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut cfg.output_name, String::new(), "System default");
-                        for d in &devices {
-                            ui.selectable_value(&mut cfg.output_name, d.name.clone(), format!("{} · {} out", d.name, d.channels));
-                        }
-                    });
-            });
-            ui.horizontal(|ui| {
-                ui.label("Input device");
-                ui.text_edit_singleline(&mut cfg.input_name)
-                    .on_hover_text("Optional exact CoreAudio input device name. Leave blank for default input.");
-            });
-            ui.horizontal(|ui| {
-                ui.label("Sample rate");
-                egui::ComboBox::from_id_salt("sculpt_core22_rate")
-                    .selected_text(if cfg.sample_rate == 0 { "Session rate".into() } else { format!("{} Hz", cfg.sample_rate) })
-                    .show_ui(ui, |ui| {
-                        for rate in [0, 44100, 48000, 88200, 96000, 176400, 192000] {
-                            ui.selectable_value(&mut cfg.sample_rate, rate, if rate == 0 { "Session rate".into() } else { format!("{} Hz", rate) });
-                        }
-                    });
-            });
-            ui.horizontal(|ui| {
-                ui.label("Buffer");
-                egui::ComboBox::from_id_salt("sculpt_core22_buffer")
-                    .selected_text(if cfg.buffer_frames == 0 { "Device default".into() } else { format!("{} samples", cfg.buffer_frames) })
-                    .show_ui(ui, |ui| {
-                        for frames in [0, 64, 128, 256, 512, 1024, 2048] {
-                            ui.selectable_value(
-                                &mut cfg.buffer_frames,
-                                frames,
-                                if frames == 0 { "Device default".into() } else { format!("{} samples", frames) },
-                            );
-                        }
-                    });
-            });
-            if let Some(device) = &app.player {
-                ui.separator();
-                ui.label(format!("Active: {} · {} Hz · {} output channels", device.device_name, device.device_rate, device.device_channels));
-            }
-            // SCULPT_CORE23_RATE_WARNING: distinguish device rate from session rate.
-            let project_rate = app.engine.session().sample_rate.hz();
-            ui.label(format!(
-                "Session: {} Hz · Device target: {} Hz",
-                project_rate,
-                if cfg.sample_rate == 0 { project_rate } else { cfg.sample_rate }
-            ));
-            if cfg.sample_rate > 0 && cfg.sample_rate != project_rate {
-                ui.colored_label(
-                    egui::Color32::YELLOW,
-                    "WARNING: hardware rate differs from session; playback is resampled. The session rate is not changed.",
-                );
-            }
-            ui.label("A device change is rejected during playback or recording. Stop transport first.");
-            let running = app.engine.transport.playing || app.engine.transport.recording;
-            if ui.add_enabled(!running, egui::Button::new("Apply and reconnect audio")).clicked() {
-                let previous = AudioSettings::read();
-                // A new choice by name must be resolved to an UID by Show when next opened.
-                if previous.output_name != cfg.output_name {
-                    cfg.output_uid.clear();
-                }
-                match cfg.save() {
-                    Ok(()) => {
-                        let trial = soundcraft_playback::Player::new(app.engine.session_arc());
-                        if trial.silent {
-                            let _ = previous.save();
-                            app.ui.status = "Audio setup failed; previous device configuration restored".into();
-                        } else {
-                            app.player = Some(trial);
-                            app.ui.status = "Audio interface reconnected; reopen Sculpt Show when idle to share it".into();
-                        }
+    let draft_id = egui::Id::new("sculpt_core26_audio_draft");
+    let devices_id = egui::Id::new("sculpt_core26_audio_devices");
+    if !open {
+        ctx.data_mut(|d| {
+            d.remove::<AudioSettings>(draft_id);
+            d.remove::<(Vec<AudioDeviceInfo>, Vec<AudioDeviceInfo>)>(devices_id);
+        });
+        return;
+    }
+    let mut cfg = ctx.data(|d| d.get_temp::<AudioSettings>(draft_id)).unwrap_or_else(AudioSettings::read);
+    let mut devices = ctx
+        .data(|d| d.get_temp::<(Vec<AudioDeviceInfo>, Vec<AudioDeviceInfo>)>(devices_id))
+        .unwrap_or_else(|| (available_devices(true), available_devices(false)));
+    win(ctx, &mut open, "Playback Engine", vec2(640.0, 560.0), |ui| {
+        ui.heading("Audio engine");
+        ui.label(if cfg!(target_os = "macos") { "Audio system: CoreAudio" } else { "Audio system: system default" });
+        egui::Grid::new("sculpt_core26_engine_grid").num_columns(2).spacing(vec2(12.0, 8.0)).show(ui, |ui| {
+            ui.label("Output device");
+            audio_device_combo(ui, "sculpt_core26_output", &mut cfg.output_name, &devices.0);
+            ui.end_row();
+            ui.label("Input device");
+            audio_device_combo(ui, "sculpt_core26_input", &mut cfg.input_name, &devices.1);
+            ui.end_row();
+            let selected = devices.0.iter().find(|d| if cfg.output_name.is_empty() { d.is_default } else { d.name == cfg.output_name });
+            ui.label("Hardware sample rate");
+            egui::ComboBox::from_id_salt("sculpt_core26_rate")
+                .selected_text(if cfg.sample_rate == 0 { "Follow session".into() } else { format!("{} Hz", cfg.sample_rate) })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut cfg.sample_rate, 0, "Follow session");
+                    for rate in selected.map(AudioDeviceInfo::sample_rates).unwrap_or_default() {
+                        ui.selectable_value(&mut cfg.sample_rate, rate, format!("{rate} Hz"));
                     }
-                    Err(e) => app.ui.status = format!("Cannot save audio settings: {e}"),
+                });
+            ui.end_row();
+            let rate = if cfg.sample_rate == 0 { app.engine.session().sample_rate.hz() } else { cfg.sample_rate };
+            ui.label("H/W Buffer Size");
+            egui::ComboBox::from_id_salt("sculpt_core26_buffer")
+                .selected_text(if cfg.buffer_frames == 0 { "Device default".into() } else { format!("{} samples", cfg.buffer_frames) })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut cfg.buffer_frames, 0, "Device default");
+                    for frames in selected.map(|d| d.buffer_sizes(rate)).unwrap_or_default() {
+                        ui.selectable_value(&mut cfg.buffer_frames, frames, format!("{frames} samples"));
+                    }
+                });
+            ui.end_row();
+        });
+        ui.horizontal(|ui| {
+            if ui.button("Refresh devices").clicked() {
+                devices = (available_devices(true), available_devices(false));
+            }
+            if ui.button("Revert").clicked() {
+                cfg = AudioSettings::read();
+            }
+        });
+        ui.separator();
+        ui.heading("Active configuration");
+        if let Some(player) = &app.player {
+            if player.silent {
+                ui.colored_label(egui::Color32::YELLOW, player.open_error.as_deref().unwrap_or("No audio output (silent clock)"));
+            } else {
+                ui.label(format!("Output: {} · {} Hz · {} channels", player.device_name, player.device_rate, player.device_channels));
+                if player.stream_failed() {
+                    ui.colored_label(
+                        egui::Color32::YELLOW,
+                        "The audio device reported a stream error. Stop transport, check the interface and reconnect.",
+                    );
+                }
+                if player.callback_frames() > 0 {
+                    ui.label(format!("Last hardware callback: {} samples", player.callback_frames()));
+                }
+                ui.label(player.device_buffer.map_or("Buffer: device default".into(), |b| format!("Requested hardware buffer: {b} samples")));
+                if player.device_rate != app.engine.session().sample_rate.hz() {
+                    ui.colored_label(egui::Color32::YELLOW, "Active output rate differs from the session: playback uses sample-rate conversion.");
                 }
             }
-            ui.ctx().data_mut(|d| d.insert_temp(id, cfg));
+        } else {
+            ui.label("Output: not connected");
         }
-        #[cfg(target_arch = "wasm32")]
-        ui.label("Native CoreAudio settings require the macOS desktop app.");
+        if let Some(input) = &app.recorder {
+            ui.label(format!("Input: {} · {} Hz · {} channels", input.device_name, input.sample_rate, input.channels));
+        } else {
+            ui.label("Input opens when recording or monitoring is requested");
+        }
+        ui.label(format!("Session: {} Hz", app.engine.session().sample_rate.hz()));
+        if cfg.sample_rate != 0 && cfg.sample_rate != app.engine.session().sample_rate.hz() {
+            ui.colored_label(
+                egui::Color32::YELLOW,
+                "The requested hardware rate differs from the session. This does not convert the project or its media.",
+            );
+        }
+        ui.label("Hardware buffer and internal mix blocks (up to 512 samples) are separate. Buffer size is not a measured round-trip latency.");
+        let mut dc = app.engine.session().edit.delay_compensation;
+        if ui.checkbox(&mut dc, "Delay Compensation").changed() {
+            let _ = app.run("options.delay_compensation", json!({"value":dc}));
+        }
+        ui.separator();
+        ui.label("The device profile is shared with Sculpt Show. Reopen Show while idle to load changes.");
+        let running = app.engine.transport.playing || app.engine.transport.recording;
+        ui.label("Stop playback and recording before reconnecting audio.");
+        if ui.add_enabled(!running, egui::Button::new("Apply and reconnect audio")).clicked() {
+            match apply_audio_settings(app, &mut cfg) {
+                Ok(()) => app.ui.status = "Audio reconnected; shared Show profile saved".into(),
+                Err(error) => app.ui.status = error,
+            }
+        }
+    });
+    ctx.data_mut(|d| {
+        d.insert_temp(draft_id, cfg);
+        d.insert_temp(devices_id, devices);
     });
     app.ui.show_playback_engine = open;
+}
+
+fn audio_device_combo(ui: &mut egui::Ui, id: &str, name: &mut String, devices: &[soundcraft_playback::sculpt_audio_settings::AudioDeviceInfo]) {
+    egui::ComboBox::from_id_salt(id).width(360.0).selected_text(if name.is_empty() { "System default" } else { name.as_str() }).show_ui(ui, |ui| {
+        ui.selectable_value(name, String::new(), "System default");
+        for device in devices {
+            ui.selectable_value(name, device.name.clone(), format!("{} · {} channels", device.name, device.channels));
+        }
+    });
+}
+
+fn apply_audio_settings(app: &mut SoundApp, cfg: &mut soundcraft_playback::sculpt_audio_settings::AudioSettings) -> Result<(), String> {
+    use soundcraft_playback::{Player, record::Recorder, sculpt_audio_settings::AudioSettings};
+    if app.engine.transport.playing || app.engine.transport.recording {
+        return Err("Stop playback and recording before changing audio devices".into());
+    }
+    app.capture_plugin_states();
+    let previous = AudioSettings::read();
+    let trial = Player::with_audio_settings(app.engine.session_arc(), cfg);
+    if trial.silent {
+        return Err(format!("Audio setup failed: {}. Previous profile retained", trial.open_error.as_deref().unwrap_or("output unavailable")));
+    }
+    let input = if app.recorder.is_some() || !cfg.input_name.is_empty() {
+        Some(
+            Recorder::open_with_settings(cfg, app.engine.session().sample_rate.hz())
+                .map_err(|e| format!("Input setup failed: {e}. Previous profile retained"))?,
+        )
+    } else {
+        None
+    };
+    let mut committed = cfg.clone();
+    if previous.output_name != committed.output_name {
+        committed.output_uid.clear();
+    }
+    committed.save().map_err(|e| format!("Cannot save shared audio settings: {e}. Previous configuration retained"))?;
+    if let Some(input) = &input {
+        trial.set_input(std::sync::Arc::clone(&input.monitor));
+    }
+    trial.locate(app.engine.transport.position);
+    app.player = Some(trial);
+    app.recorder = input;
+    app.recorder_failed = false;
+    *cfg = committed;
+    Ok(())
 }
 
 /// Setup › I/O: busses and output paths.
 /// SCULPT_CORE22_SIMPLE_IO: no user-editable matrix, just physical destinations.
 pub fn io_setup(app: &mut SoundApp, ctx: &egui::Context) {
     let mut open = app.ui.show_io_setup;
-    win(ctx, &mut open, "Sculpt · I/O Setup", vec2(540.0, 490.0), |ui| {
+    win(ctx, &mut open, "I/O Setup", vec2(540.0, 490.0), |ui| {
         let count = app.player.as_ref().map(|p| usize::from(p.device_channels)).unwrap_or(0).min(64);
         ui.horizontal(|ui| {
             ui.heading("Physical outputs");
-            if ui.button("Audio Settings…").clicked() {
+            if ui.button("Playback Engine…").clicked() {
                 app.ui.show_playback_engine = true;
             }
         });
@@ -536,7 +597,7 @@ pub fn io_setup(app: &mut SoundApp, ctx: &egui::Context) {
         ui.label("Assign channel(s), with the same numbering used in Sculpt Show:");
         egui::ScrollArea::vertical().max_height(275.0).show(ui, |ui| {
             if count == 0 {
-                ui.label("Connect an interface in Audio Settings first.");
+                ui.label("Connect an interface in Playback Engine first.");
                 return;
             }
             for first in 0..count {
@@ -677,5 +738,36 @@ mod audio_health_tests {
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| audio_health(&mut app, ui.ctx()));
         output.textures_delta.clear();
         assert!(app.audio_health_report.is_some());
+    }
+}
+
+#[cfg(test)]
+mod sculpt_core26_audio_tests {
+    use super::*;
+    #[test]
+    fn absent_explicit_device_never_replaces_the_shared_profile() {
+        use soundcraft_playback::sculpt_audio_settings::AudioSettings;
+        let mut app = SoundApp::new(soundcraft_engine::Engine::default(), None, crate::Services::default());
+        let previous = AudioSettings::read();
+        let mut requested = AudioSettings { output_name: "Sculpt regression nonexistent interface 98c28a3f".into(), ..AudioSettings::default() };
+        assert!(apply_audio_settings(&mut app, &mut requested).is_err());
+        assert_eq!(AudioSettings::read(), previous);
+        assert!(app.player.is_none());
+        assert!(app.recorder.is_none());
+        assert!(!app.engine.is_dirty());
+    }
+
+    #[test]
+    fn audio_changes_are_rejected_before_probing_or_saving_while_running() {
+        let mut app = SoundApp::new(soundcraft_engine::Engine::default(), None, crate::Services::default());
+        let mut settings = soundcraft_playback::sculpt_audio_settings::AudioSettings::default();
+        app.engine.transport.playing = true;
+        assert!(apply_audio_settings(&mut app, &mut settings).is_err());
+        app.engine.transport.playing = false;
+        app.engine.transport.recording = true;
+        assert!(apply_audio_settings(&mut app, &mut settings).is_err());
+        assert!(app.player.is_none());
+        assert!(app.recorder.is_none());
+        assert!(!app.engine.is_dirty());
     }
 }

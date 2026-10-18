@@ -618,7 +618,10 @@ impl SoundApp {
         if self.recorder.is_some() || self.recorder_failed || self.player.is_none() {
             return;
         }
-        match soundcraft_playback::record::Recorder::open() {
+        match soundcraft_playback::record::Recorder::open_with_settings(
+            &soundcraft_playback::sculpt_audio_settings::AudioSettings::read(),
+            self.engine.session().sample_rate.hz(),
+        ) {
             Ok(r) => {
                 if let Some(p) = &self.player {
                     p.set_input(std::sync::Arc::clone(&r.monitor));

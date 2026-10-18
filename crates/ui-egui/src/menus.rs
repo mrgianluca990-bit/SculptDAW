@@ -285,7 +285,7 @@ pub fn menu_bar(app: &mut SoundApp, ui: &mut egui::Ui) {
                     if root.label == "File" {
                         // SCULPT_CORE24_EGUI_SETUP
                         ui.menu_button("Setup", |ui| {
-                            if ui.button("Audio Settings...").clicked() {
+                            if ui.button("Playback Engine...").clicked() {
                                 app.ui.show_playback_engine = true;
                                 ui.close();
                             }

@@ -91,10 +91,14 @@ impl Recorder {
     /// Open the default input device. Errors when there is none (the caller shows a message).
     #[cfg(not(target_os = "freebsd"))]
     pub fn open() -> Result<Recorder, String> {
+        Self::open_with_settings(&crate::sculpt_audio_settings::AudioSettings::read(), 0)
+    }
+
+    #[cfg(not(target_os = "freebsd"))]
+    pub fn open_with_settings(configured: &crate::sculpt_audio_settings::AudioSettings, session_rate: u32) -> Result<Recorder, String> {
         use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
         let host = cpal::default_host();
         // SCULPT_CORE22_INPUT_DEVICE: explicit input choice from shared audio settings.
-        let configured = crate::sculpt_audio_settings::AudioSettings::read();
         let device = if configured.input_name.trim().is_empty() {
             host.default_input_device().ok_or("no audio input device")?
         } else {
@@ -108,11 +112,14 @@ impl Recorder {
         };
         #[allow(deprecated)]
         let name = device.name().unwrap_or_else(|_| "Input".into());
-        let cfg = device.default_input_config().map_err(|e| e.to_string())?;
-        if cfg.sample_format() != cpal::SampleFormat::F32 {
-            return Err(format!("unsupported input sample format {:?}", cfg.sample_format()));
-        }
-        let config = cfg.config();
+        let rate = if configured.sample_rate > 0 {
+            configured.sample_rate
+        } else if session_rate > 0 {
+            session_rate
+        } else {
+            device.default_input_config().map_err(|e| e.to_string())?.sample_rate().0
+        };
+        let config = crate::sculpt_audio_settings::stream_config(&device, false, rate, configured.buffer_frames)?;
         let channels = usize::from(config.channels).max(1);
         let ring = CaptureRing::new((config.sample_rate.0 as usize).saturating_mul(channels * RING_SECONDS).min(1 << 25));
         let shared = Arc::new(Shared { armed: AtomicBool::new(false), ring, dropped: AtomicUsize::new(0) });
@@ -149,8 +156,12 @@ impl Recorder {
         Err("recording is not supported on this platform yet".into())
     }
 
-    /// Create each take's file and start recording into them: a track's take records the given
-    /// input channels into a new file.
+    #[cfg(target_os = "freebsd")]
+    pub fn open_with_settings(_configured: &crate::sculpt_audio_settings::AudioSettings, _session_rate: u32) -> Result<Recorder, String> {
+        Err("recording is not supported on this platform yet".into())
+    }
+
+    /// Create each take's file and start recording into them.
     pub fn arm(&mut self, takes: Vec<(TrackId, Vec<usize>, PathBuf)>) -> Result<(), String> {
         if self.writer.is_some() {
             return Err("already recording".into());

@@ -1,9 +1,9 @@
-name: Sculpt DAW Core25 — workspace, Edit and bridge checks
+name: Sculpt DAW Core26 — Playback Engine and bridge checks
 on:
   push:
     branches: [main, develop, 'feature/**']
   pull_request:
-    branches: [main, develop]
+    branches: [main, develop, 'feature/**']
   workflow_dispatch:
 permissions:
   contents: read
@@ -42,6 +42,10 @@ jobs:
         run: |
           cargo test --locked -p soundcraft-engine --lib sculpt_bridge
           cargo test --locked -p soundcraft-ui-egui --lib sculpt_bridge
+      - name: Playback Engine capability and transaction regressions
+        run: |
+          cargo test --locked -p soundcraft-playback --lib
+          cargo test --locked -p soundcraft-ui-egui --lib sculpt_core26_audio_tests
       - name: Workspace and upstream regressions
         run: |
           cargo test --locked -p sculpt-daw single_instance
@@ -54,10 +58,12 @@ jobs:
         run: |
           mkdir -p dist/qa
           cargo run --locked -p soundcraft-ui-egui --example ui_shot -- dist/qa/edit.png QA/edit-strip.jsonl --size 1400x900
+      - name: Render Playback Engine
+        run: cargo run --locked -p soundcraft-ui-egui --example ui_shot -- dist/qa/playback-engine.png QA/playback-engine.jsonl --size 1400x1000
       - uses: actions/upload-artifact@v4
         with:
-          name: Sculpt-DAW-Core25-Edit-preview
-          path: dist/qa/edit.png
+          name: Sculpt-DAW-Core26-previews
+          path: dist/qa/*.png
           if-no-files-found: error
       - name: Build universal app with embedded CLI
         run: bash sculpt/build-macos.sh

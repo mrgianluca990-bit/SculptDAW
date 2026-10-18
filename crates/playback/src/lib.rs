@@ -77,6 +77,8 @@ struct Shared {
     /// Speed × 1000.
     speed: AtomicU32,
     meters: Mutex<MeterSnapshot>,
+    callback_frames: AtomicU32,
+    stream_failed: AtomicBool,
 }
 
 /// State owned by the audio callback.
@@ -380,6 +382,9 @@ pub struct Player {
     pub device_rate: u32,
     /// Output channels the device was opened with (0 for the silent clock).
     pub device_channels: u16,
+    /// Requested hardware buffer; None means device default (not a measured latency).
+    pub device_buffer: Option<u32>,
+    pub open_error: Option<String>,
     /// True when no audio device could be opened (silent clock).
     pub silent: bool,
 }
@@ -387,17 +392,31 @@ pub struct Player {
 impl Player {
     /// Open the default output device. Never fails: without a device it runs a silent clock.
     pub fn new(session: Arc<Session>) -> Player {
-        let p = Player::open(Arc::clone(&session));
+        Self::with_audio_settings(session, &sculpt_audio_settings::AudioSettings::read())
+    }
+
+    /// Trial configuration does not change the shared profile.
+    pub fn with_audio_settings(session: Arc<Session>, settings: &sculpt_audio_settings::AudioSettings) -> Player {
+        let p = Player::open(Arc::clone(&session), settings);
         // Hand the initial session's third-party plugins over.
         p.update_session(session);
         p
+    }
+
+    /// Most recent hardware callback size; not a round-trip latency measurement.
+    pub fn callback_frames(&self) -> u32 {
+        self.shared.callback_frames.load(Ordering::Relaxed)
+    }
+
+    pub fn stream_failed(&self) -> bool {
+        self.shared.stream_failed.load(Ordering::Relaxed)
     }
 
     fn side(&self) -> std::sync::MutexGuard<'_, Side> {
         self.side.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn open(session: Arc<Session>) -> Player {
+    fn open(session: Arc<Session>, settings: &sculpt_audio_settings::AudioSettings) -> Player {
         let (gtx, grx) = channel();
         let side = Mutex::new(Side { shadow: HashMap::new(), rate: session.sample_rate.as_f64() as f32, editors: HashMap::new(), garbage: grx });
         let shared = Arc::new(Shared {
@@ -405,13 +424,15 @@ impl Player {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
+            callback_frames: AtomicU32::new(0),
+            stream_failed: AtomicBool::new(false),
         });
         let (tx, rx) = channel();
         let want = session.sample_rate.hz();
         // SCULPT_CORE21_PLAY_REQUEST64: take hardware endpoints into account
         // before opening CoreAudio rather than silently truncating to Main 1-2.
         let want_ch = u16::try_from(sculpt_required_output_channels(&session)).unwrap_or(2);
-        match open_device(want, want_ch) {
+        match open_device(want, want_ch, settings) {
             Ok((device, config, name)) => {
                 let rate = config.sample_rate.0;
                 let channels = usize::from(config.channels);
@@ -421,7 +442,9 @@ impl Player {
                 state.pending.resize_with(render_channels, || vec![0.0; BLOCK]); // SCULPT_CORE21_PLAY_64_BUFFER
                 // cpal may call this on the audio thread (on ALSA in a loop while the device
                 // stays broken): marked, so the logger hands the record off instead of writing it.
-                let err_fn = |e: cpal::StreamError| {
+                let errors = Arc::clone(&shared);
+                let err_fn = move |e: cpal::StreamError| {
+                    errors.stream_failed.store(true, Ordering::Relaxed);
                     mark_audio_thread();
                     log::warn!("audio stream error: {e}");
                 };
@@ -430,6 +453,7 @@ impl Player {
                     &config,
                     move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                         mark_audio_thread();
+                        state.shared.callback_frames.store(u32::try_from(data.len() / channels.max(1)).unwrap_or(u32::MAX), Ordering::Relaxed);
                         state.fill(data, channels);
                     },
                     err_fn,
@@ -437,7 +461,13 @@ impl Player {
                 ) {
                     Ok(stream) => {
                         if let Err(e) = stream.play() {
-                            log::warn!("audio stream failed to start: {e}");
+                            let (tx2, rx2) = channel();
+                            let (gtx2, grx2) = channel();
+                            let mut side = side;
+                            side.get_mut().unwrap_or_else(PoisonError::into_inner).garbage = grx2;
+                            let mut failed = Player::silent_clock(shared, tx2, rx2, want, side, gtx2);
+                            failed.open_error = Some(format!("Audio stream failed to start: {e}"));
+                            return failed;
                         }
                         log::info!("audio device: {name} @ {rate} Hz, {channels} ch");
                         Player {
@@ -448,6 +478,11 @@ impl Player {
                             device_name: name,
                             device_rate: rate,
                             device_channels: config.channels,
+                            device_buffer: match config.buffer_size {
+                                cpal::BufferSize::Fixed(n) => Some(n),
+                                _ => None,
+                            },
+                            open_error: None,
                             silent: false,
                         }
                     }
@@ -458,14 +493,18 @@ impl Player {
                         // The state (and its receivers) moved into the failed closure; rebuild.
                         let mut side = side;
                         side.get_mut().unwrap_or_else(PoisonError::into_inner).garbage = grx2;
-                        Player::silent_clock(shared, tx2, rx2, want, side, gtx2)
+                        let mut failed = Player::silent_clock(shared, tx2, rx2, want, side, gtx2);
+                        failed.open_error = Some(e.to_string());
+                        failed
                     }
                 }
             }
             Err(e) => {
                 log::warn!("no audio output: {e}; using a silent clock");
                 let s2 = Arc::clone(&shared);
-                Player::silent_clock_with(s2, tx, rx, session, side, gtx)
+                let mut failed = Player::silent_clock_with(s2, tx, rx, session, side, gtx);
+                failed.open_error = Some(e);
+                failed
             }
         }
     }
@@ -521,6 +560,8 @@ impl Player {
             device_name: "No audio device (silent)".into(),
             device_rate: rate,
             device_channels: 0,
+            device_buffer: None,
+            open_error: None,
             silent: true,
         }
     }
@@ -542,6 +583,8 @@ impl Player {
             device_name: "No audio device".into(),
             device_rate: session.sample_rate.hz(),
             device_channels: 0,
+            device_buffer: None,
+            open_error: None,
             silent: true,
         }
     }
@@ -776,12 +819,15 @@ pub fn sculpt_required_output_channels(s: &Session) -> usize {
 
 /// Open the default output device: f32 at the session rate if possible, with as many channels as
 /// it offers up to `want_ch` (at least stereo when available).
-fn open_device(want_rate: u32, want_ch: u16) -> Result<(cpal::Device, cpal::StreamConfig, String), String> {
+fn open_device(
+    want_rate: u32,
+    _want_ch: u16,
+    settings: &sculpt_audio_settings::AudioSettings,
+) -> Result<(cpal::Device, cpal::StreamConfig, String), String> {
     use cpal::traits::{DeviceTrait, HostTrait};
     let host = cpal::default_host();
     // SCULPT_CORE22_EXPLICIT_DEVICE: select the same named CoreAudio device as Show.
     // CPAL 0.16 has no portable device UID; reject ambiguous duplicate names.
-    let settings = crate::sculpt_audio_settings::AudioSettings::read();
     let device = if settings.output_name.trim().is_empty() {
         host.default_output_device().ok_or_else(|| "no default output device".to_string())?
     } else {
@@ -795,47 +841,8 @@ fn open_device(want_rate: u32, want_ch: u16) -> Result<(cpal::Device, cpal::Stre
     };
     #[allow(deprecated)]
     let name = device.name().unwrap_or_else(|_| "Audio device".into());
-    // Prefer an f32 config at the session rate; else the device default (we resample).
-    // SCULPT_CORE23_MAX_PHYSICAL_CHANNELS: prefer actual hardware capacity
-    // up to the platform's 64-channel routing limit, not existing path count.
-    let _requested_paths = want_ch;
-    let want_ch = 64u16;
-    let want_rate = if settings.sample_rate > 0 { settings.sample_rate } else { want_rate };
-    // SCULPT_CORE22_REQUEST_RATE
-    let mut chosen: Option<cpal::StreamConfig> = None;
-    if let Ok(configs) = device.supported_output_configs() {
-        for c in configs {
-            if c.sample_format() == cpal::SampleFormat::F32
-                && c.min_sample_rate().0 <= want_rate
-                && c.max_sample_rate().0 >= want_rate
-                && c.channels() >= 2
-                && c.channels() <= want_ch
-                && chosen.as_ref().is_none_or(|x| c.channels() > x.channels)
-            {
-                chosen = Some(c.with_sample_rate(cpal::SampleRate(want_rate)).config());
-            }
-        }
-    }
-    if settings.sample_rate > 0 && chosen.is_none() {
-        return Err(format!("{} Hz unsupported by selected interface {}", want_rate, settings.output_name));
-    }
-    let mut config = match chosen {
-        // SCULPT_CORE22_BUFFER_CONFIG
-        Some(c) => c,
-        None => {
-            let d = device.default_output_config().map_err(|e| e.to_string())?;
-            if d.sample_format() != cpal::SampleFormat::F32 {
-                return Err(format!("unsupported device sample format {:?}", d.sample_format()));
-            }
-            d.config()
-        }
-    };
-    if settings.buffer_frames > 0 {
-        if ![64, 128, 256, 512, 1024, 2048].contains(&settings.buffer_frames) {
-            return Err("Unsupported requested audio buffer size".into());
-        }
-        config.buffer_size = cpal::BufferSize::Fixed(settings.buffer_frames);
-    }
+    let rate = if settings.sample_rate > 0 { settings.sample_rate } else { want_rate };
+    let config = sculpt_audio_settings::stream_config(&device, true, rate, settings.buffer_frames)?;
     Ok((device, config, name)) // SCULPT_CORE22_BUFFER_APPLIED
 }
 
@@ -866,6 +873,8 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
+            callback_frames: AtomicU32::new(0),
+            stream_failed: AtomicBool::new(false),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), s, 48_000.0, channel().0);
@@ -884,6 +893,8 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
+            callback_frames: AtomicU32::new(0),
+            stream_failed: AtomicBool::new(false),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), s, 48_000.0, channel().0);
@@ -909,6 +920,8 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
+            callback_frames: AtomicU32::new(0),
+            stream_failed: AtomicBool::new(false),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::clone(&s), 48_000.0, channel().0);
@@ -968,6 +981,8 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
+            callback_frames: AtomicU32::new(0),
+            stream_failed: AtomicBool::new(false),
         });
         let (tx, rx) = channel();
         let (gtx, grx) = channel();
@@ -1031,6 +1046,8 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
+            callback_frames: AtomicU32::new(0),
+            stream_failed: AtomicBool::new(false),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), s, 48_000.0, channel().0);
@@ -1053,6 +1070,8 @@ mod tests {
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
+            callback_frames: AtomicU32::new(0),
+            stream_failed: AtomicBool::new(false),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(s), 48_000.0, channel().0);
