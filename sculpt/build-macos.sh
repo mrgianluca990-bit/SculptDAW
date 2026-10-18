@@ -29,11 +29,17 @@ python3 QA/SculptDAW_Core23_Patch.py
 # Sculpt DAW Core24: publish handoff, menu order and regression fixes.
 python3 -m py_compile QA/SculptDAW_Core24_Patch.py
 python3 QA/SculptDAW_Core24_Patch.py
+# Core25: SoundCraft v0.8 targeted, source-guarded optimization backports.
+python3 -m py_compile QA/SculptDAW_Core25_Upstream08_Patch.py
+python3 QA/SculptDAW_Core25_Upstream08_Patch.py
 # We validate the final, actually packaged source (the earlier workflow tests
 # run before the patch for historical reasons).
 cargo check --locked --target x86_64-apple-darwin -p sculpt-daw
 # Real DSP test: channel 64 + no-device Main fallback, not just UI snapshots.
 cargo test --locked --target x86_64-apple-darwin -p soundcraft-mix --lib sculpt_core21_hardware_output64
+# Regression gates for the new upstream backports.
+cargo test --locked --target x86_64-apple-darwin -p soundcraft-mix --test master_insert_latency
+cargo test --locked --target x86_64-apple-darwin -p soundcraft-vst3-host --test fixture_e2e host_set_controller_param_survives_state_round_trip
 
 for target in aarch64-apple-darwin x86_64-apple-darwin; do
   rustup target add "$target"
