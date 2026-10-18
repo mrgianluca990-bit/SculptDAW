@@ -1,0 +1,37 @@
+name: Sculpt Core25 - SoundCraft 0.8 backport regression
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "QA/SculptDAW_Core25*"
+      - "QA/CORE25_UPSTREAM08.md"
+      - "sculpt/build-macos.sh"
+      - ".github/workflows/core25-upstream08.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos-backport-regressions:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - name: Checkout Sculpt DAW baseline
+        uses: actions/checkout@v4
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+      - name: Validate and apply upstream backports
+        run: |
+          python3 -m py_compile QA/SculptDAW_Core25_Upstream08_Patch.py
+          python3 QA/SculptDAW_Core25_Upstream08_Patch.py
+          python3 QA/SculptDAW_Core25_Upstream08_Patch.py
+      - name: Check core modules
+        run: cargo check --locked -p soundcraft-mix -p soundcraft-vst3-host
+      - name: Master insert latency regression
+        run: cargo test --locked -p soundcraft-mix --test master_insert_latency
+      - name: VST3 parameter state regression
+        run: cargo test --locked -p soundcraft-vst3-host --test fixture_e2e host_set_controller_param_survives_state_round_trip
