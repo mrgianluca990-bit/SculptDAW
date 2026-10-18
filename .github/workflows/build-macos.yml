@@ -19,6 +19,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin,wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: "true"
       - name: Check exact committed sources
         run: cargo check --locked -p sculpt-daw -p soundcraft-cli
       - name: Engine and bridge regression tests
