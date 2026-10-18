@@ -15,7 +15,7 @@ jobs:
     runs-on: macos-15-intel
     timeout-minutes: 120
     env:
-      SCULPT_BRIDGE_VALIDATOR: ${{ runner.temp }}/sculpt-bridge-validator
+      SCULPT_BRIDGE_VALIDATOR: /tmp/sculpt-bridge-validator
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
