@@ -45,8 +45,10 @@ cannot overwrite each other. Mono keeps one hardware channel, including OUT 64.
 Shared buses/sends and processed master/VCA chains cannot be represented as independent
 track stems by this renderer and are explicitly rejected. Consolidate those returns
 before publishing. Offline render allocation limit is checked before rendering;
-longer material is rejected rather than truncated. Published files currently remain
-in the DAW publication folder: retain that folder with the Show's media.
+longer material is rejected rather than truncated. Saving Show copies published
+audio into its portable project. Byte-identical media relocation preserves the
+bridge revision; changed audio still conflicts. Retain the DAW session and its
+publication folders/receipts for subsequent edits and acknowledgements.
 
 ## Validation status
 

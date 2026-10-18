@@ -430,10 +430,8 @@ fn insert_drag(e: &mut Engine, p: &Value) -> Result<Value> {
         if let Some(t) = s.track_mut(dst) {
             t.mixer.inserts[to] = Some(item);
         }
-        if !copy {
-            if let Some(t) = s.track_mut(src) {
-                t.mixer.inserts[from] = other;
-            }
+        if !copy && let Some(t) = s.track_mut(src) {
+            t.mixer.inserts[from] = other;
         }
     }
     Ok(json!({"copied":copy,"swapped":occupied&&!copy}))

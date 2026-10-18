@@ -28,7 +28,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: mrgianluca990-bit/Sculpt-Show
-          ref: 03eacd1f1abfa3e5343c859c46215c4baa1d6430
+          ref: 962a43302c67ded1f72cc4bf130a66452211b5c6
           path: .bridge-show
           persist-credentials: false
       - name: Compile actual Swift Show receiver validator

@@ -442,16 +442,16 @@ pub fn create_fades_with_shapes(s: &mut Session, track: TrackId, range: Range, s
         for (aid, bid, seam) in rebuild {
             let left = pl.clips.iter().position(|c| c.id == aid);
             let right = pl.clips.iter().position(|c| c.id == bid);
-            if let (Some(i), Some(j)) = (left, right) {
-                if i != j {
-                    if let Some(a) = pl.clips.get_mut(i) {
-                        a.fade_out = Fade::default();
-                        a.trim_end_to(seam);
-                    }
-                    if let Some(b) = pl.clips.get_mut(j) {
-                        b.fade_in = Fade::default();
-                        b.trim_start_to(seam);
-                    }
+            if let (Some(i), Some(j)) = (left, right)
+                && i != j
+            {
+                if let Some(a) = pl.clips.get_mut(i) {
+                    a.fade_out = Fade::default();
+                    a.trim_end_to(seam);
+                }
+                if let Some(b) = pl.clips.get_mut(j) {
+                    b.fade_in = Fade::default();
+                    b.trim_start_to(seam);
                 }
             }
         }
@@ -616,6 +616,39 @@ pub fn delete_fades(s: &mut Session, track: TrackId, range: Range) -> usize {
         s.edit.values.remove(&key);
     }
     changed
+}
+
+/// SCULPT_CORE23_GROUP_EDIT_HELPERS: resolve active Edit group membership.
+pub fn sculpt_group_tracks(s: &soundcraft_model::Session, track: soundcraft_model::TrackId) -> Vec<soundcraft_model::TrackId> {
+    let mut out = vec![track];
+    for g in &s.groups {
+        if g.active && g.edit && g.members.contains(&track) {
+            for id in &g.members {
+                if !out.contains(id) {
+                    out.push(*id);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A clip gesture is applied to overlapping clips on other active Edit-group tracks.
+/// Preserve the original clicked clip and avoid duplicate IDs.
+pub fn sculpt_group_clips(s: &soundcraft_model::Session, selected: &[soundcraft_model::ClipId]) -> Vec<soundcraft_model::ClipId> {
+    let mut out = selected.to_vec();
+    for cid in selected {
+        let Some((track, clip)) = s.find_clip(*cid) else { continue };
+        for member in sculpt_group_tracks(s, track) {
+            let Some(t) = s.track(member) else { continue };
+            for c in t.clips() {
+                if c.start < clip.end() && c.end() > clip.start && !out.contains(&c.id) {
+                    out.push(c.id);
+                }
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -852,37 +885,4 @@ mod tests {
         s.find_clip_mut(id).unwrap().time_locked = true;
         assert_eq!(move_clips(&mut s, &[id], 500, None), 0);
     }
-}
-
-/// SCULPT_CORE23_GROUP_EDIT_HELPERS: resolve active Edit group membership.
-pub fn sculpt_group_tracks(s: &soundcraft_model::Session, track: soundcraft_model::TrackId) -> Vec<soundcraft_model::TrackId> {
-    let mut out = vec![track];
-    for g in &s.groups {
-        if g.active && g.edit && g.members.contains(&track) {
-            for id in &g.members {
-                if !out.contains(id) {
-                    out.push(*id);
-                }
-            }
-        }
-    }
-    out
-}
-
-/// A clip gesture is applied to overlapping clips on other active Edit-group tracks.
-/// Preserve the original clicked clip and avoid duplicate IDs.
-pub fn sculpt_group_clips(s: &soundcraft_model::Session, selected: &[soundcraft_model::ClipId]) -> Vec<soundcraft_model::ClipId> {
-    let mut out = selected.to_vec();
-    for cid in selected {
-        let Some((track, clip)) = s.find_clip(*cid) else { continue };
-        for member in sculpt_group_tracks(s, track) {
-            let Some(t) = s.track(member) else { continue };
-            for c in t.clips() {
-                if c.start < clip.end() && c.end() > clip.start && !out.contains(&c.id) {
-                    out.push(c.id);
-                }
-            }
-        }
-    }
-    out
 }
