@@ -1807,6 +1807,37 @@ pub const MAX_RENDER_SAMPLES: usize = 1 << 29;
 /// order). The mix's delay-compensation latency is removed, so the result lines up with the
 /// timeline.
 pub fn render_range(s: &Session, range: Range, block: usize) -> Vec<Vec<f32>> {
+    render_range_impl(s, range, block, false).unwrap_or_default()
+}
+
+/// Offline publication must fail when a required plugin could not be instantiated.
+/// The ordinary playback/bounce fallback remains unchanged.
+pub fn render_range_checked(s: &Session, range: Range, block: usize) -> Result<Vec<Vec<f32>>, String> {
+    render_range_impl(s, range, block, true)
+}
+
+fn check_render_plugins(eng: &MixEngine, s: &Session) -> Result<(), String> {
+    for track in s.tracks.iter().filter(|t| !t.inactive) {
+        let strip = eng.strips.get(&track.id);
+        for (slot, insert) in track.mixer.inserts.iter().enumerate() {
+            if let Some(insert) = insert
+                && !insert.bypass
+                && strip.and_then(|st| st.plugins.get(slot)).and_then(Option::as_ref).is_none()
+            {
+                return Err(format!("{}: required plugin {} is unavailable", track.name, insert.plugin));
+            }
+        }
+        if let Some(instrument) = &track.instrument
+            && !instrument.bypass
+            && strip.and_then(|st| st.instrument.as_ref()).is_none()
+        {
+            return Err(format!("{}: required instrument {} is unavailable", track.name, instrument.plugin));
+        }
+    }
+    Ok(())
+}
+
+fn render_range_impl(s: &Session, range: Range, block: usize, checked: bool) -> Result<Vec<Vec<f32>>, String> {
     let nch = main_channels(s);
     let len = usize::try_from(range.len().max(0)).unwrap_or(0).min(MAX_RENDER_SAMPLES / nch.max(1));
     // Probe the latency with one block, then render `len + latency` and drop the head.
@@ -1815,6 +1846,9 @@ pub fn render_range(s: &Session, range: Range, block: usize) -> Vec<Vec<f32>> {
         let b = probe.max_block();
         let mut tmp = vec![vec![0.0f32; b]; nch];
         probe.render(s, range.start, b.min(len.max(1)), &mut tmp);
+        if checked {
+            check_render_plugins(&probe, s)?;
+        }
         probe.latency
     };
     let total = len.saturating_add(latency);
@@ -1826,6 +1860,9 @@ pub fn render_range(s: &Session, range: Range, block: usize) -> Vec<Vec<f32>> {
     while done < total {
         let n = (total - done).min(b);
         eng.render(s, range.start + done as i64, n, &mut tmp);
+        if checked && done == 0 {
+            check_render_plugins(&eng, s)?;
+        }
         for (o, t) in out.iter_mut().zip(tmp.iter()) {
             if let (Some(d), Some(sr)) = (o.get_mut(done..done + n), t.get(..n)) {
                 d.copy_from_slice(sr);
@@ -1838,7 +1875,7 @@ pub fn render_range(s: &Session, range: Range, block: usize) -> Vec<Vec<f32>> {
             c.drain(..latency.min(c.len()));
         }
     }
-    out
+    Ok(out)
 }
 
 /// Offline render of one bus over `range` (planar, the bus format's channel count).

@@ -15,7 +15,14 @@ pub struct AudioSettings {
 }
 impl AudioSettings {
     pub fn file() -> Option<PathBuf> {
-        std::env::var_os("HOME").map(PathBuf::from).map(|h| h.join("Library/Application Support/Sculpt/AudioSettings.conf"))
+        #[cfg(target_arch = "wasm32")]
+        {
+            None
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            std::env::var_os("HOME").map(PathBuf::from).map(|h| h.join("Library/Application Support/Sculpt/AudioSettings.conf"))
+        }
     }
     pub fn read() -> Self {
         let Some(file) = Self::file() else { return Self::default() };
@@ -41,7 +48,7 @@ impl AudioSettings {
         let path = Self::file().ok_or("HOME not set")?;
         let dir = path.parent().ok_or("missing config parent")?;
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-        let clean = |s: &str| s.replace('\r', " ").replace('\n', " ");
+        let clean = |s: &str| s.replace(['\r', '\n'], " ");
         let body = format!(
             "SCULPT_AUDIO_V1\nuid={}\nname={}\ninput={}\nrate={}\nbuffer={}\n",
             clean(&self.output_uid),
@@ -62,6 +69,12 @@ pub struct AudioDeviceInfo {
     pub channels: u16,
 }
 
+#[cfg(target_arch = "wasm32")]
+pub fn available_output_devices() -> Vec<AudioDeviceInfo> {
+    Vec::new()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub fn available_output_devices() -> Vec<AudioDeviceInfo> {
     use cpal::traits::{DeviceTrait, HostTrait};
     let Ok(devices) = cpal::default_host().output_devices() else { return Vec::new() };

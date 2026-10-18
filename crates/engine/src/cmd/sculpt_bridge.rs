@@ -33,6 +33,18 @@ fn render(e: &mut Engine, p: &Value) -> Result<Value> {
     // Reject it explicitly; never silently publish a different mix.
     for t in &s.tracks {
         if matches!(t.kind, TrackKind::Audio | TrackKind::Instrument | TrackKind::Midi) {
+            for clip in t.clips() {
+                if let soundcraft_model::ClipContent::Audio { source, .. } = clip.content {
+                    let audio = s.pool.get(source).ok_or_else(|| bad(id, format!("{}: source audio is unavailable", clip.name)))?;
+                    if audio.frames() == 0
+                        || audio.buffer.sample_rate != s.sample_rate.hz()
+                        || audio.buffer.channels.is_empty()
+                        || audio.buffer.channels.iter().any(|ch| ch.len() != audio.frames())
+                    {
+                        return Err(bad(id, format!("{}: source audio is empty or invalid", clip.name)));
+                    }
+                }
+            }
             if t.inactive
                 || !(1..=2).contains(&t.channels())
                 || !matches!(t.mixer.output, Route::Main | Route::Hardware(_))
@@ -78,7 +90,7 @@ fn render(e: &mut Engine, p: &Value) -> Result<Value> {
                 t.inactive = true;
             }
         }
-        let mut channels = soundcraft_mix::render_range(&isolated, Range::new(0, frames), 1024);
+        let mut channels = soundcraft_mix::render_range_checked(&isolated, Range::new(0, frames), 1024).map_err(|err| bad(id, err))?;
         if track.channels() == 1 {
             let left = channels.first().ok_or_else(|| bad(id, "renderer returned no audio"))?;
             channels = vec![left.iter().map(|x| x * std::f32::consts::SQRT_2).collect()];
@@ -106,6 +118,32 @@ fn render(e: &mut Engine, p: &Value) -> Result<Value> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    #[test]
+    fn sculpt_bridge_rejects_unavailable_plugins_instruments_and_source_audio() {
+        let mut engine = Engine::default();
+        let buffer = soundcraft_audio_io::AudioBuffer { sample_rate: 48000, channels: vec![vec![0.25; 480]] };
+        let bytes = soundcraft_audio_io::encode(&buffer, &soundcraft_audio_io::EncodeOptions::default()).unwrap();
+        crate::io::import_audio_bytes(&mut engine, "Tone", &bytes, None, None, 0).unwrap();
+        let dir = std::env::temp_dir().join(format!("sculpt-bridge-unavailable-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        engine.session_mut().tracks[0].mixer.inserts[0] = Some(soundcraft_model::Insert::new("sculpt-missing-plugin"));
+        let error = engine.execute("bridge.render_stems", &json!({"dir":dir})).unwrap_err();
+        assert!(error.to_string().contains("required plugin"));
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        engine.session_mut().tracks[0].mixer.inserts[0].as_mut().unwrap().bypass = true;
+        assert!(engine.execute("bridge.render_stems", &json!({"dir":dir})).is_ok());
+        fs::remove_dir_all(&dir).unwrap();
+        engine.session_mut().tracks[0].instrument = Some(soundcraft_model::Insert::new("sculpt-missing-instrument"));
+        let error = engine.execute("bridge.render_stems", &json!({"dir":dir})).unwrap_err();
+        assert!(error.to_string().contains("required instrument"));
+        engine.session_mut().tracks[0].instrument = None;
+        let source = engine.session().sources[0].id;
+        engine.session_mut().pool.remove(source);
+        let error = engine.execute("bridge.render_stems", &json!({"dir":dir})).unwrap_err();
+        assert!(error.to_string().contains("source audio is unavailable"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn sculpt_bridge_renders_duplicate_names_muted_mono_and_stereo_without_mutating_session() {
         let mut engine = Engine::default();

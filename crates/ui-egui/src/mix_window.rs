@@ -41,7 +41,8 @@ pub(crate) fn selected_channel(app: &mut SoundApp, ui: &mut Ui) {
         return;
     };
     let snap = app.player.as_ref().filter(|_| app.meters_live()).map(|p| p.meters());
-    let width = ui.available_width().max(150.0).min(260.0);
+    let available = ui.available_width();
+    let width = if available.is_nan() { 150.0 } else { available.clamp(150.0, 260.0) };
     egui::ScrollArea::vertical().id_salt("sculpt19-selected-strip").auto_shrink([false, false]).show(ui, |ui| {
         strip(app, ui, id, snap.as_ref(), Some(width));
     });
@@ -431,21 +432,21 @@ fn strip(app: &mut SoundApp, ui: &mut Ui, id: TrackId, snap: Option<&MeterSnapsh
     if nresp.dragged() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
     }
-    if nresp.drag_stopped() {
-        if let Some(pointer) = ui.ctx().pointer_latest_pos() {
-            let all: Vec<_> = app.engine.session().tracks.iter().filter(|t| !t.hidden && t.kind != TrackKind::Video).collect();
-            let index = all.iter().position(|t| t.id == id).unwrap_or(0);
-            let width = strip_width(app.ui.narrow_mix) + 1.0;
-            let first_x = r.min.x - (index as f32) * width;
-            let drop_index = ((pointer.x - first_x) / width + 0.5).floor().max(0.0) as usize;
-            let to = all.get(drop_index).and_then(|t| app.engine.session().track_index(t.id)).unwrap_or(app.engine.session().tracks.len());
-            let ids: Vec<u64> = if app.engine.session().edit.selected_tracks.contains(&id) {
-                app.engine.session().tracks.iter().filter(|t| app.engine.session().edit.selected_tracks.contains(&t.id)).map(|t| t.id.0).collect()
-            } else {
-                vec![id.0]
-            };
-            let _ = app.run("track.move", json!({"tracks":ids,"to":to}));
-        }
+    if nresp.drag_stopped()
+        && let Some(pointer) = ui.ctx().pointer_latest_pos()
+    {
+        let all: Vec<_> = app.engine.session().tracks.iter().filter(|t| !t.hidden && t.kind != TrackKind::Video).collect();
+        let index = all.iter().position(|t| t.id == id).unwrap_or(0);
+        let width = strip_width(app.ui.narrow_mix) + 1.0;
+        let first_x = r.min.x - (index as f32) * width;
+        let drop_index = ((pointer.x - first_x) / width + 0.5).floor().max(0.0) as usize;
+        let to = all.get(drop_index).and_then(|t| app.engine.session().track_index(t.id)).unwrap_or(app.engine.session().tracks.len());
+        let ids: Vec<u64> = if app.engine.session().edit.selected_tracks.contains(&id) {
+            app.engine.session().tracks.iter().filter(|t| app.engine.session().edit.selected_tracks.contains(&t.id)).map(|t| t.id.0).collect()
+        } else {
+            vec![id.0]
+        };
+        let _ = app.run("track.move", json!({"tracks":ids,"to":to}));
     }
     if app.ui.mix_views.iter().any(|v| v == "color") {
         ui.painter().rect_filled(Rect::from_min_size(pos2(r.min.x, r.max.y - 5.0), vec2(w, 5.0)), 0.0, rgb(track.color));
@@ -804,22 +805,22 @@ fn send_options_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, slot: usize, 
         }
     });
     // SCULPT_CORE16_RENAME_BUS: modify Bus.name, not the Aux track name.
-    if let Route::Bus(bus_id) = send.target {
-        if let Some(old_name) = app.engine.session().bus(bus_id).map(|b| b.name.clone()) {
-            let edit_id = egui::Id::new(("sculpt-bus-name", bus_id.0));
-            let mut proposed: String = ui.data(|d| d.get_temp(edit_id)).unwrap_or_else(|| old_name.clone());
-            ui.separator();
-            ui.label("Bus name");
-            ui.horizontal(|ui| {
-                let resp = ui.add(egui::TextEdit::singleline(&mut proposed).desired_width(120.0));
-                let confirm = ui.small_button("Rename bus").clicked() || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
-                if confirm && !proposed.trim().is_empty() && proposed.trim() != old_name {
-                    let _ = app.run("setup.io", json!({"action": "rename_bus", "name": old_name, "new_name": proposed.trim()}));
-                    ui.close();
-                }
-            });
-            ui.data_mut(|d| d.insert_temp(edit_id, proposed));
-        }
+    if let Route::Bus(bus_id) = send.target
+        && let Some(old_name) = app.engine.session().bus(bus_id).map(|b| b.name.clone())
+    {
+        let edit_id = egui::Id::new(("sculpt-bus-name", bus_id.0));
+        let mut proposed: String = ui.data(|d| d.get_temp(edit_id)).unwrap_or_else(|| old_name.clone());
+        ui.separator();
+        ui.label("Bus name");
+        ui.horizontal(|ui| {
+            let resp = ui.add(egui::TextEdit::singleline(&mut proposed).desired_width(120.0));
+            let confirm = ui.small_button("Rename bus").clicked() || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+            if confirm && !proposed.trim().is_empty() && proposed.trim() != old_name {
+                let _ = app.run("setup.io", json!({"action": "rename_bus", "name": old_name, "new_name": proposed.trim()}));
+                ui.close();
+            }
+        });
+        ui.data_mut(|d| d.insert_temp(edit_id, proposed));
     }
 }
 
@@ -902,29 +903,6 @@ fn parse_pan(text: &str) -> Option<f32> {
     let raw = number.trim().parse::<f32>().ok()? * sign;
     let value = if number.contains('.') && raw.abs() <= 1.0 { raw } else { raw / 100.0 };
     value.is_finite().then_some(value.clamp(-1.0, 1.0))
-}
-
-/// A compact calibrated scale for a send. The marks use the same taper as the strip's level bar.
-fn send_level_scale(ui: &mut Ui, db: f32) {
-    let t = Tokens::current();
-    let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 25.0), Sense::hover());
-    let line_y = r.min.y + 4.0;
-    ui.painter().line_segment([pos2(r.min.x, line_y), pos2(r.max.x, line_y)], Stroke::new(1.0, t.slot_border));
-    for (i, mark) in [-60.0f32, -24.0, -10.0, 0.0, 6.0, 12.0].into_iter().enumerate() {
-        let x = r.min.x + r.width() * soundcraft_model::fader_db_to_pos(mark);
-        ui.painter().line_segment([pos2(x, line_y - 3.0), pos2(x, line_y + 3.0)], Stroke::new(1.0, t.text_dim));
-        let align = if i == 0 {
-            Align2::LEFT_TOP
-        } else if i == 5 {
-            Align2::RIGHT_TOP
-        } else {
-            Align2::CENTER_TOP
-        };
-        let label = if mark > 0.0 { format!("+{mark:.0}") } else { format!("{mark:.0}") };
-        ui.painter().text(pos2(x, line_y + 5.0), align, label, regular(8.0), t.text_dim);
-    }
-    let x = r.min.x + r.width() * soundcraft_model::fader_db_to_pos(db);
-    ui.painter().line_segment([pos2(x, r.min.y), pos2(x, line_y + 3.0)], Stroke::new(2.0, t.counter_text));
 }
 
 fn send_route_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, slot: usize, current: Option<&Route>) {

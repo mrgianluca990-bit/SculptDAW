@@ -28,7 +28,7 @@ fn get_str<'a>(v: &'a Value, key: &str) -> Result<&'a str, String> {
 }
 fn source_stem_uuid(track: &Track) -> Option<String> {
     let suffix = track.comments.split("Source stem UUID: ").nth(1)?;
-    let uuid = suffix.trim().split_whitespace().next()?;
+    let uuid = suffix.split_whitespace().next()?;
     valid_uuid(uuid).then(|| uuid.to_owned())
 }
 fn original_stem<'a>(manifest: &'a Value, track: &Track) -> Option<&'a Value> {
@@ -36,10 +36,10 @@ fn original_stem<'a>(manifest: &'a Value, track: &Track) -> Option<&'a Value> {
     manifest.get("stems")?.as_array()?.iter().find(|v| v.get("elementID").and_then(Value::as_str).is_some_and(|x| x.eq_ignore_ascii_case(&id)))
 }
 fn physical_output(track: &Track, session: &soundcraft_model::Session, old: Option<&Value>) -> usize {
-    if let Route::Hardware(name) = &track.mixer.output {
-        if let Some(out) = session.outputs.iter().find(|o| &o.name == name) {
-            return usize::from(out.first_channel) + 1;
-        }
+    if let Route::Hardware(name) = &track.mixer.output
+        && let Some(out) = session.outputs.iter().find(|o| &o.name == name)
+    {
+        return usize::from(out.first_channel) + 1;
     }
     old.and_then(|o| o.get("outputStartChannel")).and_then(Value::as_u64).map_or(1, |c| usize::try_from(c).unwrap_or(1))
 }
@@ -106,26 +106,24 @@ fn prepare_publication(app: &mut SoundApp, new_cue: bool) -> Result<Value, Strin
     // Repeated updates use the previously acknowledged cue revision.
     let last_path = session_dir.join("sculpt-last-publish.json");
     let mut previous_tracks = json!({});
-    if let Ok(bytes) = fs::read(&last_path) {
-        if let Ok(last) = serde_json::from_slice::<Value>(&bytes) {
-            if last.get("mode").and_then(Value::as_str) == Some("updateCue")
-                && last.get("cueID").and_then(Value::as_str).is_some_and(|id| id.eq_ignore_ascii_case(&old_cue))
+    if let Ok(bytes) = fs::read(&last_path)
+        && let Ok(last) = serde_json::from_slice::<Value>(&bytes)
+    {
+        if last.get("mode").and_then(Value::as_str) == Some("updateCue")
+            && last.get("cueID").and_then(Value::as_str).is_some_and(|id| id.eq_ignore_ascii_case(&old_cue))
+        {
+            previous_tracks = last.get("trackElements").cloned().unwrap_or_else(|| json!({}));
+        }
+        if let Some(folder) = last.get("folder").and_then(Value::as_str) {
+            let receipt = Path::new(folder).join("receipt.json");
+            if let Ok(bytes) = fs::read(receipt)
+                && let Ok(record) = serde_json::from_slice::<Value>(&bytes)
+                && record.get("status").and_then(Value::as_str) == Some("applied")
+                && record.get("publishMode").and_then(Value::as_str) == Some("updateCue")
+                && record.get("cueID").and_then(Value::as_str).is_some_and(|v| v.eq_ignore_ascii_case(&old_cue))
+                && record.get("publicationID") == last.get("publicationID")
             {
-                previous_tracks = last.get("trackElements").cloned().unwrap_or_else(|| json!({}));
-            }
-            if let Some(folder) = last.get("folder").and_then(Value::as_str) {
-                let receipt = Path::new(folder).join("receipt.json");
-                if let Ok(bytes) = fs::read(receipt) {
-                    if let Ok(record) = serde_json::from_slice::<Value>(&bytes) {
-                        if record.get("status").and_then(Value::as_str) == Some("applied")
-                            && record.get("publishMode").and_then(Value::as_str) == Some("updateCue")
-                            && record.get("cueID").and_then(Value::as_str).is_some_and(|v| v.eq_ignore_ascii_case(&old_cue))
-                            && record.get("publicationID") == last.get("publicationID")
-                        {
-                            origin["originCue"] = record["originCue"].clone();
-                        }
-                    }
-                }
+                origin["originCue"] = record["originCue"].clone();
             }
         }
     }

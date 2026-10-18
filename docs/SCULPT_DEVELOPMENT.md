@@ -41,6 +41,9 @@ One rendered file per active mono/stereo audio/instrument track, aligned from 0
 through content end; edits, fades, inserts and track gain automation are baked.
 Manual mute remains a cue-element flag. Filenames use track IDs, so duplicate names
 cannot overwrite each other. Mono keeps one hardware channel, including OUT 64.
+Missing/invalid loaded audio and unavailable required plugin/instrument instances
+abort publication instead of silently exporting an incomplete mix. Bypassed plugins
+do not prevent publication.
 
 Shared buses/sends and processed master/VCA chains cannot be represented as independent
 track stems by this renderer and are explicitly rejected. Consolidate those returns

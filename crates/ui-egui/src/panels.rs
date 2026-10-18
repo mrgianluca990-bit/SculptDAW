@@ -417,38 +417,36 @@ fn plugin_windows(app: &mut SoundApp, ctx: &egui::Context) {
         let pending_key = egui::Id::new(("sculpt_native_pending", tid.0, slot));
         if native_editor {
             let fallback = ctx.data(|d| d.get_temp::<bool>(fallback_key).unwrap_or(false));
-            if !fallback {
-                if let Some(player) = &app.player {
-                    if player.has_editor(tid, slot) {
-                        // A closed native editor is reopened on *every* new insert click.
-                        // Do not keep a generic window around after opening the native one.
-                        ctx.data_mut(|d| d.remove::<f64>(pending_key));
-                        if player.editor_open(tid, slot) {
-                            continue;
-                        }
-                        match player.open_editor(tid, slot) {
-                            Ok(()) => continue,
-                            Err(e) => {
-                                app.ui.status = format!("{} native editor: {e}", info.name);
-                                ctx.data_mut(|d| d.insert_temp(fallback_key, true));
-                            }
-                        }
-                    } else {
-                        // The audio thread asynchronously prepares hosted plugin instances.
-                        // Give it time before deciding this particular plugin has no GUI.
-                        let now = ctx.input(|i| i.time);
-                        let started = ctx.data(|d| d.get_temp::<f64>(pending_key));
-                        let since = started.unwrap_or(now);
-                        if started.is_none() {
-                            ctx.data_mut(|d| d.insert_temp(pending_key, now));
-                        }
-                        if now - since < 2.0 {
-                            keep.push((tid, slot));
-                            ctx.request_repaint_after_secs(0.05);
-                            continue;
-                        }
-                        ctx.data_mut(|d| d.insert_temp(fallback_key, true));
+            if !fallback && let Some(player) = &app.player {
+                if player.has_editor(tid, slot) {
+                    // A closed native editor is reopened on *every* new insert click.
+                    // Do not keep a generic window around after opening the native one.
+                    ctx.data_mut(|d| d.remove::<f64>(pending_key));
+                    if player.editor_open(tid, slot) {
+                        continue;
                     }
+                    match player.open_editor(tid, slot) {
+                        Ok(()) => continue,
+                        Err(e) => {
+                            app.ui.status = format!("{} native editor: {e}", info.name);
+                            ctx.data_mut(|d| d.insert_temp(fallback_key, true));
+                        }
+                    }
+                } else {
+                    // The audio thread asynchronously prepares hosted plugin instances.
+                    // Give it time before deciding this particular plugin has no GUI.
+                    let now = ctx.input(|i| i.time);
+                    let started = ctx.data(|d| d.get_temp::<f64>(pending_key));
+                    let since = started.unwrap_or(now);
+                    if started.is_none() {
+                        ctx.data_mut(|d| d.insert_temp(pending_key, now));
+                    }
+                    if now - since < 2.0 {
+                        keep.push((tid, slot));
+                        ctx.request_repaint_after_secs(0.05);
+                        continue;
+                    }
+                    ctx.data_mut(|d| d.insert_temp(fallback_key, true));
                 }
             }
         }

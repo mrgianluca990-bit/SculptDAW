@@ -1582,22 +1582,17 @@ fn sculpt_fade_at_pointer(s: &Session, track: &Track, tl: Rect, lane: Rect, p: P
         }
     }
     let top = lane.min.y + if lane.height() >= 40.0 && s.edit.flag("view.clip.name") { 13.0 } else { 0.0 };
-    let h = (lane.max.y - top).max(1.0);
     for c in track.clips() {
         if !c.is_audio() {
             continue;
         }
         if c.fade_in.len > 0 && c.start <= at && at < c.start + c.fade_in.len {
-            let phase = (at - c.start) as f32 / c.fade_in.len as f32;
-            let y = lane.max.y - h * c.fade_in.shape.gain(phase);
             // SCULPT_CORE_FADE_HIT_V1: full area of the fade, instead of the thin curve.
             if p.y >= top && p.y <= lane.max.y {
                 return Some(FadeSelection { track: track.id, clip: c.id, other: None, fade_in: true });
             }
         }
         if c.fade_out.len > 0 && c.end() - c.fade_out.len <= at && at < c.end() {
-            let phase = (c.end() - at) as f32 / c.fade_out.len as f32;
-            let y = lane.max.y - h * c.fade_out.shape.gain(phase);
             // SCULPT_CORE_FADE_HIT_V1: full area of the fade, instead of the thin curve.
             if p.y >= top && p.y <= lane.max.y {
                 return Some(FadeSelection { track: track.id, clip: c.id, other: None, fade_in: false });
@@ -2797,96 +2792,4 @@ mod tests {
         let want: Vec<TrackId> = [1, 0, 2, 3].iter().map(|&i| before[i]).collect();
         assert_eq!(order(&h), want);
     }
-}
-
-// SCULPT_FADES_UI_MIGRATION_V1
-
-/// SCULPT_CORE20_SELECTED_CHANNEL_WIDGET
-/// Persistent Edit-channel controls: visible fader, pan, I/O and current inserts/sends.
-fn sculpt_core20_selected_strip(app: &mut SoundApp, ui: &mut Ui) {
-    ui.horizontal(|ui| {
-        ui.strong("SELECTED CHANNEL");
-        ui.separator();
-        let selected = app.engine.session().edit.selected_tracks.first().copied();
-        let track = selected.and_then(|id| app.engine.session().track(id)).cloned();
-        let Some(track) = track else {
-            ui.label("Select a track in Edit to show its channel strip");
-            return;
-        };
-        ui.strong(&track.name);
-    });
-    let selected = app.engine.session().edit.selected_tracks.first().copied();
-    let Some(track) = selected.and_then(|id| app.engine.session().track(id)).cloned() else { return };
-    let id = track.id;
-    ui.horizontal_top(|ui| {
-        ui.vertical(|ui| {
-            ui.label("FADER");
-            let (fr, _) = ui.allocate_exact_size(vec2(36.0, 83.0), Sense::hover());
-            if let Some(db) = crate::widgets::fader(ui, fr, track.mixer.volume_db, ui.id().with(("sculpt_core20_fader", id.0))) {
-                let _ = app.engine.execute_merged("mix.volume", &json!({"track": id.0, "db": db}), &format!("fader:{}", id.0));
-            }
-            ui.label(egui::RichText::new(format!("{:.1} dB", track.mixer.volume_db)).small());
-        });
-        ui.separator();
-        ui.vertical(|ui| {
-            ui.label("PAN");
-            let mut pan = track.mixer.pan.first().copied().unwrap_or_default();
-            if ui.add_sized([120.0, 22.0], egui::Slider::new(&mut pan, -1.0..=1.0).show_value(true)).changed() {
-                let _ = app.engine.execute_merged("mix.pan", &json!({"track": id.0, "pan": pan, "index": 0}), &format!("pan:{}:0", id.0));
-            }
-            if ui.small_button("Centre").clicked() {
-                let _ = app.run("mix.pan", json!({"track": id.0, "pan": 0.0, "index": 0}));
-            }
-            ui.horizontal(|ui| {
-                if ui.selectable_label(track.mixer.mute, "MUTE").clicked() {
-                    let _ = app.run("mix.mute", json!({"track": id.0}));
-                }
-                if ui.selectable_label(track.mixer.solo, "SOLO").clicked() {
-                    let _ = app.run("mix.solo", json!({"track": id.0}));
-                }
-            });
-        });
-        ui.separator();
-        ui.vertical(|ui| {
-            ui.label("I/O");
-            ui.label(egui::RichText::new(format!("IN: {:?}", track.mixer.input)).small());
-            ui.label(egui::RichText::new(format!("OUT: {:?}", track.mixer.output)).small());
-            if ui.small_button("Routing...").clicked() {
-                app.ui.show_io_setup = true;
-            }
-        });
-        ui.separator();
-        egui::ScrollArea::vertical().max_height(108.0).show(ui, |ui| {
-            ui.horizontal_top(|ui| {
-                ui.vertical(|ui| {
-                    ui.label("INSERTS");
-                    for (slot, insert) in track.mixer.inserts.iter().take(8).enumerate() {
-                        if let Some(ins) = insert {
-                            let name = crate::mix_window::plugin_info(&ins.plugin).map_or(ins.plugin.as_str(), |p| p.name);
-                            if ui.small_button(format!("{}: {}", slot + 1, name)).clicked() && !app.ui.plugin_windows.contains(&(id, slot)) {
-                                app.ui.plugin_windows.push((id, slot));
-                            }
-                        }
-                    }
-                });
-                ui.add_space(24.0);
-                ui.vertical(|ui| {
-                    ui.label("SENDS");
-                    for (slot, send) in track.mixer.sends.iter().take(8).enumerate() {
-                        if let Some(send) = send {
-                            ui.label(egui::RichText::new(format!("{}: {:?}", slot + 1, send.target)).small());
-                            let mut level = send.level_db;
-                            if ui.add_sized([135.0, 17.0], egui::Slider::new(&mut level, -60.0..=12.0).text("dB")).changed() {
-                                let _ = app.engine.execute_merged(
-                                    "mix.send_level",
-                                    &json!({"track": id.0, "slot": slot, "db": level}),
-                                    &format!("send:{}:{slot}", id.0),
-                                );
-                            }
-                        }
-                    }
-                });
-            });
-        });
-    });
 }

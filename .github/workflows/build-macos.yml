@@ -23,6 +23,7 @@ jobs:
           targets: aarch64-apple-darwin,x86_64-apple-darwin,wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
+          key: bridge-full-ci-v1
           cache-on-failure: "true"
       - name: Check out matching Show receiver for contract test
         uses: actions/checkout@v4

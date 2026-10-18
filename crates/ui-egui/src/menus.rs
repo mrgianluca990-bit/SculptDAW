@@ -473,43 +473,43 @@ pub fn live_label(app: &SoundApp, id: Option<&str>) -> Option<String> {
 /// Menu-style invocation: may open a dialog.
 pub fn invoke_menu(app: &mut SoundApp, id: &str, path: &str) {
     // SCULPT_CORE24_IMPORT_MENU_COUNT: intercept native & egui multi-file import.
-    if id == "file.import_audio" {
-        if let Some(pick) = &app.services.pick_open_many {
-            if let Some(paths) = pick(id, &[]) {
-                let at = app.engine.session().edit.selection.start;
-                let mut imported = 0usize;
-                let mut failed = 0usize;
-                let mut conversions = Vec::<String>::new();
-                for file in paths {
-                    // SCULPT_CORE24_IMPORT_MENU_RATES: engine returns original and session rate.
-                    match app.run("file.import_audio", json!({"path":file,"at":at})) {
-                        Ok(v) => {
-                            imported += 1;
-                            let source = v.get("source_sample_rate").and_then(Value::as_u64);
-                            let session = v.get("session_sample_rate").and_then(Value::as_u64);
-                            if let (Some(a), Some(b)) = (source, session) {
-                                if a != b {
-                                    conversions.push(format!("{a} → {b} Hz"));
-                                }
-                            }
-                        }
-                        Err(_) => {
-                            failed += 1;
+    if id == "file.import_audio"
+        && let Some(pick) = &app.services.pick_open_many
+    {
+        if let Some(paths) = pick(id, &[]) {
+            let at = app.engine.session().edit.selection.start;
+            let mut imported = 0usize;
+            let mut failed = 0usize;
+            let mut conversions = Vec::<String>::new();
+            for file in paths {
+                // SCULPT_CORE24_IMPORT_MENU_RATES: engine returns original and session rate.
+                match app.run("file.import_audio", json!({"path":file,"at":at})) {
+                    Ok(v) => {
+                        imported += 1;
+                        let source = v.get("source_sample_rate").and_then(Value::as_u64);
+                        let session = v.get("session_sample_rate").and_then(Value::as_u64);
+                        if let (Some(a), Some(b)) = (source, session)
+                            && a != b
+                        {
+                            conversions.push(format!("{a} → {b} Hz"));
                         }
                     }
-                }
-                let count = conversions.len();
-                app.ui.status = format!(
-                    "Imported {imported} audio file(s) at {} Hz; {count} converted: {}",
-                    app.engine.session().sample_rate.hz(),
-                    conversions.join(", ")
-                ); // SCULPT_CORE24_IMPORT_MENU_NOTICE
-                if failed > 0 {
-                    app.ui.status.push_str(&format!("; {failed} failed"));
+                    Err(_) => {
+                        failed += 1;
+                    }
                 }
             }
-            return;
+            let count = conversions.len();
+            app.ui.status = format!(
+                "Imported {imported} audio file(s) at {} Hz; {count} converted: {}",
+                app.engine.session().sample_rate.hz(),
+                conversions.join(", ")
+            ); // SCULPT_CORE24_IMPORT_MENU_NOTICE
+            if failed > 0 {
+                app.ui.status.push_str(&format!("; {failed} failed"));
+            }
         }
+        return;
     }
     if let Some((_, w)) = MENU_WINDOWS.iter().find(|(p, _)| *p == path)
         && w.starts_with("window.")
@@ -523,27 +523,27 @@ pub fn invoke_menu(app: &mut SoundApp, id: &str, path: &str) {
         return;
     }
     // Sculpt: the native audio import picker supports selecting multiple files.
-    if id == "file.import_audio" {
-        if let Some(pick) = &app.services.pick_open_many {
-            if let Some(paths) = pick(id, &[]) {
-                let at = app.engine.session().edit.selection.start;
-                // SCULPT_CORE17_IMPORT_GROUP: a single multi-file import action.
-                match app.run("file.import_audio", json!({"paths": paths, "at": at})) {
-                    Ok(v) => app.ui.status = format!("Audio imported: {}", v),
-                    Err(e) => app.ui.status = e,
-                }
+    if id == "file.import_audio"
+        && let Some(pick) = &app.services.pick_open_many
+    {
+        if let Some(paths) = pick(id, &[]) {
+            let at = app.engine.session().edit.selection.start;
+            // SCULPT_CORE17_IMPORT_GROUP: a single multi-file import action.
+            match app.run("file.import_audio", json!({"paths": paths, "at": at})) {
+                Ok(v) => app.ui.status = format!("Audio imported: {}", v),
+                Err(e) => app.ui.status = e,
             }
-            return;
         }
+        return;
     }
     // SCULPT_CORE18_NATIVE_SESSION_PICKERS: immediate macOS Open/Save panels.
-    if id == "session.open" {
-        if let Some(pick) = &app.services.pick_open {
-            if let Some(path) = pick(id, &["scdaw", "scraft"]) {
-                let _ = crate::dialogs::run_or_ask(app, id, json!({"path": path}));
-            }
-            return;
+    if id == "session.open"
+        && let Some(pick) = &app.services.pick_open
+    {
+        if let Some(path) = pick(id, &["scdaw", "scraft"]) {
+            let _ = crate::dialogs::run_or_ask(app, id, json!({"path": path}));
         }
+        return;
     }
     if matches!(id, "session.save" | "session.save_as" | "session.save_copy") {
         // Normal Cmd+S on a named session does NOT open an additional Save dialog.

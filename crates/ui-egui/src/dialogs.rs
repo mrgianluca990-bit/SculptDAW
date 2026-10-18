@@ -271,13 +271,13 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
     // extra text field, then a second Browse button. Use native picker immediately.
     if matches!(app.dialogs.open, Some(Dialog::PathPrompt { ref cmd, .. }) if cmd == "file.import_audio") {
         app.dialogs.open = None;
-        if let Some(pick) = &app.services.pick_open_many {
-            if let Some(paths) = pick("file.import_audio", &[]) {
-                let at = app.engine.session().edit.selection.start;
-                let result = app.run("file.import_audio", json!({"paths": paths, "at": at}));
-                if let Err(e) = result {
-                    app.ui.status = e;
-                }
+        if let Some(pick) = &app.services.pick_open_many
+            && let Some(paths) = pick("file.import_audio", &[])
+        {
+            let at = app.engine.session().edit.selection.start;
+            let result = app.run("file.import_audio", json!({"paths": paths, "at": at}));
+            if let Err(e) = result {
+                app.ui.status = e;
             }
         }
         return;

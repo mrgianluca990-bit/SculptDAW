@@ -23,7 +23,6 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod record;
-#[cfg(not(target_arch = "wasm32"))]
 pub mod sculpt_audio_settings; // SCULPT_CORE22_AUDIO_MODULE
 
 use soundcraft_dsp::{Plugin, PluginEditor};
@@ -766,10 +765,10 @@ fn fold_gains(s: &Session) -> [(f32, f32); MAX_CHANNELS] {
 pub fn sculpt_required_output_channels(s: &Session) -> usize {
     let mut want = main_channels(s);
     for t in &s.tracks {
-        if let soundcraft_model::Route::Hardware(path) = &t.mixer.output {
-            if let Some(p) = s.outputs.iter().find(|o| o.name.eq_ignore_ascii_case(path)) {
-                want = want.max(usize::from(p.first_channel).saturating_add(p.format.channels()).min(64));
-            }
+        if let soundcraft_model::Route::Hardware(path) = &t.mixer.output
+            && let Some(p) = s.outputs.iter().find(|o| o.name.eq_ignore_ascii_case(path))
+        {
+            want = want.max(usize::from(p.first_channel).saturating_add(p.format.channels()).min(64));
         }
     }
     want.clamp(2, 64)
