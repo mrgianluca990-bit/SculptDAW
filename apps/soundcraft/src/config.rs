@@ -10,7 +10,7 @@ enum Platform {
     Other,
 }
 
-/// SoundCraft's settings folder. A nonempty `$SOUNDCRAFT_CONFIG_DIR` overrides the platform default.
+/// Sculpt DAW's settings folder. A nonempty `$SCULPT_DAW_CONFIG_DIR` overrides the platform default.
 /// The override is the complete directory; no application-name suffix is appended. An explicitly
 /// empty value disables the settings directory instead of falling back to a personal profile.
 pub fn config_dir() -> Option<PathBuf> {
@@ -118,6 +118,7 @@ mod config_tests {
         let path = directory.join("ui.json");
         let _ = std::fs::remove_dir_all(&directory);
         let mut app = SoundApp::new(soundcraft_engine::Engine::default(), None, Services::default());
+        app.run("ui.dock", serde_json::json!({"operation":"open","panel":"tracks"})).unwrap();
         app.run("ui.dock", serde_json::json!({"operation":"float","panel":"tracks","rect":[80,90,260,400]})).unwrap();
         app.run("ui.dock", serde_json::json!({"operation":"close","panel":"tracks"})).unwrap();
         app.ui.theme = soundcraft_ui_egui::theme::ThemeMode::Light;
@@ -135,6 +136,7 @@ mod config_tests {
         assert_eq!(app.ui.docking.layout.floating.iter().find(|g| g.panels.contains(&Panel::Tracks)).unwrap().rect, [80.0, 90.0, 260.0, 400.0]);
         let mut invalid_mix = app.ui.clone();
         invalid_mix.mix_docking = soundcraft_ui_egui::docking::Workspace::default();
+        invalid_mix.mix_docking.set_visible(Panel::Clips, true).unwrap();
         let invalid_bytes = serde_json::to_vec(&invalid_mix).unwrap();
         std::fs::write(&path, &invalid_bytes).unwrap();
         let recovered = load_ui(&path).unwrap().unwrap();
@@ -157,6 +159,7 @@ mod config_tests {
         std::fs::create_dir_all(&directory).unwrap();
         let path = directory.join("ui.json");
         let mut app = SoundApp::new(soundcraft_engine::Engine::default(), None, Services::default());
+        app.run("ui.dock", serde_json::json!({"operation":"open","panel":"tracks"})).unwrap();
         app.run("ui.dock", serde_json::json!({"operation":"float","panel":"tracks","rect":[80,90,260,400]})).unwrap();
         app.ui.theme = soundcraft_ui_egui::theme::ThemeMode::Light;
         app.ui.narrow_mix = true;
@@ -225,8 +228,8 @@ mod config_tests {
     #[test]
     fn config_unset_override_keeps_platform_defaults() {
         let vars = [("HOME", "/user"), ("APPDATA", "/roaming"), ("XDG_CONFIG_HOME", "/xdg")];
-        assert_eq!(resolve(Platform::Mac, &vars), Some(PathBuf::from("/user/Library/Application Support/SoundCraft")));
-        assert_eq!(resolve(Platform::Windows, &vars), Some(PathBuf::from("/roaming/SoundCraft")));
+        assert_eq!(resolve(Platform::Mac, &vars), Some(PathBuf::from("/user/Library/Application Support/Sculpt DAW")));
+        assert_eq!(resolve(Platform::Windows, &vars), Some(PathBuf::from("/roaming/Sculpt DAW")));
         assert_eq!(resolve(Platform::Other, &vars), Some(PathBuf::from("/xdg/sculpt-daw")));
         assert_eq!(resolve(Platform::Other, &[("HOME", "/user")]), Some(PathBuf::from("/user/.config/sculpt-daw")));
         for platform in [Platform::Mac, Platform::Windows, Platform::Other] {
