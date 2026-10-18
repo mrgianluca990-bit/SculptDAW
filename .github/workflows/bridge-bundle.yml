@@ -1,0 +1,52 @@
+name: Sculpt Bridge — paired Mac apps
+on:
+  push:
+    branches: [infrastructure/bridge-distribution]
+    paths: ['.github/workflows/bridge-bundle.yml', 'bridge/package_pair.py']
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: sculpt-bridge-pair-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  bundle:
+    runs-on: macos-15
+    timeout-minutes: 70
+    env:
+      DAW_RUN_ID: '39122928712'
+      DAW_SHA: '057c6e6fa4eaf14f39d0a623c7034dba9a6a2298'
+      SHOW_SHA: '962a43302c67ded1f72cc4bf130a66452211b5c6'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check packaging source
+        run: python3 -m py_compile bridge/package_pair.py
+      - name: Check out pinned Show
+        uses: actions/checkout@v4
+        with:
+          repository: mrgianluca990-bit/Sculpt-Show
+          ref: 962a43302c67ded1f72cc4bf130a66452211b5c6
+          path: .bridge-show
+          persist-credentials: false
+      - name: Test and build pinned universal Show
+        run: bash .bridge-show/Scripts/build-macos.sh
+      - name: Require successful matching DAW build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 bridge/package_pair.py wait
+      - name: Download verified DAW artifact
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: 39122928712
+          name: Sculpt-DAW-Bridge-057c6e6fa4eaf14f39d0a623c7034dba9a6a2298
+          path: incoming/daw
+      - name: Verify signatures and combine both apps
+        run: python3 bridge/package_pair.py bundle
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Sculpt_Bridge_Mac_Universal
+          path: dist/paired/Sculpt_Bridge_Mac_Universal.zip
+          if-no-files-found: error
+          retention-days: 30
