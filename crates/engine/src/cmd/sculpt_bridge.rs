@@ -7,7 +7,7 @@ use std::{fs, path::Path};
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![cmd!(query "bridge.render_stems", "Render Show Stems", [], None,
-        "{dir}: new empty output directory; edits/inserts/fader automation baked, mute retained in manifest",
+        "{dir, end_seconds?}: empty directory; aligned stems with edits/inserts/gain baked, mute in manifest",
         has_tracks, render)]
 }
 
@@ -16,7 +16,15 @@ fn render(e: &mut Engine, p: &Value) -> Result<Value> {
     let dir = str_param(p, "dir").ok_or_else(|| bad(id, "dir required"))?;
     let s = e.session();
     let tracks: Vec<_> = s.tracks.iter().filter(|t| matches!(t.kind, TrackKind::Audio | TrackKind::Instrument | TrackKind::Midi)).collect();
-    let frames = s.content_end().max(1);
+    let frames = if let Some(value) = p.get("end_seconds") {
+        let seconds = value
+            .as_f64()
+            .filter(|v| v.is_finite() && *v > 0.0 && *v <= 14400.0)
+            .ok_or_else(|| bad(id, "end_seconds must be finite and in (0,14400]"))?;
+        s.sample_rate.samples(seconds).max(1)
+    } else {
+        s.content_end().max(1)
+    };
     // render_range caps allocations. Refuse rather than silently truncate long material.
     if tracks.is_empty() || tracks.len() > 64 || frames as u64 > (soundcraft_mix::MAX_RENDER_SAMPLES / 2) as u64 {
         return Err(bad(id, "empty, too many stems, or session exceeds offline render limit"));
@@ -95,6 +103,7 @@ fn render(e: &mut Engine, p: &Value) -> Result<Value> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     #[test]

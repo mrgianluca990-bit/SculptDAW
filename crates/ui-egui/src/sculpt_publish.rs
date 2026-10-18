@@ -65,7 +65,7 @@ fn write_atomic(path: &Path, body: &[u8]) -> Result<(), String> {
 
 /// Stage a return package, retaining IDs for update or creating fresh IDs for a new cue.
 /// A Show receiver still needs to ingest it; this function never changes a Show project.
-pub fn publish(app: &mut SoundApp, new_cue: bool) -> Result<Value, String> {
+fn prepare_publication(app: &mut SoundApp, new_cue: bool) -> Result<Value, String> {
     if app.engine.transport.playing || app.engine.transport.recording {
         return Err("Stop playback/recording before publishing to Show".into());
     }
@@ -84,7 +84,7 @@ pub fn publish(app: &mut SoundApp, new_cue: bool) -> Result<Value, String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && new_cue => json!({
             "format":"com.sculpt.bridge.cue","version":1,"showName":"DAW publication",
             "cueListID":fresh_uuid()?,"cueID":fresh_uuid()?,"cueName":app.engine.session().name,
-            "durationSeconds":1.0,"stems":[],"markers":[],"timecode":null,"targetSelection":true
+            "durationSeconds":0.0,"stems":[],"markers":[],"timecode":null,"targetSelection":true
         }),
         Err(_) => return Err("No Show origin found. Use Publish in Show as a New Cue for an independent DAW session.".into()),
     };
@@ -140,7 +140,9 @@ pub fn publish(app: &mut SoundApp, new_cue: bool) -> Result<Value, String> {
     if tracks.len() > 64 {
         return Err("Show bridge supports no more than 64 stems".into());
     }
-    let duration = s.content_end().max(1) as f64 / s.sample_rate.hz() as f64;
+    let original_duration = origin.get("durationSeconds").and_then(Value::as_f64).filter(|v| v.is_finite()).unwrap_or(0.0);
+    let marker_end = s.markers.iter().map(|m| m.start.max(0)).max().unwrap_or(0) as f64 / s.sample_rate.hz() as f64;
+    let duration = (s.content_end().max(1) as f64 / s.sample_rate.hz() as f64).max(original_duration).max(marker_end);
     if duration > 4.0 * 3600.0 {
         return Err("Publishing sessions longer than 4 hours is not supported".into());
     }
@@ -151,7 +153,7 @@ pub fn publish(app: &mut SoundApp, new_cue: bool) -> Result<Value, String> {
     // Use the established offline stem renderer, not the physical playback outputs.
     // It renders all stems from time 0 to the same session end, with inserts/edits/fades.
     app.capture_plugin_states();
-    let rendered = app.run("bridge.render_stems", json!({"dir":audio_dir.to_string_lossy().into_owned()}))?;
+    let rendered = app.run("bridge.render_stems", json!({"dir":audio_dir.to_string_lossy().into_owned(),"end_seconds":duration}))?;
     let paths = value_array(&rendered, "files")?;
     if paths.len() != tracks.len() {
         return Err(format!("Incomplete offline export: {} file(s) for {} track(s)", paths.len(), tracks.len()));
@@ -231,21 +233,99 @@ pub fn publish(app: &mut SoundApp, new_cue: bool) -> Result<Value, String> {
     let pointer = json!({"folder":folder,"publicationID":publication_id,"cueID":old_cue,
         "mode":if new_cue{"newCue"}else{"updateCue"},"trackElements":track_elements});
     write_atomic(&last_path, &serde_json::to_vec(&pointer).map_err(|e| e.to_string())?)?;
-    let opened = Command::new("/usr/bin/open").args(["-b", "com.gianlucavergalito.sculptshow"]).arg(&manifest).status();
-    let delivered = opened.is_ok_and(|status| status.success());
-    app.ui.status = if delivered {
-        format!("Publication sent to Show: {stems_count} stems. Show confirms application or queues until cue stop.")
-    } else {
-        format!("Publication ready; open Sculpt Show > Receive DAW Publication: {}", manifest.display())
-    };
-    Ok(json!({"prepared":true,"delivered":delivered,"showApplied":false,
+    Ok(json!({"prepared":true,"delivered":false,"showApplied":false,
         "publicationID":publication_id,"manifest":manifest,"cueID":destination_id,
         "stems":stems_count,"markers":markers_count}))
 }
 
+/// UI-only delivery follows the same testable preparation path.
+pub fn publish(app: &mut SoundApp, new_cue: bool) -> Result<Value, String> {
+    let mut result = prepare_publication(app, new_cue)?;
+    let path = result.get("manifest").and_then(Value::as_str).ok_or("Publication has no manifest path")?;
+    let delivered =
+        Command::new("/usr/bin/open").args(["-b", "com.gianlucavergalito.sculptshow"]).arg(path).status().is_ok_and(|status| status.success());
+    app.ui.status = if delivered {
+        "Publication sent to Show. Show will confirm application or queue until cue stop.".into()
+    } else {
+        format!("Publication ready; in Sculpt Show choose Receive DAW Publication: {path}")
+    };
+    result["delivered"] = json!(delivered);
+    Ok(result)
+}
+
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sculpt_bridge_prepares_saved_session_with_real_stems_and_extended_marker_timing() {
+        let mut engine = soundcraft_engine::Engine::default();
+        for channels in [1, 2] {
+            let audio = soundcraft_audio_io::AudioBuffer { sample_rate: 48000, channels: vec![vec![0.25; 4800]; channels] };
+            let bytes = soundcraft_audio_io::encode(&audio, &soundcraft_audio_io::EncodeOptions::default()).unwrap();
+            soundcraft_engine::io::import_audio_bytes(&mut engine, "Same", &bytes, None, None, 0).unwrap();
+        }
+        engine.session_mut().tracks[0].mixer.mute = true;
+        engine.session_mut().tracks[0].comments = "Source stem UUID: 33333333-3333-3333-3333-333333333333".into();
+        engine.session_mut().tracks[1].comments = "Source stem UUID: 44444444-4444-4444-4444-444444444444".into();
+        engine
+            .execute(
+                "markers.add",
+                &json!({"name":"Renamed","at":{"seconds":0.2},
+            "comments":"Sculpt Show marker UUID: 55555555-5555-5555-5555-555555555555"}),
+            )
+            .unwrap();
+        let dir = std::env::temp_dir().join(format!("sculpt-publish-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        engine.execute("session.save", &json!({"path":dir.join("Test.scdaw")})).unwrap();
+        let mut app = SoundApp::new(engine, None, crate::Services::default());
+        let first = prepare_publication(&mut app, true).unwrap();
+        let path = first["manifest"].as_str().unwrap();
+        let packet: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(packet["stems"].as_array().unwrap().len(), 2);
+        assert_eq!(packet["stems"][0]["muted"], true);
+        assert_eq!(packet["durationSeconds"], 0.2);
+        assert_eq!(packet["targetSelection"], true);
+        assert_eq!(packet["markers"][0]["name"], "Renamed");
+        let mut paths = std::collections::HashSet::new();
+        for (i, stem) in packet["stems"].as_array().unwrap().iter().enumerate() {
+            let path = stem["sourcePath"].as_str().unwrap();
+            assert!(paths.insert(path));
+            let audio = soundcraft_audio_io::decode(&fs::read(path).unwrap(), Some("wav")).unwrap().1;
+            assert_eq!(audio.channels.len(), i + 1);
+            assert_eq!(audio.channels[0].len(), 9600);
+        }
+        let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bridge/fixtures/origin-v1.json");
+        let validate = |manifest: &str| {
+            if let Ok(tool) = std::env::var("SCULPT_BRIDGE_VALIDATOR") {
+                let output = Command::new(tool).arg(manifest).arg(&fixture_path).output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "Swift receiver rejected actual DAW output: {} {}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        };
+        validate(path);
+        // An independent session cannot update an unspecified Show cue.
+        assert!(prepare_publication(&mut app, false).is_err());
+        let second = prepare_publication(&mut app, true).unwrap();
+        assert_ne!(first["publicationID"], second["publicationID"]);
+        assert_ne!(first["cueID"], second["cueID"]);
+        fs::copy(&fixture_path, dir.join("sculpt-cue-bridge.json")).unwrap();
+        let update = prepare_publication(&mut app, false).unwrap();
+        let manifest = update["manifest"].as_str().unwrap();
+        let packet: Value = serde_json::from_slice(&fs::read(manifest).unwrap()).unwrap();
+        assert_eq!(packet["cueID"], "22222222-2222-2222-2222-222222222222");
+        assert_eq!(packet["markers"][0]["id"], "55555555-5555-5555-5555-555555555555");
+        assert_eq!(packet["durationSeconds"], 0.25);
+        validate(manifest);
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn sculpt_bridge_uuid_validation_and_track_identity() {
         assert!(valid_uuid("12345678-1234-1234-1234-1234567890ab"));

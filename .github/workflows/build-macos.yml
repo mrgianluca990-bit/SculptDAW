@@ -14,6 +14,8 @@ jobs:
   macos:
     runs-on: macos-15-intel
     timeout-minutes: 120
+    env:
+      SCULPT_BRIDGE_VALIDATOR: ${{ runner.temp }}/sculpt-bridge-validator
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -22,17 +24,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: "true"
+      - name: Check out matching Show receiver for contract test
+        uses: actions/checkout@v4
+        with:
+          repository: mrgianluca990-bit/Sculpt-Show
+          ref: 03eacd1f1abfa3e5343c859c46215c4baa1d6430
+          path: .bridge-show
+          persist-credentials: false
+      - name: Compile actual Swift Show receiver validator
+        run: swiftc .bridge-show/Sources/SculptShowCore/*.swift bridge/tests/main.swift -o "$SCULPT_BRIDGE_VALIDATOR"
       - name: Check exact committed sources
         run: cargo check --locked -p sculpt-daw -p soundcraft-cli
-      - name: Engine and bridge regression tests
+      - name: DAW to Show audio and contract regression tests
         run: |
-          cargo test --locked -p soundcraft-engine --lib
-          cargo test --locked -p soundcraft-mix --lib
-          cargo test --locked -p soundcraft-ui-egui --lib
-          cargo test --locked -p soundcraft-ui-egui --test shortcuts
-          cargo test --locked -p soundcraft-playback --lib
-          cargo test --locked -p soundcraft-vst3-host --test fixture_e2e
-          cargo test --locked -p soundcraft-au-host --test system_units
+          cargo test --locked -p soundcraft-engine --lib sculpt_bridge
+          cargo test --locked -p soundcraft-ui-egui --lib sculpt_bridge
       - name: Full repository quality gate
         run: cargo xtask ci
       - name: Build universal app with embedded CLI
