@@ -1,0 +1,53 @@
+name: Sculpt Core25 - SoundCraft 0.8 backport regression
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "QA/SculptDAW_Core25*"
+      - "QA/CORE25_UPSTREAM08.md"
+      - "sculpt/build-macos.sh"
+      - ".github/workflows/core25-upstream08.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos-backport-regressions:
+    runs-on: macos-15
+    timeout-minutes: 50
+    steps:
+      - name: Checkout Sculpt integration patch
+        uses: actions/checkout@v4
+        with:
+          path: sculpt
+      - name: Checkout complete SoundCraft 0.6.1 upstream base
+        uses: actions/checkout@v4
+        with:
+          repository: storytold/soundcraft
+          ref: v0.6.1
+          path: upstream
+          persist-credentials: false
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Stage patches in the complete workspace
+        run: |
+          mkdir -p upstream/QA
+          cp sculpt/QA/SculptDAW_Core25_Upstream08_Patch.py upstream/QA/
+          cp sculpt/QA/SculptDAW_Core25_MasterLatency_Test.rs upstream/QA/
+      - name: Validate and apply upstream backports twice
+        working-directory: upstream
+        run: |
+          python3 -m py_compile QA/SculptDAW_Core25_Upstream08_Patch.py
+          python3 QA/SculptDAW_Core25_Upstream08_Patch.py
+          python3 QA/SculptDAW_Core25_Upstream08_Patch.py
+      - name: Check core modules
+        working-directory: upstream
+        run: cargo check --locked -p soundcraft-mix -p soundcraft-vst3-host
+      - name: Master insert latency regression
+        working-directory: upstream
+        run: cargo test --locked -p soundcraft-mix --test master_insert_latency
+      - name: VST3 parameter state regression
+        working-directory: upstream
+        run: cargo test --locked -p soundcraft-vst3-host --test fixture_e2e host_set_controller_param_survives_state_round_trip
