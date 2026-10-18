@@ -215,6 +215,10 @@ fn host_set_controller_param_survives_state_round_trip() {
     let mut p = soundcraft_vst3_host::create(&id).unwrap();
     p.prepare(48_000.0, 64, 2);
     assert!(p.set_param("7", 1.5));
+    // Gain is owned by the audio component: commit its queued change with a block.
+    let mut block = vec![vec![0.0f32; 64]; 2];
+    p.process(&mut block, 64);
+    // Frequency is controller-only: save immediately, without another audio block.
     assert!(p.set_param("12", 200.0));
     let blob = p.save_state().expect("plugin state");
     let mut q = soundcraft_vst3_host::create(&id).unwrap();

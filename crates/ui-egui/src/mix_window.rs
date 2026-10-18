@@ -1085,8 +1085,7 @@ pub(crate) fn sculpt_core22_selected_strip(app: &mut SoundApp, ui: &mut Ui) {
     egui::ScrollArea::vertical().id_salt("sculpt_edit_strip_scroll").auto_shrink([false, false]).show(ui, |ui| {
         // Core19/21 use a five-argument strip signature: explicit width for Edit.
         // SCULPT_CORE24_STRIP_HEIGHT: allow full controls + fader in the Edit ScrollArea.
-        ui.set_min_height(1100.0);
-        let strip_width = ui.available_width().clamp(155.0, 240.0); // SCULPT_CORE23_STRIP_FIT
+        let strip_width = ui.available_width().clamp(32.0, 240.0); // SCULPT_CORE23_STRIP_FIT
         strip(app, ui, id, snap.as_ref(), Some(strip_width));
     });
     app.ui.narrow_mix = old_narrow;
