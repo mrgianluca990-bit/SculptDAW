@@ -216,7 +216,10 @@ mod sculpt_core_menu_tests {
     fn only_explicit_core_items_are_displayed() {
         let allowed: Vec<&str> = SCULPT_CORE_MENU.lines().map(str::trim).filter(|p| !p.is_empty() && !p.starts_with('#')).collect();
         assert!((12..=45).contains(&allowed.len()), "keep the core UI intentionally small");
-        assert!(allowed.iter().all(|p| catalog::catalog().iter().any(|s| s == p)), "every core entry must exist in the original menu catalog");
+        assert!(
+            allowed.iter().all(|p| catalog::catalog().iter().any(|s| s == p) || UI_COMMANDS.iter().any(|(_, _, path, _)| path == p)),
+            "every core entry must exist in the engine catalog or UI command registry"
+        );
         fn leaves(nodes: &[MenuNode], out: &mut Vec<String>) {
             for node in nodes {
                 if node.children.is_empty() {

@@ -152,12 +152,14 @@ fn populated_mix_instrument_uses_readable_palette_in_real_frames() {
         harness.step();
     }
     harness.step(); // Let the popup finish its initial sizing pass.
-    harness.get_by_label_contains("Built-in").hover();
+    harness.get_by_label("Instruments · VST3 / Audio Units");
+    harness.get_by_label("VST3 ⏵");
+    assert!(harness.query_by_label("Drum Synth").is_none(), "legacy DSP is not exposed in the native picker");
+    assert_eq!(harness.state().engine.session(), &session, "opening the picker must preserve legacy instruments");
+    harness.key_press(egui::Key::Escape);
     harness.step();
-    harness.step();
-    harness.get_by_label("Drum Synth").click();
-    harness.step();
-    harness.step();
+    // Legacy sessions can still replace their instrument through the command API.
+    harness.state_mut().run("mix.instrument", json!({"track": instrument.0, "plugin": "drum_synth"})).unwrap();
     let app = harness.state();
     let replacement = app.engine.session().track(instrument).unwrap().instrument.as_ref().unwrap();
     assert_eq!(replacement.plugin, "drum_synth");

@@ -3,7 +3,7 @@
 //! returned early (no hover position) before the menu was drawn.
 
 use egui::{Event, Modifiers, PointerButton, pos2, vec2};
-use egui_kittest::Harness;
+use egui_kittest::{Harness, kittest::Queryable};
 use soundcraft_ui_egui::{Services, SoundApp};
 
 /// One UI frame, with queued synthetic pointer input applied first (as the control channel does).
@@ -45,19 +45,25 @@ fn clip_menu_stays_open_while_moving_onto_delete() {
     let before = kick_clip_count(&h);
     assert!(before > 0, "the demo session should have a recorded Kick clip");
 
-    // Right-click the Kick clip, then move the pointer into the menu and down to Delete.
-    press(&mut h, 880.0, 240.0, PointerButton::Secondary);
+    // Locate the actual clip and menu: Sculpt's sidebars change their screen coordinates.
+    let session = h.state().engine.session();
+    let kick = session.tracks.iter().find(|track| track.name == "Kick").unwrap();
+    let clip = &kick.clips()[0];
+    let row = h.state().edit_layout.rows.iter().find(|(id, _)| *id == kick.id.0).unwrap().1;
+    let timeline = soundcraft_ui_egui::edit_window::rect(h.state().edit_layout.timeline);
+    let x = soundcraft_ui_egui::edit_window::x_of(session, timeline, clip.start + clip.length / 2);
+    press(&mut h, x, (row[1] + row[3]) * 0.5, PointerButton::Secondary);
     for _ in 0..10 {
         step(&mut h);
     }
-    // Move (no click) into the menu, as a real pointer would, so the lane loses its hover.
-    for (x, y) in [(900.0, 300.0), (907.0, 442.0)] {
-        h.state_mut().synthetic.push(Event::PointerMoved(pos2(x, y)));
-        for _ in 0..10 {
-            step(&mut h);
-        }
+    let delete = h.get_by_label("Delete").rect().center();
+    // Hover into the popup first, so the lane loses its hover before Delete is clicked.
+    h.state_mut().synthetic.push(Event::PointerMoved(delete));
+    for _ in 0..10 {
+        step(&mut h);
     }
-    press(&mut h, 907.0, 442.0, PointerButton::Primary);
+    h.get_by_label("Delete");
+    press(&mut h, delete.x, delete.y, PointerButton::Primary);
     for _ in 0..15 {
         step(&mut h);
     }

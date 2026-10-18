@@ -33,3 +33,4 @@ Window > Mix
 Window > Transport
 View > Rulers > Markers
 Window > Memory Locations
+Window > Reset Panel Layout

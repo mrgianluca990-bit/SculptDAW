@@ -37,8 +37,11 @@ fn drag(h: &mut Harness<'_, SoundApp>, from: egui::Pos2, to: egui::Pos2) {
 #[test]
 fn real_drag_float_close_reopen_reload_retains_transport_and_mixer_commands() {
     let mut h = harness(None, 1400.0, 1.0);
+    h.state_mut().run("ui.dock", json!({"operation":"open","panel":"tracks"})).unwrap();
+    h.state_mut().run("ui.dock", json!({"operation":"open","panel":"clips"})).unwrap();
+    h.run_steps(5);
     let source = h.get_by_role_and_label(egui::accesskit::Role::Tab, "Clips").rect().center();
-    let target = h.get_by_role_and_label(egui::accesskit::Role::Tab, "Tracks and Groups").rect().center();
+    let target = h.get_by_role_and_label(egui::accesskit::Role::Tab, "Groups / Selected Channel").rect().center();
     drag(&mut h, source, target);
     assert_eq!(h.state().ui.docking.layout.location(&Panel::Clips).unwrap().anchor, Some(Panel::Tracks));
     h.get_by_role_and_label(egui::accesskit::Role::Tab, "Clips").click_button(PointerButton::Secondary);
@@ -60,7 +63,7 @@ fn real_drag_float_close_reopen_reload_retains_transport_and_mixer_commands() {
     assert_eq!(serde_json::to_value(&reloaded.state().ui.docking).unwrap(), expected);
     reloaded.state_mut().run("ui.dock", json!({"operation":"move","panel":"clips","target":"tracks","zone":"center"})).unwrap();
     reloaded.run_steps(4);
-    reloaded.get_by_role_and_label(egui::accesskit::Role::Tab, "Tracks and Groups").click();
+    reloaded.get_by_role_and_label(egui::accesskit::Role::Tab, "Groups / Selected Channel").click();
     reloaded.run_steps(3);
     reloaded.get_by_label("Trim (F6)").click();
     reloaded.run_steps(3);
@@ -69,11 +72,12 @@ fn real_drag_float_close_reopen_reload_retains_transport_and_mixer_commands() {
     let edit = serde_json::to_value(&reloaded.state().ui.docking).unwrap();
     reloaded.state_mut().ui.window = MainWindow::Mix;
     reloaded.run_steps(5);
+    reloaded.state_mut().run("ui.dock", json!({"operation":"open","panel":"tracks"})).unwrap();
     reloaded.state_mut().run("ui.dock", json!({"operation":"float","panel":"tracks","rect":[900,70,220,420]})).unwrap();
     reloaded.run_steps(4);
     assert_eq!(serde_json::to_value(&reloaded.state().ui.docking).unwrap(), edit);
     assert!(!reloaded.state().ui.mix_docking.layout.contains(&Panel::Clips));
-    let record = reloaded.get_by_label("Record enable");
+    let record = reloaded.get_all_by_label("Record enable").next().unwrap();
     // A real pointer click must remain outside the floating panel's occluding rectangle.
     assert!(!egui::Rect::from_min_size(egui::pos2(900.0, 70.0), vec2(220.0, 420.0)).contains(record.rect().center()));
     record.click();
@@ -113,6 +117,7 @@ fn docking_renders_edit_and_mix_default_floating_and_redocked() {
                 h.state_mut().engine = soundcraft_engine::demo::demo_engine();
                 for state in ["default", "floating", "redocked"] {
                     if state == "floating" {
+                        h.state_mut().run("ui.dock", json!({"operation":"open","panel":"tracks"})).unwrap();
                         h.state_mut().run("ui.dock", json!({"operation":"float","panel":"tracks","rect":[100,80,260,500]})).unwrap();
                     } else if state == "redocked" {
                         h.state_mut().run("ui.dock", json!({"operation":"move","panel":"tracks","target":"canvas","zone":"left"})).unwrap();
@@ -141,6 +146,7 @@ fn reset_is_enabled_and_resolves_in_native_and_in_window_menu_trees() {
     let window = tree.iter().find(|node| node.label == "Window").unwrap();
     assert!(window.children.iter().any(|node| node.path == path));
     assert!(menus::item_state(&app, path, Some("ui.dock.reset")).0);
+    app.run("ui.dock", json!({"operation":"open","panel":"tracks"})).unwrap();
     app.run("ui.dock", json!({"operation":"float","panel":"tracks","rect":[50,60,260,420]})).unwrap();
     menus::invoke_menu(&mut app, "ui.dock.reset", path);
     assert!(!app.ui.docking.layout.floating.iter().any(|group| group.panels.contains(&Panel::Tracks)));

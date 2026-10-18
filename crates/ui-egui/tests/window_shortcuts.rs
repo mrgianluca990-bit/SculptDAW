@@ -14,6 +14,7 @@ fn window_shortcuts_open_and_close_windows() {
     let pc_ctrl = Modifiers { ctrl: true, command: true, ..Modifiers::NONE };
     for (os, cmd) in [(OperatingSystem::Mac, MAC_CMD), (OperatingSystem::Windows, pc_ctrl), (OperatingSystem::Nix, pc_ctrl)] {
         let mut app = SoundApp::new(soundcraft_engine::Engine::default(), None, Services::default());
+        app.ui.show_memory_locations = false; // Toggle starts from a closed window.
         let ctx = egui::Context::default();
         ctx.set_os(os);
         for key in [Key::Num1, Key::Num3, Key::Num4, Key::Num5, Key::Num9] {

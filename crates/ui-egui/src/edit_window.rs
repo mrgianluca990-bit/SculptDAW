@@ -2640,7 +2640,7 @@ mod tests {
         let mut h = smart_demo();
         let tl = timeline(&h);
         let (clip, lane) = clip_on_screen(&h, |xs, xe| xe > tl.min.x + 100.0 && xe < tl.max.x - 20.0 && xe - xs > 100.0);
-        let press = pos2(x_of(h.state().engine.session(), tl, clip.end()) - 2.0, lane.min.y + lane.height() * 0.75);
+        let press = pos2(x_of(h.state().engine.session(), tl, clip.end()) - 2.0, lane.min.y + lane.height() * 0.5);
         quick_drag(&mut h, press, press - vec2(40.0, 0.0));
         let after = h.state().engine.session().find_clip(clip.id).unwrap().1.clone();
         assert_eq!(after.start, clip.start, "the clip moved instead of being trimmed");
@@ -2786,6 +2786,9 @@ mod tests {
         let mut h = harness(4);
         let order = |h: &Harness<SoundApp>| -> Vec<TrackId> { h.state().engine.session().tracks.iter().map(|t| t.id).collect() };
         let before = order(&h);
+        // Sculpt drags all selected tracks together; isolate the name-plate target.
+        h.state_mut().run("edit.select", json!({"tracks": [before[0].0]})).unwrap();
+        h.run_steps(2);
         let grab = row(&h, 0).min + vec2(40.0, 12.0);
         let release = pos2(grab.x, row(&h, 2).min.y);
         drag(&mut h, grab, release);

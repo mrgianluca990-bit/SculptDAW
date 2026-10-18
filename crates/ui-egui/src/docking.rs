@@ -48,7 +48,7 @@ impl Panel {
             Self::Tracks => Zone::Left,
             Self::Clips => Zone::Right,
             Self::Midi => Zone::Bottom,
-            Self::Memory => Zone::Left,  // SCULPT_CORE19_MEMORY_LEFT_BOTH
+            Self::Memory => Zone::Right,
             Self::Groups => Zone::Right, // SCULPT_CORE22_MEMORY_RIGHT
             Self::History => Zone::Right,
         }
@@ -176,6 +176,18 @@ impl Workspace {
         self.validate()?;
         let mut next = self.clone();
         let mut location = next.hidden.iter().find(|(id, _)| *id == panel).map(|(_, location)| location.clone());
+        // A newly opened MIDI editor has a predictable body height, rather than half
+        // the current canvas. Closed editors still restore their operator-chosen size.
+        if location.is_none() && panel == Panel::Midi {
+            location = Some(Location {
+                floating: None,
+                anchor: Some(Panel::Canvas),
+                placement: Placement::Split(Zone::Bottom),
+                size: Some(SplitSize::FixedSecond(320.0 + MIDI_TAB_HEIGHT)),
+                stack: None,
+                sibling: Vec::new(),
+            });
+        }
         next.hidden.retain(|(id, _)| *id != panel);
         if let Some(saved) = &mut location
             && saved.floating.is_some()
@@ -289,7 +301,10 @@ pub fn mix_default() -> Workspace {
 }
 
 fn sync(workspace: &mut Workspace, app: &crate::SoundApp, edit: bool) -> Result<(), String> {
-    workspace.set_visible(Panel::Tracks, edit && app.ui.show_tracks_list)?; // SCULPT_CORE19_TRACKS_EDIT_ONLY
+    // Edit uses its sidebar preference. Mix keeps panels explicitly opened in its own layout.
+    if edit {
+        workspace.set_visible(Panel::Tracks, app.ui.show_tracks_list)?;
+    }
     workspace.set_visible(Panel::Memory, app.ui.show_memory_locations)?;
     workspace.set_visible(Panel::History, app.ui.show_undo_history)?;
     if edit {
@@ -375,14 +390,16 @@ pub(crate) fn arrange(app: &mut crate::SoundApp) -> Result<(), String> {
     } else {
         workspace.validate_mix()?;
     }
-    let previous = workspace.clone();
     let floating: Vec<_> = workspace.layout.floating.iter().filter_map(|group| group.panels.first().map(|panel| (*panel, group.rect))).collect();
     for (index, (panel, mut rect)) in floating.into_iter().enumerate() {
         rect[0] = 32.0 + index as f32 * 28.0;
         rect[1] = 80.0 + index as f32 * 28.0;
         workspace.apply(Action::MoveFloating { panel, rect })?;
     }
-    cancel_replaced_workspace(app, &previous, &workspace, edit);
+    // Arrange cancels a held divider even when every panel was already docked.
+    if let Some(ctx) = &app.docking_context {
+        craft_ui::docking::cancel_drag::<Panel>(ctx, egui::Id::new(("soundcraft-docking", edit)));
+    }
     store(app, workspace, edit);
     Ok(())
 }
@@ -433,20 +450,6 @@ pub fn show(app: &mut crate::SoundApp, ui: &mut egui::Ui, window: crate::MainWin
         app.ui.status = format!("Panel layout could not be restored: {error}");
         workspace = if edit { Workspace::default() } else { mix_default() };
         let _ = sync(&mut workspace, app, edit);
-    }
-    // SCULPT_CORE19_MEMORY_MIGRATE_BOTH: migrate saved floating/right layouts once
-    // for each view; visibility is shared, layout is independent.
-    let migrated = egui::Id::new(("sculpt19-memory-left", edit));
-    if workspace.layout.contains(&Panel::Memory) && !ui.ctx().data(|d| d.get_temp::<bool>(migrated).unwrap_or(false)) {
-        if let Err(error) = workspace.apply(Action::Move {
-            panel: Panel::Memory,
-            anchor: if edit && workspace.layout.contains(&Panel::Tracks) { Panel::Tracks } else { Panel::Canvas },
-            placement: Placement::Split(Zone::Left),
-        }) {
-            app.ui.status = format!("Cannot dock Memory Locations: {error}");
-        } else {
-            ui.ctx().data_mut(|d| d.insert_temp(migrated, true));
-        }
     }
     cancel_replaced_workspace(app, &before_sync, &workspace, edit);
     let mut style = DockStyle::from_ui(ui);

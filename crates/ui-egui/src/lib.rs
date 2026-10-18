@@ -67,7 +67,9 @@ pub struct UiState {
     pub show_clip_list: bool,
     pub show_transport: bool,
     pub show_memory_locations: bool,
+    #[serde(default)]
     pub sculpt_core20_marker_placed: bool, // SCULPT_CORE20_LAYOUT_FIELD
+    #[serde(default)]
     pub sculpt_core20_marker_placed_mix: bool,
     pub show_big_counter: bool,
     pub show_undo_history: bool,
@@ -102,7 +104,9 @@ pub struct UiState {
     pub show_configurations: bool,
     pub show_playback_engine: bool,
     pub show_io_setup: bool,
+    #[serde(default)]
     pub sculpt_core22_layout_migrated: bool, // SCULPT_CORE22_LAYOUT_FLAG
+    #[serde(default)]
     pub sculpt_core23_layout_migrated: bool, // SCULPT_CORE23_LAYOUT_FLAG
     pub show_shortcuts: bool,
     pub show_clip_effects: bool,
@@ -137,9 +141,9 @@ impl Default for UiState {
             show_tracks_list: false, // SCULPT_CORE22_NO_TRACKS_SIDEBAR
             show_clip_list: false,
             show_transport: false,
-            show_memory_locations: true,        // SCULPT_CORE22_MARKERS_VISIBLE
-            sculpt_core20_marker_placed: false, // SCULPT_CORE20_LAYOUT_DEFAULT
-            sculpt_core20_marker_placed_mix: false,
+            show_memory_locations: true,       // SCULPT_CORE22_MARKERS_VISIBLE
+            sculpt_core20_marker_placed: true, // SCULPT_CORE20_LAYOUT_DEFAULT
+            sculpt_core20_marker_placed_mix: true,
             show_big_counter: false,
             show_undo_history: false,
             show_session_info: false,
@@ -167,8 +171,8 @@ impl Default for UiState {
             show_configurations: false,
             show_playback_engine: false,
             show_io_setup: false,
-            sculpt_core22_layout_migrated: false, // SCULPT_CORE22_LAYOUT_INIT
-            sculpt_core23_layout_migrated: false, // SCULPT_CORE23_LAYOUT_DEFAULT
+            sculpt_core22_layout_migrated: true, // SCULPT_CORE22_LAYOUT_INIT
+            sculpt_core23_layout_migrated: true, // SCULPT_CORE23_LAYOUT_DEFAULT
             show_shortcuts: false,
             show_clip_effects: false,
             show_beat_detective: false,
@@ -893,16 +897,9 @@ impl SoundApp {
         // Autosave and the macOS menu bar only run on frames, and plugin editors are native windows egui never hears from.
         // egui takes its predicted frame time off every delay, so add it back.
         let editors = self.player.as_ref().is_some_and(Player::any_editor_open);
-        // SCULPT_CORE16_LIVE_REPAINT: the 60 Hz audio meter needs 60 Hz frames.
-        let active = self.meters_live();
-        let repaint = if active {
-            0.0
-        } else if editors {
-            0.03
-        } else {
-            1.0
-        };
-        ctx.request_repaint_after_secs(repaint + if active { 0.0 } else { ctx.input(|i| i.predicted_dt) });
+        // Only ui() schedules metering frames. Covered windows run logic() alone.
+        let repaint = if editors { 0.03 } else { 1.0 };
+        ctx.request_repaint_after_secs(repaint + ctx.input(|i| i.predicted_dt));
         control::collect_screenshots(self, ctx);
     }
 
