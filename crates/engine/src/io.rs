@@ -952,17 +952,12 @@ pub fn plan_takes(e: &Engine, unsaved_dir: &Path, input_channels: usize) -> Vec<
     s.tracks
         .iter()
         .filter(|t| t.mixer.record_arm && t.kind == TrackKind::Audio && !t.inactive)
-        .map(|t| {
-            let first = match &t.mixer.input {
-                soundcraft_model::Route::Hardware(h) => {
-                    h.trim_start_matches("In ").split(['-', ' ']).next().and_then(|n| n.parse::<usize>().ok()).map_or(0, |n| n.saturating_sub(1))
-                }
-                _ => 0,
-            };
-            let inputs = (0..t.channels()).map(|k| first.saturating_add(k) % input_channels.max(1)).collect();
+        .filter_map(|t| {
+            let inputs: Option<Vec<usize>> = (0..t.channels()).map(|k| s.input_channel(&t.mixer.input, k, input_channels)).collect();
+            let inputs = inputs?;
             let file = |n: usize| dir.join("Audio Files").join(format!("{}_{n:02}.wav", sanitize_name(&t.name)));
             let path = (take_no..take_no + 1_000).map(file).find(|p| !p.exists()).unwrap_or_else(|| file(take_no));
-            (t.id, inputs, path)
+            Some((t.id, inputs, path))
         })
         .collect()
 }
@@ -1038,7 +1033,7 @@ mod record_tests {
         write_take(&dir.join("Audio Files/Vox_01.wav"), 10);
         let plan = plan_takes(&e, &dir, 4);
         assert_eq!(plan, vec![(vox, vec![1], dir.join("Audio Files/Vox_02.wav")), (gtr, vec![2, 3], dir.join("Audio Files/Gtr_01.wav"))]);
-        assert_eq!(plan_takes(&e, &dir, 2)[1].1, vec![0, 1]);
+        assert_eq!(plan_takes(&e, &dir, 2).len(), 1, "unavailable inputs must not wrap back to channel one");
 
         let session = dir.join("Song.scraft").to_string_lossy().into_owned();
         e.execute("session.save_as", &json!({"path": session})).unwrap();

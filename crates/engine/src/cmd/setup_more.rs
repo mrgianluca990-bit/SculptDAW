@@ -217,7 +217,7 @@ fn peripherals(e: &mut Engine, p: &Value) -> Result<Value> {
 }
 
 fn io_state(s: &Session) -> Value {
-    json!({"busses": s.busses, "outputs": s.outputs})
+    super::io_setup::state(s)
 }
 
 fn io_setup(e: &mut Engine, p: &Value) -> Result<Value> {
@@ -275,7 +275,8 @@ fn io_setup(e: &mut Engine, p: &Value) -> Result<Value> {
                 return Err(bad(id, "hardware output path exceeds channel 64"));
             }
             let first = requested as u16;
-            s.outputs.push(OutputPath { name, first_channel: first, format });
+            let id = s.outputs.iter().map(|p| p.id).max().unwrap_or(0).saturating_add(1);
+            s.outputs.push(OutputPath { id, active: true, monitor_on_main: name.starts_with("SCULPT HW"), name, first_channel: first, format });
         }
         "rename_output" => {
             let to = new_name.ok_or_else(|| bad(id, "`new_name` required"))?;

@@ -120,7 +120,7 @@ pub fn set_main_format(s: &mut Session, fmt: ChannelFormat) {
                 }
             }
         }
-        None => s.outputs.push(OutputPath { name: new_name, first_channel: 0, format: fmt }),
+        None => s.outputs.push(OutputPath { id: 0, active: true, monitor_on_main: false, name: new_name, first_channel: 0, format: fmt }),
     }
     for t in s.tracks.iter_mut().filter(|t| t.kind == TrackKind::Master) {
         if t.format != fmt {

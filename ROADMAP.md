@@ -1,3 +1,5 @@
+> Sculpt update — 2026-10-19: Core27 adds named input/output matrices and mapped output buses with atomic Apply/Undo. See [Core27 scope and validation](QA/CORE27_IO_SETUP.md); historical upstream parity figures below are unchanged.
+
 > Sculpt fork update — 2026-10-18: Core15–24 consolidated into source; development infrastructure and bidirectional bridge in feature verification. See [development status](docs/SCULPT_DEVELOPMENT.md). Upstream assessments below are historical, not new test results.
 
 # SoundCraft roadmap

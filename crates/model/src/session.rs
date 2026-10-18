@@ -300,6 +300,8 @@ pub struct Session {
     pub videos: Vec<VideoSource>,
     pub busses: Vec<Bus>,
     pub outputs: Vec<OutputPath>,
+    #[serde(default)]
+    pub inputs: Vec<OutputPath>,
     pub markers: Vec<MemoryLocation>,
     pub groups: Vec<Group>,
     pub edit: EditState,
@@ -340,7 +342,15 @@ impl Session {
             sources: Vec::new(),
             videos: Vec::new(),
             busses: Vec::new(),
-            outputs: vec![OutputPath { name: "Out 1-2".into(), first_channel: 0, format: ChannelFormat::Stereo }],
+            outputs: vec![OutputPath {
+                id: 1,
+                active: true,
+                monitor_on_main: false,
+                name: "Out 1-2".into(),
+                first_channel: 0,
+                format: ChannelFormat::Stereo,
+            }],
+            inputs: Vec::new(),
             markers: Vec::new(),
             groups: Vec::new(),
             edit: EditState::default(),
@@ -467,7 +477,7 @@ impl Session {
             return b.id;
         }
         let id = BusId(self.alloc());
-        self.busses.push(Bus { id, name: name.to_string(), format });
+        self.busses.push(Bus { id, name: name.to_string(), format, output: None });
         id
     }
 
@@ -508,6 +518,11 @@ impl Session {
         if ver > u64::from(Self::FORMAT_VERSION) {
             return Err(SessionError::Version(u32::try_from(ver).unwrap_or(u32::MAX)));
         }
+        for (key, limit) in [("inputs", 128), ("outputs", 128), ("busses", 256)] {
+            if v.get(key).and_then(serde_json::Value::as_array).is_some_and(|rows| rows.len() > limit) {
+                return Err(SessionError::Format(format!("Too many {key} paths (maximum {limit})")));
+            }
+        }
         let mut s: Session = serde_json::from_value(v).map_err(|e| SessionError::Format(e.to_string()))?;
         s.sanitize();
         Ok(s)
@@ -515,6 +530,7 @@ impl Session {
 
     /// Repair invariants after loading untrusted data.
     pub fn sanitize(&mut self) {
+        self.sanitize_io_paths();
         let max_id = self
             .tracks
             .iter()

@@ -397,15 +397,38 @@ pub struct Bus {
     pub id: BusId,
     pub name: String,
     pub format: ChannelFormat,
+    /// None is an internal bus; an output route key maps this bus to a physical output.
+    #[serde(default)]
+    pub output: Option<String>,
 }
 
 /// Physical output paths (from the I/O setup).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct OutputPath {
+    /// Stable within the input or output path namespace. Zero identifies a legacy path.
+    #[serde(default)]
+    pub id: u64,
+    #[serde(default = "yes")]
+    pub active: bool,
+    #[serde(default)]
+    pub monitor_on_main: bool,
     pub name: String,
     /// First hardware channel (0-based).
     pub first_channel: u16,
     pub format: ChannelFormat,
+}
+
+impl OutputPath {
+    pub fn new(name: impl Into<String>, first_channel: u16, format: ChannelFormat) -> Self {
+        let name = name.into();
+        Self { id: 0, active: true, monitor_on_main: name.starts_with("SCULPT HW"), name, first_channel, format }
+    }
+    pub fn route_key(&self, input: bool) -> String {
+        if self.id == 0 { self.name.clone() } else { format!("sculpt.io.{}:{}", if input { "in" } else { "out" }, self.id) }
+    }
+    pub fn available(&self, channels: usize) -> bool {
+        self.active && usize::from(self.first_channel).checked_add(self.format.channels()).is_some_and(|end| end <= channels.min(64))
+    }
 }
 
 /// Where a signal goes or comes from.

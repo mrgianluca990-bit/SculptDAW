@@ -695,6 +695,7 @@ fn route(e: &mut Engine, p: &Value, input: bool) -> Result<Value> {
     let mut r = parse_route(s, &v);
     if let Route::Hardware(name) = &r
         && create_bus
+        && !(if input { s.input_path(name).is_some() } else { s.output_path(name).is_some() })
         && !name.to_ascii_lowercase().starts_with("in ")
         && !s.outputs.iter().any(|out| out.name.eq_ignore_ascii_case(name))
     // SCULPT_CORE21_ROUTE_PRESERVE_HARDWARE

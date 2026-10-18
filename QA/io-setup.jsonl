@@ -1,0 +1,9 @@
+{"method": "engine.execute", "params": {"command": "setup.io.apply", "params": {"busses": [{"format": "Stereo", "id": 1, "name": "Verb", "output": null}, {"id": 900, "name": "Batteria", "format": "Stereo", "output": "sculpt.io.out:2"}], "inputs": [{"id": 1, "name": "Microfono voce", "format": "Mono", "first_channel": 0, "active": true}, {"id": 2, "name": "Tastiere", "format": "Stereo", "first_channel": 2, "active": true}], "outputs": [{"active": true, "first_channel": 0, "format": "Stereo", "id": 1, "monitor_on_main": false, "name": "Out 1-2"}, {"id": 2, "name": "Palco", "format": "Stereo", "first_channel": 4, "active": true}, {"id": 3, "name": "Cuffie", "format": "Stereo", "first_channel": 6, "active": true}], "expected": {"busses": [{"format": "Stereo", "id": 1, "name": "Verb", "output": null}], "inputs": [], "outputs": [{"active": true, "first_channel": 0, "format": "Stereo", "id": 1, "monitor_on_main": false, "name": "Out 1-2"}]}}}}
+{"method": "ui.set", "params": {"show_io_setup": true, "io_setup_tab": 0}}
+{"steps": 5}
+{"shot": "dist/qa/io-input.png"}
+{"method": "ui.set", "params": {"io_setup_tab": 1}}
+{"steps": 5}
+{"shot": "dist/qa/io-output.png"}
+{"method": "ui.set", "params": {"io_setup_tab": 2}}
+{"steps": 5}

@@ -9,6 +9,7 @@ mod automation;
 pub mod b64;
 mod clip;
 mod ids;
+mod io_paths;
 mod markers;
 mod mixer;
 mod session;

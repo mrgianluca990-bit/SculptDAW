@@ -1,3 +1,5 @@
+> Sculpt update — 2026-10-19: Core26 device/buffer selection and Core27 named Input/Output/Bus setup supersede the historical missing-selection statements below for Sculpt. Hardware inserts, duplex clocking/latency calibration, bus recording and hierarchical subpaths remain open. See [Core27](../QA/CORE27_IO_SETUP.md).
+
 > Sculpt fork update — 2026-10-18: Core15–24 consolidated into source; development infrastructure and bidirectional bridge in feature verification. See [development status](SCULPT_DEVELOPMENT.md). Upstream assessments below are historical, not new test results.
 
 # Where SoundCraft falls short of Pro Tools

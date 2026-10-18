@@ -99,7 +99,9 @@ fn route_name(app: &SoundApp, r: &Route) -> String {
         Route::None => "no output".into(),
         Route::Main => app.engine.session().outputs.first().map_or_else(|| "Out 1-2".into(), |o| o.name.clone()),
         Route::Bus(b) => app.engine.session().bus(*b).map_or_else(|| "bus?".into(), |b| b.name.clone()),
-        Route::Hardware(h) => h.clone(),
+        Route::Hardware(h) => {
+            app.engine.session().input_path(h).or_else(|| app.engine.session().output_path(h)).map_or_else(|| h.clone(), |p| p.name.clone())
+        }
     }
 }
 
@@ -109,11 +111,21 @@ pub fn strip_required_height(views: &[String], pan_height: f32) -> f32 {
     let has = |key: &str| all || views.iter().any(|v| v == key);
     let mut height = 4.0 + 22.0 + 48.0 + pan_height.max(0.0) + 160.0 + 64.0;
     for (key, size) in [
-        ("mic_preamps", 38.0), ("instruments", 38.0), ("object", 24.0),
-        ("inserts_ae", 105.0), ("inserts_fj", 71.0),
-        ("sends_ae", 105.0), ("sends_fj", 71.0),
-        ("eq_curve", 44.0), ("comments", 48.0), ("io", 86.0),
-    ] { if has(key) { height += size; } }
+        ("mic_preamps", 38.0),
+        ("instruments", 38.0),
+        ("object", 24.0),
+        ("inserts_ae", 105.0),
+        ("inserts_fj", 71.0),
+        ("sends_ae", 105.0),
+        ("sends_fj", 71.0),
+        ("eq_curve", 44.0),
+        ("comments", 48.0),
+        ("io", 86.0),
+    ] {
+        if has(key) {
+            height += size;
+        }
+    }
     height
 }
 
@@ -124,13 +136,15 @@ fn strip(app: &mut SoundApp, ui: &mut Ui, id: TrackId, snap: Option<&MeterSnapsh
     let narrow = width.is_none() && app.ui.narrow_mix;
     let w = width.unwrap_or_else(|| strip_width(narrow)); // SCULPT_CORE19_CONTEXT_STRIP_WIDTH
     let out_fmt = output_format(app, &track);
-    let surround = out_fmt.channels() > 2 && !out_fmt.is_ambisonic()
-        && !matches!(track.kind, TrackKind::Master | TrackKind::Vca) && track.channels() <= 2;
+    let surround =
+        out_fmt.channels() > 2 && !out_fmt.is_ambisonic() && !matches!(track.kind, TrackKind::Master | TrackKind::Vca) && track.channels() <= 2;
     let pan_height = if surround {
         (w - 12.0).min(88.0) + if out_fmt.has_height() { 28.0 } else { 17.0 }
     } else if !track.mixer.pan.is_empty() && track.kind != TrackKind::Vca {
         if track.mixer.pan.len() >= 2 { ((w - 8.0) / 2.0 - 6.0).min(32.0) + 20.0 } else { 54.0 }
-    } else { 0.0 };
+    } else {
+        0.0
+    };
     let minimum = strip_required_height(&app.ui.mix_views, pan_height);
     let h = if width.is_some() { minimum.max(640.0) } else { ui.available_height().max(minimum) };
     let (r, strip_response) = ui.allocate_exact_size(vec2(w, h), Sense::click()); // SCULPT_CORE22_CLICK_STRIP
@@ -260,8 +274,7 @@ fn strip(app: &mut SoundApp, ui: &mut Ui, id: TrackId, snap: Option<&MeterSnapsh
         section_label(ui, sec, "I / O");
         let in_r = Rect::from_min_size(pos2(x0 + 2.0, sec.min.y + 15.0), vec2(inner_w - 4.0, 16.0));
         let out_r = Rect::from_min_size(pos2(x0 + 2.0, sec.min.y + 33.0), vec2(inner_w - 4.0, 16.0));
-        let input =
-            if track.kind.has_playlist() && track.mixer.input == Route::None { "In 1".to_string() } else { route_name(app, &track.mixer.input) };
+        let input = if track.mixer.input == Route::None { "no input".to_string() } else { route_name(app, &track.mixer.input) };
         let mut c = ui.new_child(egui::UiBuilder::new().id_salt(("mix-input", id.0)).max_rect(in_r));
         let resp = selector_box(&mut c, in_r.width(), in_r.height(), &input, t.text);
         egui::Popup::menu(&resp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| route_menu(app, ui, id, true));
@@ -968,35 +981,46 @@ fn route_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, input: bool) {
         let _ = app.run(cmd, json!({"track": id.0, key: "none"}));
         ui.close();
     }
-    let main_name = app.engine.session().outputs.first().map_or_else(|| "Out 1-2".to_string(), |o| o.name.clone());
-    if !input && ui.button(main_name).clicked() {
-        let _ = app.run(cmd, json!({"track": id.0, key: "main"}));
+    if !input && ui.button(app.engine.session().outputs.first().map_or("Main", |p| p.name.as_str())).clicked() {
+        let _ = app.run(cmd, json!({"track":id.0,key:"main","create_bus":false}));
         ui.close();
     }
-    if input {
-        for i in 1..=8 {
+    let paths = if input { app.engine.session().inputs.clone() } else { app.engine.session().outputs.clone() };
+    ui.separator();
+    ui.strong(if input { "Hardware inputs" } else { "Hardware outputs" });
+    if input && paths.is_empty() {
+        let channels = app.recorder.as_ref().map_or(8, |r| r.channels).min(64);
+        for i in 1..=channels {
             if ui.button(format!("In {i}")).clicked() {
-                let _ = app.run(cmd, json!({"track": id.0, key: format!("In {i}")}));
+                let _ = app.run(cmd, json!({"track":id.0,key:format!("In {i}"),"create_bus":false}));
                 ui.close();
             }
         }
     }
-    // SCULPT_CORE21_MIX_OUTPUT_MENU: direct hardware output selection.
-    if !input {
-        let paths = app.engine.session().outputs.clone();
-        ui.separator();
-        ui.strong("Hardware outputs");
-        for path in paths.iter().skip(1) {
-            let end = usize::from(path.first_channel) + path.format.channels();
-            if ui.button(format!("{} · Ch {}–{}", path.name, path.first_channel + 1, end)).clicked() {
-                let _ = app.run("track.output", json!({"tracks":[id.0],"output":path.name,"create_bus":false}));
-                ui.close();
-            }
+    let track_width = app.engine.session().track(id).map_or(1, |t| t.channels());
+    let connected = if input { app.recorder.as_ref().map(|r| r.channels) } else { app.player.as_ref().map(|p| usize::from(p.device_channels)) };
+    for (index, path) in paths.iter().enumerate() {
+        if !input && index == 0 {
+            continue;
         }
-        if ui.button("I/O Setup...").clicked() {
-            app.ui.show_io_setup = true;
+        let width = path.format.channels();
+        let compatible = !input || width >= track_width;
+        let unavailable = connected.is_some_and(|n| !path.available(n)) || !path.active;
+        let label = format!(
+            "{} · {}–{}{}",
+            path.name,
+            path.first_channel + 1,
+            usize::from(path.first_channel) + width,
+            if unavailable { " (unavailable)" } else { "" }
+        );
+        if ui.add_enabled(compatible, egui::Button::new(label)).clicked() {
+            let _ = app.run(cmd, json!({"track":id.0,key:path.route_key(input),"create_bus":false}));
             ui.close();
         }
+    }
+    if ui.button("I/O Setup...").clicked() {
+        app.ui.show_io_setup = true;
+        ui.close();
     }
     ui.separator();
     let busses: Vec<String> = app.engine.session().busses.iter().map(|b| b.name.clone()).collect();

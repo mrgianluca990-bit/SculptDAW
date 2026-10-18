@@ -73,7 +73,8 @@ fn render(e: &mut Engine, p: &Value) -> Result<Value> {
     let mut files = Vec::new();
     for track in tracks {
         let mut isolated = s.clone();
-        isolated.outputs = vec![OutputPath { name: "Bridge".into(), first_channel: 0, format: ChannelFormat::Stereo }];
+        isolated.outputs =
+            vec![OutputPath { id: 0, active: true, monitor_on_main: false, name: "Bridge".into(), first_channel: 0, format: ChannelFormat::Stereo }];
         for t in &mut isolated.tracks {
             t.mixer.solo = false;
             t.mixer.solo_safe = false;

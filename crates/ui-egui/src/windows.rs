@@ -572,62 +572,8 @@ fn apply_audio_settings(app: &mut SoundApp, cfg: &mut soundcraft_playback::sculp
     Ok(())
 }
 
-/// Setup › I/O: busses and output paths.
-/// SCULPT_CORE22_SIMPLE_IO: no user-editable matrix, just physical destinations.
 pub fn io_setup(app: &mut SoundApp, ctx: &egui::Context) {
-    let mut open = app.ui.show_io_setup;
-    win(ctx, &mut open, "I/O Setup", vec2(540.0, 490.0), |ui| {
-        let count = app.player.as_ref().map(|p| usize::from(p.device_channels)).unwrap_or(0).min(64);
-        ui.horizontal(|ui| {
-            ui.heading("Physical outputs");
-            if ui.button("Playback Engine…").clicked() {
-                app.ui.show_playback_engine = true;
-            }
-        });
-        ui.label(app.player.as_ref().map_or("No connected audio output".into(), |p| format!("{} · {} active outputs", p.device_name, count)));
-        let selected = app.engine.session().edit.selected_tracks.first().copied();
-        let Some(track) = selected else {
-            ui.separator();
-            ui.label("Select a track in Edit or Mix to assign its output.");
-            return;
-        };
-        let current = app.engine.session().track(track).map(|t| format!("{:?}", t.mixer.output)).unwrap_or_default();
-        ui.label(format!("Track output: {current}"));
-        if ui.button("Main (monitor)").clicked() {
-            let _ = app.run("track.output", json!({"tracks":[track.0],"output":"main","create_bus":false}));
-        }
-        ui.separator();
-        ui.label("Assign channel(s), with the same numbering used in Sculpt Show:");
-        egui::ScrollArea::vertical().max_height(275.0).show(ui, |ui| {
-            if count == 0 {
-                ui.label("Connect an interface in Playback Engine first.");
-                return;
-            }
-            for first in 0..count {
-                ui.horizontal(|ui| {
-                    let mono = format!("SCULPT HW MONO {:02}", first + 1);
-                    if ui.button(format!("Out {}", first + 1)).clicked() {
-                        let exists = app.engine.session().outputs.iter().any(|p| p.name == mono);
-                        if !exists {
-                            let _ = app.run("setup.io", json!({"action":"create_output","name":mono,"first_channel":first,"format":"mono"}));
-                        }
-                        let _ = app.run("track.output", json!({"tracks":[track.0],"output":mono,"create_bus":false}));
-                    }
-                    if first + 1 < count {
-                        let stereo = format!("SCULPT HW STEREO {:02}-{:02}", first + 1, first + 2);
-                        if ui.button(format!("Out {}–{}", first + 1, first + 2)).clicked() {
-                            let exists = app.engine.session().outputs.iter().any(|p| p.name == stereo);
-                            if !exists {
-                                let _ = app.run("setup.io", json!({"action":"create_output","name":stereo,"first_channel":first,"format":"stereo"}));
-                            }
-                            let _ = app.run("track.output", json!({"tracks":[track.0],"output":stereo,"create_bus":false}));
-                        }
-                    }
-                });
-            }
-        });
-    });
-    app.ui.show_io_setup = open;
+    crate::io_setup::show(app, ctx);
 }
 
 /// Setup › Keyboard Shortcuts.

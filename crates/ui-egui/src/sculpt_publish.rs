@@ -37,7 +37,7 @@ fn original_stem<'a>(manifest: &'a Value, track: &Track) -> Option<&'a Value> {
 }
 fn physical_output(track: &Track, session: &soundcraft_model::Session, old: Option<&Value>) -> usize {
     if let Route::Hardware(name) = &track.mixer.output
-        && let Some(out) = session.outputs.iter().find(|o| &o.name == name)
+        && let Some(out) = session.output_path(name)
     {
         return usize::from(out.first_channel) + 1;
     }
@@ -264,6 +264,15 @@ mod tests {
             let bytes = soundcraft_audio_io::encode(&audio, &soundcraft_audio_io::EncodeOptions::default()).unwrap();
             soundcraft_engine::io::import_audio_bytes(&mut engine, "Same", &bytes, None, None, 0).unwrap();
         }
+        engine.session_mut().outputs.push(soundcraft_model::OutputPath {
+            id: 7,
+            active: true,
+            monitor_on_main: true,
+            name: "Renamed output".into(),
+            first_channel: 63,
+            format: soundcraft_model::ChannelFormat::Mono,
+        });
+        engine.session_mut().tracks[0].mixer.output = Route::Hardware("sculpt.io.out:7".into());
         engine.session_mut().tracks[0].mixer.mute = true;
         engine.session_mut().tracks[0].comments = "Source stem UUID: 33333333-3333-3333-3333-333333333333".into();
         engine.session_mut().tracks[1].comments = "Source stem UUID: 44444444-4444-4444-4444-444444444444".into();
@@ -284,6 +293,7 @@ mod tests {
         let packet: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
         assert_eq!(packet["stems"].as_array().unwrap().len(), 2);
         assert_eq!(packet["stems"][0]["muted"], true);
+        assert_eq!(packet["stems"][0]["outputStartChannel"], 64, "stable renamed I/O paths must preserve bridge metadata");
         assert_eq!(packet["durationSeconds"], 0.2);
         assert_eq!(packet["targetSelection"], true);
         assert_eq!(packet["markers"][0]["name"], "Renamed");

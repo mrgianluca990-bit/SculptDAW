@@ -695,6 +695,23 @@ impl MixEngine {
             self.strips.insert(t.id, st);
         }
         self.order = order;
+        // Output buses are summed after aux processing, exactly once per bus.
+        for bus in &s.busses {
+            let Some(path) = bus.output.as_deref().and_then(|key| s.output_path(key)).filter(|p| p.active) else { continue };
+            let Some(source) = self.busses.get(&bus.id) else { continue };
+            let stereo = if source.buf.len() == 1 { [0.0, 0.0] } else { [-1.0, 1.0] };
+            let spec = PanSpec { stereo, surround: None };
+            if s.outputs.first().is_some_and(|main| main.id == path.id) || self.hardware_channels == 0 {
+                let matrix = build_matrix(source.fmt, source.buf.len(), self.main_fmt, self.main.len(), &spec, self.pan_law);
+                apply_matrix(&source.buf, frames, &mut self.main, &matrix, 1.0);
+            } else if path.available(self.hardware_channels) {
+                let first = usize::from(path.first_channel);
+                if let Some(dst) = self.hardware.get_mut(first..first + path.format.channels()) {
+                    let matrix = build_matrix(source.fmt, source.buf.len(), path.format, dst.len(), &spec, self.pan_law);
+                    apply_matrix(&source.buf, frames, dst, &matrix, 1.0);
+                }
+            }
+        }
         // Master faders process the main mix.
         for t in s.tracks.iter().filter(|t| t.kind == TrackKind::Master && !t.inactive) {
             if let Some(strip) = self.strips.get_mut(&t.id) {
@@ -752,7 +769,15 @@ impl MixEngine {
         }
         // Output: min(out.len(), main channels) channels; any further output channels are silent.
         for (c, o) in out.iter_mut().enumerate() {
-            let src = self.main.get(c);
+            let src = if self.hardware_channels == 0 {
+                self.main.get(c)
+            } else {
+                s.outputs
+                    .first()
+                    .filter(|p| p.available(self.hardware_channels))
+                    .and_then(|path| c.checked_sub(usize::from(path.first_channel)))
+                    .and_then(|channel| self.main.get(channel))
+            };
             for i in 0..frames {
                 // SCULPT_CORE21_HW_DEVICE_SUM: independent physical paths are
                 // summed with the existing Main (physical channels 1..main_width).
@@ -835,7 +860,10 @@ impl MixEngine {
             // SCULPT_CORE21_HW_RENDER: a named I/O path is a physical endpoint,
             // NOT an internal bus. Never discard this signal when unavailable.
             Route::Hardware(name) => {
-                let endpoint = s.outputs.iter().find(|p| p.name.eq_ignore_ascii_case(name));
+                let endpoint = s.output_path(name);
+                if endpoint.is_some_and(|p| !p.active) || (name.starts_with("sculpt.io.out:") && endpoint.is_none()) {
+                    return;
+                }
                 let assigned = endpoint.and_then(|p| {
                     let first = usize::from(p.first_channel);
                     let width = p.format.channels();
@@ -851,11 +879,19 @@ impl MixEngine {
                     // SCULPT_CORE21_BRIDGE_MAIN_PREVIEW: only Show's dedicated
                     // SCULPT HW outputs keep a parallel Main 1-2 monitor while
                     // editing. Do not double-sum an output already on Main.
-                    if name.starts_with("SCULPT HW") && first >= self.main.len() {
+                    let main_first = s.outputs.first().map_or(0, |p| usize::from(p.first_channel));
+                    if endpoint.is_some_and(|p| p.monitor_on_main || p.name.starts_with("SCULPT HW"))
+                        && (first + width <= main_first || first >= main_first + self.main.len())
+                    {
                         let m = build_matrix(src_fmt, strip.buf.len(), self.main_fmt, self.main.len(), &spec, law);
                         apply_matrix(&strip.buf, frames, &mut self.main, &m, 1.0);
                     }
-                } else {
+                } else if !name.starts_with("sculpt.io.out:")
+                    || self.hardware_channels == 0
+                    || endpoint.is_some_and(|p| p.monitor_on_main || p.name.starts_with("SCULPT HW"))
+                {
+                    // Legacy monitoring and offline bounce preserve the established fallback.
+                    // Stable new paths stay silent when hardware is unavailable.
                     // Device has too few output channels, or this path is absent:
                     // safe Main monitoring, retaining the original Hardware assignment.
                     let m = build_matrix(src_fmt, strip.buf.len(), self.main_fmt, self.main.len(), &spec, law);
@@ -890,17 +926,14 @@ fn process_strip(
         c.iter_mut().take(frames).for_each(|x| *x = 0.0);
     }
     match t.kind {
-        TrackKind::Audio if !live.input.is_empty() && (t.mixer.input_monitor || (t.mixer.record_arm && (live.monitor_only || live.recording))) => {
+        TrackKind::Audio | TrackKind::Aux
+            if !live.input.is_empty()
+                && ((t.kind == TrackKind::Aux && matches!(t.mixer.input, Route::Hardware(_)))
+                    || (t.kind == TrackKind::Audio && (t.mixer.input_monitor || (t.mixer.record_arm && (live.monitor_only || live.recording))))) =>
+        {
             // Input monitoring: the track hears its hardware input instead of its clips.
-            let first = match &t.mixer.input {
-                Route::Hardware(h) => {
-                    h.trim_start_matches("In ").split(['-', ' ']).next().and_then(|n| n.parse::<usize>().ok()).map_or(0, |n| n.saturating_sub(1))
-                }
-                _ => 0,
-            };
-            let n_in = live.input.len().max(1);
             for (k, dst) in strip.buf.iter_mut().enumerate() {
-                if let Some(src) = live.input.get((first + k) % n_in) {
+                if let Some(src) = s.input_channel(&t.mixer.input, k, live.input.len()).and_then(|channel| live.input.get(channel)) {
                     for (d, x) in dst.iter_mut().zip(src.iter()).take(frames) {
                         *d = *x;
                     }
@@ -2000,7 +2033,8 @@ pub fn render_track_pre_fader(s: &Session, track: TrackId, range: Range) -> Vec<
     let mut solo = s.clone();
     // Multichannel tracks render into a main mix of their own format (straight through).
     let fmt = s.track(track).map_or(ChannelFormat::Stereo, |t| if t.channels() > 2 { t.format } else { ChannelFormat::Stereo });
-    solo.outputs = vec![soundcraft_model::OutputPath { name: "Out".into(), first_channel: 0, format: fmt }];
+    solo.outputs =
+        vec![soundcraft_model::OutputPath { id: 0, active: true, monitor_on_main: false, name: "Out".into(), first_channel: 0, format: fmt }];
     for t in &mut solo.tracks {
         if t.id == track {
             t.mixer.volume_db = 0.0;
@@ -2140,11 +2174,108 @@ mod tests {
         (s, t)
     }
 
+    #[test]
+    fn core27_output_bus_reaches_only_its_mapped_pair_and_rename_preserves_audio() {
+        let (mut s, t) = session_with_dc(0.5, 512);
+        s.outputs.push(soundcraft_model::OutputPath {
+            id: 2,
+            active: true,
+            monitor_on_main: false,
+            name: "Speakers".into(),
+            first_channel: 4,
+            format: ChannelFormat::Stereo,
+        });
+        let bus = s.add_bus("Drums", ChannelFormat::Stereo);
+        s.busses.iter_mut().find(|b| b.id == bus).unwrap().output = Some("sculpt.io.out:2".into());
+        s.track_mut(t).unwrap().mixer.output = Route::Bus(bus);
+        let render = |s: &Session| {
+            let mut e = MixEngine::new(48000.0, 512);
+            e.set_device_output_channels(8);
+            let mut out = vec![vec![0.0; 512]; 8];
+            e.render(s, 0, 512, &mut out);
+            out
+        };
+        let before = render(&s);
+        assert!(before[4][100] > 0.3 && before[5][100] > 0.3);
+        assert!(before.iter().enumerate().filter(|(i, _)| *i != 4 && *i != 5).all(|(_, c)| c.iter().all(|v| v.abs() < 1e-6)));
+        s.outputs[1].name = "Stage".into();
+        assert_eq!(render(&s), before);
+        s.outputs[1].active = false;
+        assert!(render(&s).iter().flatten().all(|v| v.abs() < 1e-6));
+    }
+
+    #[test]
+    fn core27_named_input_and_primary_output_matrix_select_the_real_channels() {
+        let (mut s, t) = session_with_dc(0.0, 512);
+        s.inputs.push(soundcraft_model::OutputPath {
+            id: 1,
+            active: true,
+            monitor_on_main: false,
+            name: "Voice".into(),
+            first_channel: 2,
+            format: ChannelFormat::Mono,
+        });
+        s.outputs[0].first_channel = 4;
+        s.track_mut(t).unwrap().mixer.input = Route::Hardware("sculpt.io.in:1".into());
+        s.track_mut(t).unwrap().mixer.input_monitor = true;
+        let mut e = MixEngine::new(48000.0, 512);
+        e.set_device_output_channels(8);
+        e.input = vec![vec![0.0; 512]; 4];
+        e.input[2].fill(0.5);
+        let mut out = vec![vec![0.0; 512]; 8];
+        e.render(&s, 0, 512, &mut out);
+        assert!(out[4][100] > 0.3 && out[5][100] > 0.3);
+        assert!(out[0].iter().all(|v| v.abs() < 1e-6));
+        e.input.truncate(2);
+        e.render(&s, 512, 512, &mut out);
+        assert!(out.iter().flatten().all(|v| v.abs() < 1e-6));
+    }
+
+    #[test]
+    fn core27_bridge_preview_survives_renaming_a_stable_hardware_path() {
+        let (mut s, t) = session_with_dc(0.5, 512);
+        s.outputs.push(soundcraft_model::OutputPath {
+            id: 9,
+            active: true,
+            monitor_on_main: true,
+            name: "SCULPT HW STEREO 05-06".into(),
+            first_channel: 4,
+            format: ChannelFormat::Stereo,
+        });
+        s.track_mut(t).unwrap().mixer.output = Route::Hardware("sculpt.io.out:9".into());
+        let render = |s: &Session| {
+            let mut e = MixEngine::new(48000.0, 512);
+            e.set_device_output_channels(8);
+            let mut out = vec![vec![0.0; 512]; 8];
+            e.render(s, 0, 512, &mut out);
+            out
+        };
+        let before = render(&s);
+        assert!(before[0][100] > 0.3 && before[4][100] > 0.3);
+        s.outputs[1].name = "Renamed stage output".into();
+        assert_eq!(render(&s), before);
+        let mut fallback = MixEngine::new(48000.0, 512);
+        fallback.set_device_output_channels(2);
+        let mut stereo = vec![vec![0.0; 512]; 2];
+        fallback.render(&s, 0, 512, &mut stereo);
+        assert!(stereo[0][100] > 0.3, "Show's preview fallback must remain audible on a two-output interface");
+        s.outputs[0].first_channel = 4;
+        let overlapping = render(&s);
+        assert!((overlapping[4][100] - before[4][100]).abs() < 1e-6, "preview must not double a physical output that overlaps Main");
+    }
+
     // SCULPT_CORE21_TEST_OUTPUT64: physical 64 + safe stereo fallback.
     #[test]
     fn sculpt_core21_hardware_output64_and_missing_device_fallback() {
         let (mut s, t) = session_with_dc(0.5, 4800);
-        s.outputs.push(soundcraft_model::OutputPath { name: "SCULPT HW MONO 64".into(), first_channel: 63, format: ChannelFormat::Mono });
+        s.outputs.push(soundcraft_model::OutputPath {
+            id: 0,
+            active: true,
+            monitor_on_main: false,
+            name: "SCULPT HW MONO 64".into(),
+            first_channel: 63,
+            format: ChannelFormat::Mono,
+        });
         s.track_mut(t).unwrap().mixer.output = Route::Hardware("SCULPT HW MONO 64".into());
         let mut e = MixEngine::new(48_000.0, 512);
         e.set_device_output_channels(64);
@@ -2475,6 +2606,7 @@ mod tests {
         assert!((out[0][100] - 0.5 * std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-3);
         // Monitored: the input replaces it, and it still sounds when stopped.
         s.track_mut(t).unwrap().mixer.input_monitor = true;
+        s.track_mut(t).unwrap().mixer.input = Route::Hardware("In 1".into());
         eng.render(&s, 512, 512, &mut out);
         assert!((out[0][100] - 0.25 * std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-3, "{}", out[0][100]);
         eng.monitor_only = true;

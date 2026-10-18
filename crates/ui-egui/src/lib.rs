@@ -12,6 +12,7 @@ pub mod edit_window;
 pub mod extra_windows;
 pub mod fonts;
 pub mod icons;
+mod io_setup;
 pub mod menus;
 pub mod midi_editor;
 pub mod mix_window;
@@ -105,6 +106,8 @@ pub struct UiState {
     pub show_playback_engine: bool,
     pub show_io_setup: bool,
     #[serde(default)]
+    pub io_setup_tab: usize,
+    #[serde(default)]
     pub sculpt_core22_layout_migrated: bool, // SCULPT_CORE22_LAYOUT_FLAG
     #[serde(default)]
     pub sculpt_core23_layout_migrated: bool, // SCULPT_CORE23_LAYOUT_FLAG
@@ -171,6 +174,7 @@ impl Default for UiState {
             show_configurations: false,
             show_playback_engine: false,
             show_io_setup: false,
+            io_setup_tab: 0,
             sculpt_core22_layout_migrated: true, // SCULPT_CORE22_LAYOUT_INIT
             sculpt_core23_layout_migrated: true, // SCULPT_CORE23_LAYOUT_DEFAULT
             show_shortcuts: false,
@@ -537,8 +541,17 @@ impl SoundApp {
         let unsaved_dir = self.autosave_dir.as_ref().map_or_else(std::env::temp_dir, |d| d.join(name));
         let Some(r) = &mut self.recorder else { return Err("no audio input device".into()) };
         let plan = soundcraft_engine::io::plan_takes(&self.engine, &unsaved_dir, r.channels);
-        if plan.is_empty() {
-            return Err("no audio track is record-enabled".into());
+        if plan.is_empty()
+            || plan.len()
+                != self
+                    .engine
+                    .session()
+                    .tracks
+                    .iter()
+                    .filter(|t| t.kind == soundcraft_model::TrackKind::Audio && !t.inactive && t.mixer.record_arm)
+                    .count()
+        {
+            return Err("Assign an available hardware input to every armed audio track. Internal-bus recording is not supported.".into());
         }
         r.arm(plan)
     }
@@ -609,8 +622,7 @@ impl SoundApp {
 
     /// Whether the meters are live: while playing, and while armed or input-monitored tracks are heard.
     fn meters_live(&self) -> bool {
-        self.engine.transport.playing
-            || (self.recorder.is_some() && self.engine.session().tracks.iter().any(|t| t.mixer.input_monitor || t.mixer.record_arm))
+        self.engine.transport.playing || (self.recorder.is_some() && self.engine.session().needs_hardware_input())
     }
 
     /// Open the input device once (for recording and input monitoring) and feed the player.
@@ -743,6 +755,7 @@ impl SoundApp {
                     // The old capture belongs to the replaced document, never to the new one.
                     self.recorder = None;
                     self.recorder_failed = false;
+                    self.ui.show_io_setup = false;
                     self.punch = None;
                     self.gesture = None;
                     self.ui.selected_fade = None;
@@ -891,10 +904,7 @@ impl SoundApp {
         }
         self.write_automation(ctx);
         self.autosave();
-        if self.recorder.is_none()
-            && !self.recorder_failed
-            && self.engine.session().tracks.iter().any(|t| t.mixer.input_monitor || t.mixer.record_arm)
-        {
+        if self.recorder.is_none() && !self.recorder_failed && self.engine.session().needs_hardware_input() {
             self.ensure_input();
         }
         // Autosave and the macOS menu bar only run on frames, and plugin editors are native windows egui never hears from.

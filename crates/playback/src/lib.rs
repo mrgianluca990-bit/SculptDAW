@@ -280,7 +280,7 @@ impl AudioState {
     fn fill(&mut self, out: &mut [f32], channels: usize) {
         self.drain();
         let channels = channels.max(1);
-        let monitoring = self.input.is_some() && self.session.tracks.iter().any(|t| t.mixer.input_monitor || t.mixer.record_arm);
+        let monitoring = self.input.is_some() && self.session.needs_hardware_input();
         if !self.playing && !monitoring {
             out.iter_mut().for_each(|x| *x = 0.0);
             if let Ok(mut m) = self.shared.meters.try_lock() {
@@ -821,6 +821,14 @@ pub fn sculpt_required_output_channels(s: &Session) -> usize {
             want = want.max(usize::from(p.first_channel).saturating_add(p.format.channels()).min(64));
         }
     }
+    for bus in &s.busses {
+        if let Some(path) = bus.output.as_deref().and_then(|key| s.output_path(key)) {
+            want = want.max(usize::from(path.first_channel).saturating_add(path.format.channels()));
+        }
+    }
+    if let Some(main) = s.outputs.first() {
+        want = want.max(usize::from(main.first_channel).saturating_add(main.format.channels()));
+    }
     want.clamp(2, 64)
 }
 
@@ -1072,6 +1080,7 @@ mod tests {
         let mut s = soundcraft_model::Session::default();
         let t = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
         s.track_mut(t).unwrap().mixer.record_arm = true;
+        s.track_mut(t).unwrap().mixer.input = soundcraft_model::Route::Hardware("In 1".into());
         let shared = Arc::new(Shared {
             position: AtomicI64::new(0),
             playing: AtomicBool::new(false),
