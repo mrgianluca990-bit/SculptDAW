@@ -408,7 +408,7 @@ fn configurations(app: &mut SoundApp, ctx: &egui::Context) {
     app.ui.show_configurations = open;
 }
 
-/// Setup › Playback Engine. The shared Show profile is committed only after a successful trial.
+/// Setup › Playback Engine. The device profile is committed only after a successful trial.
 pub fn playback_engine(app: &mut SoundApp, ctx: &egui::Context) {
     use soundcraft_playback::sculpt_audio_settings::{AudioDeviceInfo, AudioSettings, available_devices};
     let mut open = app.ui.show_playback_engine;
@@ -508,12 +508,12 @@ pub fn playback_engine(app: &mut SoundApp, ctx: &egui::Context) {
             let _ = app.run("options.delay_compensation", json!({"value":dc}));
         }
         ui.separator();
-        ui.label("The device profile is shared with Sculpt Show. Reopen Show while idle to load changes.");
+        ui.label("Device choices are saved on this Mac. Session sample rate and I/O routing are configured separately.");
         let running = app.engine.transport.playing || app.engine.transport.recording;
         ui.label("Stop playback and recording before reconnecting audio.");
         if ui.add_enabled(!running, egui::Button::new("Apply and reconnect audio")).clicked() {
             match apply_audio_settings(app, &mut cfg) {
-                Ok(()) => app.ui.status = "Audio reconnected; shared Show profile saved".into(),
+                Ok(()) => app.ui.status = "Audio reconnected; device profile saved".into(),
                 Err(error) => app.ui.status = error,
             }
         }
@@ -557,11 +557,14 @@ fn apply_audio_settings(app: &mut SoundApp, cfg: &mut soundcraft_playback::sculp
     if previous.output_name != committed.output_name {
         committed.output_uid.clear();
     }
-    committed.save().map_err(|e| format!("Cannot save shared audio settings: {e}. Previous configuration retained"))?;
+    committed.save().map_err(|e| format!("Cannot save audio settings: {e}. Previous configuration retained"))?;
     if let Some(input) = &input {
         trial.set_input(std::sync::Arc::clone(&input.monitor));
     }
     trial.locate(app.engine.transport.position);
+    if let Some(previous) = &app.player {
+        previous.close_editors();
+    }
     app.player = Some(trial);
     app.recorder = input;
     app.recorder_failed = false;

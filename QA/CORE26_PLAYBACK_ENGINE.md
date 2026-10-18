@@ -10,8 +10,11 @@ Selected capability-driven configuration approach after inspecting SoundCraft
 - Strict named device, rate and buffer selection; no silent fallback to another device or rate.
 - Input capture now honors the selected rate and buffer, using the session rate by default.
 - Stream-start errors report failure rather than claiming an active output.
-- New streams are tried before saving the unchanged SCULPT_AUDIO_V1 shared profile contract.
+- New streams are tried before saving the existing SCULPT_AUDIO_V1 device profile format.
+  The current Show source does not consume this profile; automatic device synchronization
+  with Show is not included or claimed.
 - Reconnection is rejected while playing/recording; plugin states and transport position are retained.
+  Native plugin editor windows are closed on the UI thread before replacing the player.
 - I/O retains existing physical output assignment, adjacent stereo paths and 64-channel limits.
 
 Bridge renderer, publication protocol, document model and single-project behavior are unchanged.

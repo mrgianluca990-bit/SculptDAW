@@ -1,8 +1,8 @@
-//! SCULPT_CORE22_SHARED_AUDIO: a simple atomic shared audio profile for Show and DAW.
-//! Both apps read ~/Library/Application Support/Sculpt/AudioSettings.conf.
-//! Hardware UID is authoritative for Show; DAW matches the physical output's
-//! unique display name through CPAL 0.16 (which does not expose a UID API).
-//! If names are duplicated, DAW refuses the switch instead of guessing.
+//! Existing Sculpt device-profile format at
+//! ~/Library/Application Support/Sculpt/AudioSettings.conf.
+//! The current Show source does not consume this file; automatic synchronization is not implied.
+//! The UID field is retained for compatibility. DAW matches the physical output's unique
+//! display name through CPAL 0.16, refusing ambiguous duplicate names.
 use std::path::PathBuf;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

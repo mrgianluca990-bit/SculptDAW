@@ -651,6 +651,13 @@ impl Player {
         self.side().editors.get(&(track, slot)).is_some_and(|e| e.is_open())
     }
 
+    /// Close native plugin windows on the UI thread before replacing this player.
+    pub fn close_editors(&self) {
+        for editor in self.side().editors.values_mut() {
+            editor.close();
+        }
+    }
+
     pub fn any_editor_open(&self) -> bool {
         self.side().editors.values().any(|e| e.is_open())
     }
