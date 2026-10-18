@@ -15,13 +15,15 @@ pub enum Dialog {
     Bounce { path: String, format: String, bit_depth: String, normalize: bool },
     RenameTrack { id: TrackId, name: String },
     RenameClip { id: ClipId, name: String },
+    // SCULPT_CORE16_SPOT_DIALOG: numeric placement without moving until confirmed.
+    Spot { clips: Vec<ClipId>, position_seconds: f64 },
     ClearClips { clips: Vec<ClipId>, sources: Vec<SourceId>, message: String },
     PathPrompt { cmd: String, title: String, path: String, key: String },
     Number { cmd: String, title: String, key: String, value: f64, suffix: String },
     TempoChange { at: Samples, bpm: f64 }, // from double-clicking the tempo ruler
     Fades { shape_in: String, shape_out: String, link: bool },
     StripSilence { threshold: f64, min_ms: f64, pre_ms: f64, post_ms: f64 },
-    Group { name: String, edit: bool, mix: bool, members: Vec<(u64, String, bool)> },
+    Group { id: Option<u64>, name: String, edit: bool, mix: bool, members: Vec<(u64, String, bool)> }, // SCULPT_CORE19_GROUP_DIALOG_ID
     Session { frame_rate: String, bit_depth: String },
     ScoreSetup { title: String, composer: String, bars_per_system: u32, show_track_names: bool },
     SaveChanges { then: (String, Value) },
@@ -42,6 +44,7 @@ impl Dialogs {
             Dialog::Bounce { .. } => "bounce",
             Dialog::RenameTrack { .. } => "rename_track",
             Dialog::RenameClip { .. } => "rename_clip",
+            Dialog::Spot { .. } => "spot",
             Dialog::ClearClips { .. } => "clear_clips",
             Dialog::PathPrompt { .. } => "path",
             Dialog::Number { .. } => "number",
@@ -59,6 +62,12 @@ impl Dialogs {
         self.open = Some(Dialog::RenameTrack { id, name: name.to_string() });
     }
 
+    // SCULPT_CORE16_SPOT_OPEN: same numeric destination for single or grouped clips.
+    pub fn open_spot(&mut self, clips: Vec<ClipId>, session: &Session) {
+        let Some(first) = clips.iter().filter_map(|c| session.find_clip(*c).map(|(_, c)| c.start)).min() else { return };
+        self.open = Some(Dialog::Spot { clips, position_seconds: session.sample_rate.seconds(first) });
+    }
+
     pub fn open_rename_clip(&mut self, id: ClipId, name: &str) {
         self.open = Some(Dialog::RenameClip { id, name: name.to_string() });
     }
@@ -68,6 +77,14 @@ impl Dialogs {
         let Some(message) = clear_message(e.session(), &clips, &sources) else { return false };
         self.open = Some(Dialog::ClearClips { clips, sources, message });
         true
+    }
+
+    /// SCULPT_CORE19_OPEN_EDIT_GROUP: edit existing group fields and members in-place.
+    pub fn open_edit_group(&mut self, e: &Engine, id: u64) {
+        let s = e.session();
+        let Some(g) = s.groups.iter().find(|g| g.id.0 == id) else { return };
+        let members = s.tracks.iter().map(|t| (t.id.0, t.name.clone(), g.members.contains(&t.id))).collect();
+        self.open = Some(Dialog::Group { id: Some(id), name: g.name.clone(), edit: g.edit, mix: g.mix, members });
     }
 
     /// Open the dialog for a command; false when the command has no dialog.
@@ -98,7 +115,7 @@ impl Dialogs {
                 path: if home.is_empty() {
                     format!("{name}.{}", soundcraft_engine::io::BUNDLE_EXTENSION)
                 } else {
-                    format!("{home}/{name}/{name}.scraft")
+                    format!("{home}/{name}/{name}.{}", soundcraft_model::SESSION_EXTENSION) // SCULPT_CORE16_SAVE_DIALOG
                 },
                 key: "path".into(),
             },
@@ -117,7 +134,7 @@ impl Dialogs {
             "track.group" => {
                 let s = e.session();
                 let members = s.tracks.iter().map(|t| (t.id.0, t.name.clone(), s.edit.selected_tracks.contains(&t.id))).collect();
-                Dialog::Group { name: format!("Group {}", s.groups.len() + 1), edit: true, mix: true, members }
+                Dialog::Group { id: None, name: format!("Group {}", s.groups.len() + 1), edit: true, mix: true, members } // SCULPT_CORE19_GROUP_CREATE
             }
             "setup.session" => Dialog::Session { frame_rate: e.session().frame_rate.label().into(), bit_depth: "24".into() },
             "file.score_setup" => {
@@ -250,6 +267,21 @@ fn default_dir() -> String {
 /// Show the open dialog, if any.
 pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
     audiosuite_window(app, ctx);
+    // SCULPT_CORE17_IMPORT_DIRECT: old contextual/shortcut path used to show an
+    // extra text field, then a second Browse button. Use native picker immediately.
+    if matches!(app.dialogs.open, Some(Dialog::PathPrompt { ref cmd, .. }) if cmd == "file.import_audio") {
+        app.dialogs.open = None;
+        if let Some(pick) = &app.services.pick_open_many {
+            if let Some(paths) = pick("file.import_audio", &[]) {
+                let at = app.engine.session().edit.selection.start;
+                let result = app.run("file.import_audio", json!({"paths": paths, "at": at}));
+                if let Err(e) = result {
+                    app.ui.status = e;
+                }
+            }
+        }
+        return;
+    }
     let Some(mut d) = app.dialogs.open.take() else { return };
     let mut keep = true;
     let mut action: Option<(String, Value)> = None;
@@ -261,12 +293,19 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
         Dialog::Bounce { .. } => "Bounce Mix",
         Dialog::RenameTrack { .. } => "Rename Track",
         Dialog::RenameClip { .. } => "Rename Clip",
+        Dialog::Spot { .. } => "Spot Clip",
         Dialog::ClearClips { .. } => "Clear",
         Dialog::PathPrompt { title, .. } | Dialog::Number { title, .. } => title.as_str(),
         Dialog::TempoChange { .. } => "Tempo Change (BPM)",
         Dialog::Fades { .. } => "Fades",
         Dialog::StripSilence { .. } => "Strip Silence",
-        Dialog::Group { .. } => "Create Group",
+        Dialog::Group { id, .. } => {
+            if id.is_some() {
+                "Edit Group"
+            } else {
+                "Create Group"
+            }
+        } // SCULPT_CORE19_GROUP_TITLE
         Dialog::Session { .. } => "Session Setup",
         Dialog::ScoreSetup { .. } => "Score Setup",
         Dialog::SaveChanges { then } if then.0 == "session.revert" => "Revert to Saved",
@@ -379,6 +418,20 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                         action = Some(("clip.rename".into(), json!({"clip": id.0, "name": name})));
                     }
                 }
+                // SCULPT_CORE16_SPOT_CONFIRM: exact absolute session position, undoable move.
+                Dialog::Spot { clips, position_seconds } => {
+                    ui.label("Clip start position (seconds)");
+                    ui.add(egui::DragValue::new(position_seconds).speed(0.01).range(0.0..=360000.0).fixed_decimals(3).suffix(" s"));
+                    if buttons(ui, "Spot", enter) {
+                        action = Some((
+                            "edit.move_clips".into(),
+                            json!({
+                                "clips": clips.iter().map(|c| c.0).collect::<Vec<_>>(),
+                                "to": {"seconds": *position_seconds}
+                            }),
+                        ));
+                    }
+                }
                 Dialog::ClearClips { clips, sources, message } => {
                     ui.set_max_width(340.0);
                     ui.label(message.as_str());
@@ -442,6 +495,10 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                     if buttons(ui, if replaces { "Replace" } else { "OK" }, enter && !replaces) {
                         let mut v = json!({});
                         v[key.as_str()] = json!(path);
+                        // SCULPT_CORE17_PROJECT_UI: new session/save copy creates its own folder.
+                        if cmd == "session.save_as" || cmd == "session.save_copy" {
+                            v["project_folder"] = json!(true);
+                        }
                         if replaces {
                             v["replace"] = json!(true);
                         }
@@ -473,24 +530,22 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                     ui.checkbox(link, "Link Fade In and Fade Out curves");
                     ui.horizontal(|ui| {
                         ui.label("FADE OUT");
-                        egui::ComboBox::from_id_salt("sculpt_fade_out_shape")
-                            .selected_text(shape_out.as_str()).show_ui(ui, |ui| {
-                                for s in soundcraft_model::FadeShape::ALL {
-                                    if ui.selectable_value(shape_out, s.label().to_lowercase(), s.label()).changed() && *link {
-                                        *shape_in = shape_out.clone();
-                                    }
+                        egui::ComboBox::from_id_salt("sculpt_fade_out_shape").selected_text(shape_out.as_str()).show_ui(ui, |ui| {
+                            for s in soundcraft_model::FadeShape::ALL {
+                                if ui.selectable_value(shape_out, s.label().to_lowercase(), s.label()).changed() && *link {
+                                    *shape_in = shape_out.clone();
                                 }
-                            });
+                            }
+                        });
                         ui.separator();
                         ui.label("FADE IN");
-                        egui::ComboBox::from_id_salt("sculpt_fade_in_shape")
-                            .selected_text(shape_in.as_str()).show_ui(ui, |ui| {
-                                for s in soundcraft_model::FadeShape::ALL {
-                                    if ui.selectable_value(shape_in, s.label().to_lowercase(), s.label()).changed() && *link {
-                                        *shape_out = shape_in.clone();
-                                    }
+                        egui::ComboBox::from_id_salt("sculpt_fade_in_shape").selected_text(shape_in.as_str()).show_ui(ui, |ui| {
+                            for s in soundcraft_model::FadeShape::ALL {
+                                if ui.selectable_value(shape_in, s.label().to_lowercase(), s.label()).changed() && *link {
+                                    *shape_out = shape_in.clone();
                                 }
-                            });
+                            }
+                        });
                     });
                     let out_shape = soundcraft_model::FadeShape::from_id(shape_out).unwrap_or_default();
                     let in_shape = soundcraft_model::FadeShape::from_id(shape_in).unwrap_or_default();
@@ -532,7 +587,8 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                         ));
                     }
                 }
-                Dialog::Group { name, edit, mix, members } => {
+                Dialog::Group { id, name, edit, mix, members } => {
+                    // SCULPT_CORE19_GROUP_FORM
                     ui.horizontal(|ui| {
                         ui.label("Name");
                         ui.text_edit_singleline(name);
@@ -549,7 +605,11 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                     });
                     if buttons(ui, "OK", enter) {
                         let ids: Vec<u64> = members.iter().filter(|m| m.2).map(|m| m.0).collect();
-                        action = Some(("track.group".into(), json!({"name": name, "edit": edit, "mix": mix, "tracks": ids})));
+                        action = if let Some(id) = id {
+                            Some(("track.group_update".into(), json!({"group":*id,"name":name,"edit":edit,"mix":mix,"tracks":ids})))
+                        } else {
+                            Some(("track.group".into(), json!({"name":name,"edit":edit,"mix":mix,"tracks":ids})))
+                        }; // SCULPT_CORE19_GROUP_SAVE
                     }
                 }
                 Dialog::Session { frame_rate, bit_depth } => {

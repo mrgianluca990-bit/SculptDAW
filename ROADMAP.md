@@ -1,3 +1,5 @@
+> Sculpt fork update — 2026-10-18: Core15–24 consolidated into source; development infrastructure and bidirectional bridge in feature verification. See [development status](docs/SCULPT_DEVELOPMENT.md). Upstream assessments below are historical, not new test results.
+
 # SoundCraft roadmap
 
 **Stage: pre-alpha** · next: alpha, ~5% and ~110–180 h away (the alpha gate's three failing workflows)

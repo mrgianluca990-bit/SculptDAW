@@ -78,7 +78,7 @@ pub fn tracks_and_groups(app: &mut SoundApp, ui: &mut Ui) {
             let members: Vec<u64> =
                 app.engine.session().groups.iter().find(|g| g.id.0 == id).map(|g| g.members.iter().map(|m| m.0).collect()).unwrap_or_default();
             if resp.double_clicked() {
-                let _ = app.run("edit.select", json!({"tracks": members, "exact": true}));
+                app.dialogs.open_edit_group(&app.engine, id); // SCULPT_CORE19_GROUP_EDITOR_FROM_LIST
             }
             resp.context_menu(|ui| {
                 if ui.button("Select Tracks in Group").clicked() {
@@ -96,6 +96,47 @@ pub fn tracks_and_groups(app: &mut SoundApp, ui: &mut Ui) {
             });
         }
     });
+}
+
+/// SCULPT_CORE19_GROUPS_TOP: interactive groups, selected mixer channel below.
+pub(crate) fn groups_and_selected_channel(app: &mut SoundApp, ui: &mut Ui) {
+    let total = ui.available_height();
+    panel_header(ui, "GROUPS");
+    let groups: Vec<(u64, char, String, bool, [u8; 3])> =
+        app.engine.session().groups.iter().map(|g| (g.id.0, g.letter, g.name.clone(), g.active, g.color)).collect();
+    egui::ScrollArea::vertical().id_salt("sculpt19-groups").max_height((total * 0.22).clamp(64.0, 160.0)).auto_shrink([false, false]).show(
+        ui,
+        |ui| {
+            if ui.button("+ New Group").clicked() {
+                let _ = app.dialogs.open_for_command(&app.engine, "track.group");
+            }
+            for (id, letter, name, active, color) in groups {
+                ui.horizontal(|ui| {
+                    if ui.small_button(if active { "●" } else { "○" }).on_hover_text("Toggle group").clicked() {
+                        let _ = app.run("track.group_toggle", json!({"group":id}));
+                    }
+                    let label = egui::RichText::new(format!("{letter}  {name}")).color(rgb(color));
+                    let r = ui.add(egui::Label::new(label).sense(Sense::click()));
+                    if r.double_clicked() {
+                        app.dialogs.open_edit_group(&app.engine, id);
+                    } else if r.clicked() {
+                        let members: Vec<u64> = app
+                            .engine
+                            .session()
+                            .groups
+                            .iter()
+                            .find(|g| g.id.0 == id)
+                            .map(|g| g.members.iter().map(|m| m.0).collect())
+                            .unwrap_or_default();
+                        let _ = app.run("edit.select", json!({"tracks":members,"exact":true}));
+                    }
+                });
+            }
+        },
+    );
+    ui.separator();
+    panel_header(ui, "SELECTED CHANNEL");
+    crate::mix_window::selected_channel(app, ui);
 }
 
 pub fn clip_list(app: &mut SoundApp, ui: &mut Ui) {
@@ -443,8 +484,14 @@ fn plugin_windows(app: &mut SoundApp, ctx: &egui::Context) {
                                 p.close_editor(tid, slot);
                             } else {
                                 match p.open_editor(tid, slot) {
-                                    Ok(()) => { ctx.data_mut(|d| { d.remove::<bool>(fallback_key); }); }
-                                    Err(e) => { app.ui.status = format!("{}: {e}", info.name); }
+                                    Ok(()) => {
+                                        ctx.data_mut(|d| {
+                                            d.remove::<bool>(fallback_key);
+                                        });
+                                    }
+                                    Err(e) => {
+                                        app.ui.status = format!("{}: {e}", info.name);
+                                    }
                                 }
                             }
                         }
@@ -639,4 +686,62 @@ fn preset_menu(
         }
     });
     ui.ctx().memory_mut(|m| m.data.insert_temp(key, name));
+}
+
+/// SCULPT_CORE22_GROUPS_ONLY: separate dedicated right-hand Groups panel.
+pub fn groups_only(app: &mut SoundApp, ui: &mut Ui) {
+    let t = Tokens::current();
+    panel_header(ui, "GROUPS");
+    let groups: Vec<(u64, char, String, bool, [u8; 3])> =
+        app.engine.session().groups.iter().map(|g| (g.id.0, g.letter, g.name.clone(), g.active, g.color)).collect();
+    egui::ScrollArea::vertical().id_salt("groups_scroll").auto_shrink([false, false]).show(ui, |ui| {
+        let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 17.0), Sense::hover());
+        ui.painter().text(pos2(r.min.x + 30.0, r.center().y), Align2::LEFT_CENTER, "<ALL>", regular(11.5).clone(), t.text);
+        let all = ui.interact(r, ui.id().with("group_all"), Sense::click());
+        if all.double_clicked() {
+            let _ = app.run("edit.select_all", json!({}));
+        }
+        all.context_menu(|ui| {
+            if ui.button("New Group…").clicked() {
+                let _ = app.dialogs.open_for_command(&app.engine, "track.group");
+                ui.close();
+            }
+        });
+        for (id, letter, name, active, color) in groups {
+            let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 17.0), Sense::click());
+            if active {
+                ui.painter().rect_filled(Rect::from_min_size(pos2(r.min.x + 4.0, r.min.y + 2.0), vec2(14.0, 13.0)), 1.0, rgb(color));
+            }
+            ui.painter().text(
+                pos2(r.min.x + 11.0, r.center().y),
+                Align2::CENTER_CENTER,
+                letter.to_string(),
+                bold(10.0),
+                if active { t.text_dark } else { t.text_dim },
+            );
+            ui.painter().text(pos2(r.min.x + 30.0, r.center().y), Align2::LEFT_CENTER, &name, regular(11.5), t.text);
+            if resp.clicked() {
+                let _ = app.run("track.group_toggle", json!({"group": id}));
+            }
+            let members: Vec<u64> =
+                app.engine.session().groups.iter().find(|g| g.id.0 == id).map(|g| g.members.iter().map(|m| m.0).collect()).unwrap_or_default();
+            if resp.double_clicked() {
+                app.dialogs.open_edit_group(&app.engine, id); // SCULPT_CORE19_GROUP_EDITOR_FROM_LIST
+            }
+            resp.context_menu(|ui| {
+                if ui.button("Select Tracks in Group").clicked() {
+                    let _ = app.run("edit.select", json!({"tracks": members, "exact": true}));
+                    ui.close();
+                }
+                if ui.button(if active { "Disable" } else { "Enable" }).clicked() {
+                    let _ = app.run("track.group_toggle", json!({"group": id}));
+                    ui.close();
+                }
+                if ui.button("Delete Group").clicked() {
+                    let _ = app.run("track.ungroup", json!({"group": id}));
+                    ui.close();
+                }
+            });
+        }
+    });
 }

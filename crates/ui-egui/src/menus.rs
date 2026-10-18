@@ -69,6 +69,8 @@ pub const UI_COMMANDS: &[(&str, &str, &str, Option<&str>)] = &[
     ("view.mix_section", "Mix Window View", "", None),
     ("ui.new_tracks_dialog", "New Tracks…", "", None),
     ("ui.bounce_dialog", "Bounce Mix…", "", None),
+    ("ui.publish_in_show", "Publish in Show", "", None), // SCULPT_CORE24_UI_COMMANDS
+    ("ui.publish_in_show_new", "Publish in Show as a New Cue", "", None),
     ("ui.set", "Set UI State", "", None),
     ("ui.theme", "Appearance", "", None),
 ];
@@ -200,9 +202,7 @@ const SCULPT_CORE_MENU: &str = include_str!("../../../sculpt/qa-core-menu.txt");
 
 pub fn tree() -> Vec<MenuNode> {
     let mut roots: Vec<MenuNode> = Vec::new();
-    for line in SCULPT_CORE_MENU.lines().map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-    {
+    for line in SCULPT_CORE_MENU.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with('#')) {
         insert_path(&mut roots, line);
     }
     roots
@@ -214,21 +214,24 @@ mod sculpt_core_menu_tests {
 
     #[test]
     fn only_explicit_core_items_are_displayed() {
-        let allowed: Vec<&str> = SCULPT_CORE_MENU.lines().map(str::trim)
-            .filter(|p| !p.is_empty() && !p.starts_with('#')).collect();
+        let allowed: Vec<&str> = SCULPT_CORE_MENU.lines().map(str::trim).filter(|p| !p.is_empty() && !p.starts_with('#')).collect();
         assert!((12..=45).contains(&allowed.len()), "keep the core UI intentionally small");
-        assert!(allowed.iter().all(|p| catalog::catalog().iter().any(|s| s == p)),
-            "every core entry must exist in the original menu catalog");
+        assert!(allowed.iter().all(|p| catalog::catalog().iter().any(|s| s == p)), "every core entry must exist in the original menu catalog");
         fn leaves(nodes: &[MenuNode], out: &mut Vec<String>) {
             for node in nodes {
-                if node.children.is_empty() { out.push(node.path.clone()); }
-                else { leaves(&node.children, out); }
+                if node.children.is_empty() {
+                    out.push(node.path.clone());
+                } else {
+                    leaves(&node.children, out);
+                }
             }
         }
         let mut actual = Vec::new();
         leaves(&tree(), &mut actual);
         assert_eq!(actual.len(), allowed.len());
-        for path in allowed { assert!(actual.iter().any(|s| s == path), "missing: {path}"); }
+        for path in allowed {
+            assert!(actual.iter().any(|s| s == path), "missing: {path}");
+        }
         assert!(!actual.iter().any(|s| s.starts_with("AudioSuite >")));
         assert!(!actual.iter().any(|s| s.starts_with("Event >")));
         assert!(!actual.iter().any(|s| s.starts_with("Setup >")));
@@ -250,17 +253,45 @@ pub fn menu_bar(app: &mut SoundApp, ui: &mut egui::Ui) {
                         let _ = crate::dialogs::run_or_ask(app, "app.quit", json!({}));
                     }
                 });
+                // SCULPT_CORE24_EGUI_MENU: File + Publish, Setup, remaining menus.
                 let extra = ui_aliases();
                 for root in tree() {
                     ui.menu_button(&root.label, |ui| {
                         for c in &root.children {
                             menu_node(app, ui, c, &extra);
                         }
+                        if root.label == "File" {
+                            // SCULPT_CORE24_EGUI_PUBLISH
+                            ui.separator();
+                            ui.menu_button("Publish in Show", |ui| {
+                                if ui.button("Publish in Show").clicked() {
+                                    let _ = app.run("ui.publish_in_show", json!({}));
+                                    ui.close();
+                                }
+                                if ui.button("Publish in Show as a New Cue").clicked() {
+                                    let _ = app.run("ui.publish_in_show_new", json!({}));
+                                    ui.close();
+                                }
+                            });
+                        }
                         if root.label == "AudioSuite" {
                             ui.separator();
                             ui.label(egui::RichText::new("Processes selected clips offline").small().color(t.text_dim));
                         }
                     });
+                    if root.label == "File" {
+                        // SCULPT_CORE24_EGUI_SETUP
+                        ui.menu_button("Setup", |ui| {
+                            if ui.button("Audio Settings...").clicked() {
+                                app.ui.show_playback_engine = true;
+                                ui.close();
+                            }
+                            if ui.button("I/O Setup...").clicked() {
+                                app.ui.show_io_setup = true;
+                                ui.close();
+                            }
+                        });
+                    }
                 }
                 let title = format!(
                     "{}{}  —  {}",
@@ -312,7 +343,7 @@ pub fn command_for_path(path: &str, extra: &[(&str, &str)]) -> Option<String> {
 pub fn item_state(app: &SoundApp, path: &str, id: Option<&str>) -> (bool, bool) {
     let enabled = match id {
         Some(i)
-            if i.starts_with("window.") || i.starts_with("view.mix_section") || matches!(i, "audiosuite.process" | "ui.dock" | "ui.dock.reset") =>
+            if i.starts_with("window.") || i.starts_with("view.mix_section") || matches!(i, "audiosuite.process" | "ui.dock" | "ui.dock.reset" | "ui.publish_in_show" | "ui.publish_in_show_new") /* SCULPT_CORE24_PUBLISH_ENABLED */ =>
         {
             true
         }
@@ -441,6 +472,45 @@ pub fn live_label(app: &SoundApp, id: Option<&str>) -> Option<String> {
 
 /// Menu-style invocation: may open a dialog.
 pub fn invoke_menu(app: &mut SoundApp, id: &str, path: &str) {
+    // SCULPT_CORE24_IMPORT_MENU_COUNT: intercept native & egui multi-file import.
+    if id == "file.import_audio" {
+        if let Some(pick) = &app.services.pick_open_many {
+            if let Some(paths) = pick(id, &[]) {
+                let at = app.engine.session().edit.selection.start;
+                let mut imported = 0usize;
+                let mut failed = 0usize;
+                let mut conversions = Vec::<String>::new();
+                for file in paths {
+                    // SCULPT_CORE24_IMPORT_MENU_RATES: engine returns original and session rate.
+                    match app.run("file.import_audio", json!({"path":file,"at":at})) {
+                        Ok(v) => {
+                            imported += 1;
+                            let source = v.get("source_sample_rate").and_then(Value::as_u64);
+                            let session = v.get("session_sample_rate").and_then(Value::as_u64);
+                            if let (Some(a), Some(b)) = (source, session) {
+                                if a != b {
+                                    conversions.push(format!("{a} → {b} Hz"));
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            failed += 1;
+                        }
+                    }
+                }
+                let count = conversions.len();
+                app.ui.status = format!(
+                    "Imported {imported} audio file(s) at {} Hz; {count} converted: {}",
+                    app.engine.session().sample_rate.hz(),
+                    conversions.join(", ")
+                ); // SCULPT_CORE24_IMPORT_MENU_NOTICE
+                if failed > 0 {
+                    app.ui.status.push_str(&format!("; {failed} failed"));
+                }
+            }
+            return;
+        }
+    }
     if let Some((_, w)) = MENU_WINDOWS.iter().find(|(p, _)| *p == path)
         && w.starts_with("window.")
     {
@@ -457,19 +527,50 @@ pub fn invoke_menu(app: &mut SoundApp, id: &str, path: &str) {
         if let Some(pick) = &app.services.pick_open_many {
             if let Some(paths) = pick(id, &[]) {
                 let at = app.engine.session().edit.selection.start;
-                let mut imported = 0usize;
-                let mut failed = 0usize;
-                for file in paths {
-                    if app.run("file.import_audio", json!({"path": file, "at": at})).is_ok() {
-                        imported += 1;
-                    } else {
-                        failed += 1;
-                    }
+                // SCULPT_CORE17_IMPORT_GROUP: a single multi-file import action.
+                match app.run("file.import_audio", json!({"paths": paths, "at": at})) {
+                    Ok(v) => app.ui.status = format!("Audio imported: {}", v),
+                    Err(e) => app.ui.status = e,
                 }
-                app.ui.status = format!("Imported {imported} audio file(s)" );
-                if failed > 0 {
-                    app.ui.status.push_str(&format!("; {failed} failed"));
+            }
+            return;
+        }
+    }
+    // SCULPT_CORE18_NATIVE_SESSION_PICKERS: immediate macOS Open/Save panels.
+    if id == "session.open" {
+        if let Some(pick) = &app.services.pick_open {
+            if let Some(path) = pick(id, &["scdaw", "scraft"]) {
+                let _ = crate::dialogs::run_or_ask(app, id, json!({"path": path}));
+            }
+            return;
+        }
+    }
+    if matches!(id, "session.save" | "session.save_as" | "session.save_copy") {
+        // Normal Cmd+S on a named session does NOT open an additional Save dialog.
+        if id == "session.save" && app.engine.path.is_some() {
+            let _ = app.run("session.save", json!({}));
+            return;
+        }
+        if let Some(pick) = &app.services.pick_save {
+            let default = app.engine.path.clone().unwrap_or_else(|| {
+                let name = app.engine.session().name.trim();
+                format!("{}.scdaw", if name.is_empty() { "Untitled" } else { name })
+            });
+            if let Some(chosen) = pick(id, &default) {
+                let mut path = std::path::PathBuf::from(chosen);
+                if path.extension().is_none() {
+                    path.set_extension("scdaw");
                 }
+                let cmd = if id == "session.save_copy" { "session.save_copy" } else { "session.save_as" };
+                // System Save panel handles the overwrite confirmation; retain
+                // engine's protected Save-As behavior for programmatic callers.
+                let replace = path.is_file();
+                let _ = app.run(
+                    cmd,
+                    json!({
+                        "path": path.to_string_lossy(), "project_folder": true, "replace": replace
+                    }),
+                );
             }
             return;
         }
@@ -493,6 +594,13 @@ pub fn invoke_menu(app: &mut SoundApp, id: &str, path: &str) {
 /// Keyboard shortcut for a dialog command, or one that would close a modified session: open its
 /// dialog. Returns true when handled.
 pub fn invoke_shortcut_dialog(app: &mut SoundApp, id: &str) -> bool {
+    // SCULPT_CORE18_NATIVE_SESSION_SHORTCUTS: Cmd+O and first Cmd+S are direct pickers too.
+    if (id == "session.open" && app.services.pick_open.is_some())
+        || (matches!(id, "session.save" | "session.save_as" | "session.save_copy") && app.services.pick_save.is_some())
+    {
+        invoke_menu(app, id, "");
+        return true;
+    }
     (wants_dialog(id) && app.dialogs.open_for_command(&app.engine, id)) || crate::dialogs::ask_to_save(app, id, &json!({}))
 }
 
@@ -514,6 +622,15 @@ pub fn run_ui_command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<
         json!({"value": *v})
     };
     let r = match id {
+        // SCULPT_CORE24_PUBLISH_COMMANDS: creates a handoff; Show ingestion is a separate feature.
+        "ui.publish_in_show" | "ui.publish_in_show_new" => {
+            let new_cue = id == "ui.publish_in_show_new";
+            let result = crate::sculpt_publish::publish(app, new_cue);
+            if let Err(message) = &result {
+                app.ui.status = format!("Publish in Show: {message}");
+            }
+            return Some(result);
+        }
         "window.mix" => {
             app.ui.window = MainWindow::Mix;
             json!({"window": "mix"})

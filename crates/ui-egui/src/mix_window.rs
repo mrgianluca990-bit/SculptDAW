@@ -22,14 +22,28 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
 pub(crate) fn content(app: &mut SoundApp, ui: &mut Ui) {
     let ids: Vec<TrackId> = app.engine.session().tracks.iter().filter(|x| !x.hidden && x.kind != TrackKind::Video).map(|x| x.id).collect();
     // Per-channel peaks for multichannel meters (read once per frame).
-    let snap = app.player.as_ref().filter(|_| app.meters_live()).map(|p| p.meters());
+    // SCULPT_CORE16_MIX_CACHED_METER: reuse the same 60 Hz snapshot as Edit.
+    let snap = app.player.as_ref().filter(|_| app.meters_live()).map(|_| app.meter_snapshot.clone());
     egui::ScrollArea::horizontal().auto_shrink([false, false]).show(ui, |ui| {
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 1.0;
             for id in ids {
-                strip(app, ui, id, snap.as_ref());
+                strip(app, ui, id, snap.as_ref(), None); // SCULPT_CORE19_MIX_CALL
             }
         });
+    });
+}
+
+/// SCULPT_CORE19_SELECTED_CHANNEL: same mixer controls, directly in Edit sidebar.
+pub(crate) fn selected_channel(app: &mut SoundApp, ui: &mut Ui) {
+    let Some(id) = app.engine.session().edit.selected_tracks.first().copied() else {
+        ui.label("Select a track in Edit to show its channel strip.");
+        return;
+    };
+    let snap = app.player.as_ref().filter(|_| app.meters_live()).map(|p| p.meters());
+    let width = ui.available_width().max(150.0).min(260.0);
+    egui::ScrollArea::vertical().id_salt("sculpt19-selected-strip").auto_shrink([false, false]).show(ui, |ui| {
+        strip(app, ui, id, snap.as_ref(), Some(width));
     });
 }
 
@@ -88,13 +102,14 @@ fn route_name(app: &SoundApp, r: &Route) -> String {
     }
 }
 
-fn strip(app: &mut SoundApp, ui: &mut Ui, id: TrackId, snap: Option<&MeterSnapshot>) {
+fn strip(app: &mut SoundApp, ui: &mut Ui, id: TrackId, snap: Option<&MeterSnapshot>, width: Option<f32>) {
+    // SCULPT_CORE19_REUSABLE_STRIP
     let t = Tokens::current();
     let Some(track) = app.engine.session().track(id).cloned() else { return };
     let narrow = app.ui.narrow_mix;
-    let w = strip_width(narrow);
-    let h = ui.available_height().max(560.0);
-    let (r, _) = ui.allocate_exact_size(vec2(w, h), Sense::hover());
+    let w = width.unwrap_or_else(|| strip_width(narrow)); // SCULPT_CORE19_CONTEXT_STRIP_WIDTH
+    let h = if width.is_some() { 640.0 } else { ui.available_height().max(560.0) }; // SCULPT_CORE19_CONTEXT_STRIP_HEIGHT
+    let (r, strip_response) = ui.allocate_exact_size(vec2(w, h), Sense::click()); // SCULPT_CORE22_CLICK_STRIP
     let selected = app.engine.session().edit.selected_tracks.contains(&id);
     ui.painter().rect_filled(r, 0.0, if selected { t.strip_selected } else { t.strip_bg });
     let mut y = r.min.y + 4.0;
@@ -404,12 +419,33 @@ fn strip(app: &mut SoundApp, ui: &mut Ui, id: TrackId, snap: Option<&MeterSnapsh
         StrokeKind::Inside,
     );
     ui.painter().with_clip_rect(nr).text(nr.center(), Align2::CENTER_CENTER, &track.name, bold(12.0), t.text_dark);
-    let nresp = ui.interact(nr, ui.id().with(("strip_name", id.0)), Sense::click());
-    if nresp.clicked() {
+    let nresp = ui.interact(nr, ui.id().with(("strip_name", id.0)), Sense::click_and_drag()); // SCULPT_CORE19_MIX_DRAG_SENSE
+    if nresp.clicked() || strip_response.clicked() {
+        // SCULPT_CORE22_SELECTION_SYNC
         crate::edit_window::click_track(app, id, ui.input(|i| i.modifiers), |_, t| !t.hidden && t.kind != TrackKind::Video);
     }
     if nresp.double_clicked() {
         app.dialogs.open_rename_track(id, &track.name);
+    }
+    // SCULPT_CORE19_MIX_TRACK_DRAG: drag a name to move the selected group as one block.
+    if nresp.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+    }
+    if nresp.drag_stopped() {
+        if let Some(pointer) = ui.ctx().pointer_latest_pos() {
+            let all: Vec<_> = app.engine.session().tracks.iter().filter(|t| !t.hidden && t.kind != TrackKind::Video).collect();
+            let index = all.iter().position(|t| t.id == id).unwrap_or(0);
+            let width = strip_width(app.ui.narrow_mix) + 1.0;
+            let first_x = r.min.x - (index as f32) * width;
+            let drop_index = ((pointer.x - first_x) / width + 0.5).floor().max(0.0) as usize;
+            let to = all.get(drop_index).and_then(|t| app.engine.session().track_index(t.id)).unwrap_or(app.engine.session().tracks.len());
+            let ids: Vec<u64> = if app.engine.session().edit.selected_tracks.contains(&id) {
+                app.engine.session().tracks.iter().filter(|t| app.engine.session().edit.selected_tracks.contains(&t.id)).map(|t| t.id.0).collect()
+            } else {
+                vec![id.0]
+            };
+            let _ = app.run("track.move", json!({"tracks":ids,"to":to}));
+        }
     }
     if app.ui.mix_views.iter().any(|v| v == "color") {
         ui.painter().rect_filled(Rect::from_min_size(pos2(r.min.x, r.max.y - 5.0), vec2(w, 5.0)), 0.0, rgb(track.color));
@@ -443,11 +479,33 @@ fn instrument_slot(app: &mut SoundApp, ui: &mut Ui, track: &Track, r: Rect) {
     popup.show(|ui| instrument_menu(app, ui, id));
 }
 
+#[derive(Clone)]
+struct SculptInsertDrag {
+    track: TrackId,
+    slot: usize,
+} // SCULPT_CORE19_INSERT_PAYLOAD
+
 fn insert_slot(app: &mut SoundApp, ui: &mut Ui, track: &Track, slot: usize, r: Rect) {
     let t = Tokens::current();
     let id = track.id;
     let ins = track.mixer.inserts.get(slot).cloned().flatten();
-    let resp = ui.interact(r, ui.id().with(("ins", id.0, slot)), Sense::click());
+    let resp = ui.interact(r, ui.id().with(("ins", id.0, slot)), Sense::click_and_drag()); // SCULPT_CORE19_INSERT_DND_SENSE
+    if ins.is_some() {
+        resp.dnd_set_drag_payload(SculptInsertDrag { track: id, slot });
+    }
+    if let Some(from) = resp.dnd_release_payload::<SculptInsertDrag>() {
+        let copy = ui.input(|i| i.modifiers.alt);
+        if let Err(error) = app.run(
+            "mix.insert_drag",
+            json!({"source_track":from.track.0,"source_slot":from.slot,
+            "target_track":id.0,"target_slot":slot,"copy":copy}),
+        ) {
+            app.ui.status = error;
+        }
+    }
+    if resp.dnd_hover_payload::<SculptInsertDrag>().is_some() {
+        ui.painter().rect_stroke(r, 2.0, Stroke::new(2.0, Tokens::current().accent), StrokeKind::Inside);
+    }
     let fill = match &ins {
         Some(i) if i.bypass => t.insert_bypass,
         Some(_) => t.insert_on,
@@ -614,7 +672,8 @@ pub fn plugin_info(id: &str) -> Option<&'static soundcraft_dsp::PluginInfo> {
         .or_else(|| soundcraft_au_host::plugin_info(id))
 }
 
-fn send_slot(app: &mut SoundApp, ui: &mut Ui, track: &Track, slot: usize, r: Rect) {
+// SCULPT_CORE14_SEND_SHARED_WIDGET: Edit and Mix must use this exact widget.
+pub(crate) fn send_slot(app: &mut SoundApp, ui: &mut Ui, track: &Track, slot: usize, r: Rect) {
     let t = Tokens::current();
     let id = track.id;
     let snd = track.mixer.sends.get(slot).cloned().flatten();
@@ -625,7 +684,8 @@ fn send_slot(app: &mut SoundApp, ui: &mut Ui, track: &Track, slot: usize, r: Rec
     let route_resp = ui.interact(if snd.is_some() { route_r } else { r }, ui.id().with(("snd-route", id.0, slot)), Sense::click());
     match &snd {
         Some(s) => {
-            let name = route_name(app, &s.target);
+            // SCULPT_CORE14_SEND_PREPOST_READOUT: label the state on both surfaces.
+            let name = format!("{} · {}", route_name(app, &s.target), if s.pre_fader { "PRE" } else { "POST" });
             // Level bar.
             let k = soundcraft_model::fader_db_to_pos(s.level_db);
             ui.painter().rect_filled(
@@ -688,6 +748,9 @@ fn send_slot(app: &mut SoundApp, ui: &mut Ui, track: &Track, slot: usize, r: Rec
             ui.label(egui::RichText::new("DESTINATION").size(8.0).color(Tokens::current().text_dim));
             send_route_menu(app, ui, id, slot, Some(&send.target));
             ui.separator();
+            // SCULPT_CORE14_SEND_OPTIONS: ordinary click exposes precise fader and pre/post.
+            send_options_menu(app, ui, id, slot, send);
+            ui.separator();
             if ui.button("Remove send").clicked() {
                 let _ = app.run("mix.send_remove", json!({"track": id.0, "slot": slot}));
                 ui.close();
@@ -710,7 +773,8 @@ fn send_options_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, slot: usize, 
     if ui.add(egui::Slider::new(&mut db, -60.0..=12.0).text("Level").suffix(" dB")).changed() {
         let _ = app.engine.execute_merged("mix.send_level", &json!({"track": id.0, "slot": slot, "db": db}), &format!("send:{}:{slot}", id.0));
     }
-    send_level_scale(ui, send.level_db);
+    // SCULPT_CORE16_SEND_SCALE_REMOVED: no fake meter under send level.
+    // The slider and numeric dB editor are the active controls.
     ui.horizontal(|ui| {
         for (label, delta) in [("−3", -3.0), ("−1", -1.0), ("+1", 1.0), ("+3", 3.0)] {
             if ui.small_button(label).clicked() {
@@ -739,13 +803,23 @@ fn send_options_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, slot: usize, 
             let _ = app.run("mix.send_level", json!({"track": id.0, "slot": slot, "pre_fader": pre}));
         }
     });
-    if let Route::Bus(bus) = send.target
-        && let Some(aux) =
-            app.engine.session().tracks.iter().find(|t| t.kind == TrackKind::Aux && t.mixer.input == Route::Bus(bus)).map(|t| (t.id, t.name.clone()))
-        && ui.button("Rename bus…").clicked()
-    {
-        app.dialogs.open_rename_track(aux.0, &aux.1);
-        ui.close();
+    // SCULPT_CORE16_RENAME_BUS: modify Bus.name, not the Aux track name.
+    if let Route::Bus(bus_id) = send.target {
+        if let Some(old_name) = app.engine.session().bus(bus_id).map(|b| b.name.clone()) {
+            let edit_id = egui::Id::new(("sculpt-bus-name", bus_id.0));
+            let mut proposed: String = ui.data(|d| d.get_temp(edit_id)).unwrap_or_else(|| old_name.clone());
+            ui.separator();
+            ui.label("Bus name");
+            ui.horizontal(|ui| {
+                let resp = ui.add(egui::TextEdit::singleline(&mut proposed).desired_width(120.0));
+                let confirm = ui.small_button("Rename bus").clicked() || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                if confirm && !proposed.trim().is_empty() && proposed.trim() != old_name {
+                    let _ = app.run("setup.io", json!({"action": "rename_bus", "name": old_name, "new_name": proposed.trim()}));
+                    ui.close();
+                }
+            });
+            ui.data_mut(|d| d.insert_temp(edit_id, proposed));
+        }
     }
 }
 
@@ -906,6 +980,23 @@ fn route_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, input: bool) {
             }
         }
     }
+    // SCULPT_CORE21_MIX_OUTPUT_MENU: direct hardware output selection.
+    if !input {
+        let paths = app.engine.session().outputs.clone();
+        ui.separator();
+        ui.strong("Hardware outputs");
+        for path in paths.iter().skip(1) {
+            let end = usize::from(path.first_channel) + path.format.channels();
+            if ui.button(format!("{} · Ch {}–{}", path.name, path.first_channel + 1, end)).clicked() {
+                let _ = app.run("track.output", json!({"tracks":[id.0],"output":path.name,"create_bus":false}));
+                ui.close();
+            }
+        }
+        if ui.button("I/O Setup...").clicked() {
+            app.ui.show_io_setup = true;
+            ui.close();
+        }
+    }
     ui.separator();
     let busses: Vec<String> = app.engine.session().busses.iter().map(|b| b.name.clone()).collect();
     ui.strong("Bus");
@@ -973,4 +1064,30 @@ mod sculpt_plugin_core_tests {
         assert!(menu.contains("mix.insert_bypass"));
         assert!(menu.contains("mix.insert_remove"));
     }
+}
+
+// SCULPT_CORE22_SHARED_STRIP: the Edit inspector renders this same mixer strip.
+// Selection is shared in session.edit.selected_tracks across both views.
+pub(crate) fn sculpt_core22_selected_strip(app: &mut SoundApp, ui: &mut Ui) {
+    let id = app.engine.session().edit.selected_tracks.first().copied();
+    let Some(id) = id else {
+        ui.label("Select a track to display its channel strip");
+        return;
+    };
+    // SCULPT_CORE23_STRIP_SECTIONS: do not expose PREAMP/INSTRUMENT/OBJECT or EQ.
+    let old_views = std::mem::replace(
+        &mut app.ui.mix_views,
+        ["io", "inserts_ae", "inserts_fj", "sends_ae", "sends_fj"].into_iter().map(str::to_string).collect(),
+    );
+    let old_narrow = std::mem::replace(&mut app.ui.narrow_mix, false);
+    let snap = app.player.as_ref().filter(|_| app.meters_live()).map(|p| p.meters());
+    egui::ScrollArea::vertical().id_salt("sculpt_edit_strip_scroll").auto_shrink([false, false]).show(ui, |ui| {
+        // Core19/21 use a five-argument strip signature: explicit width for Edit.
+        // SCULPT_CORE24_STRIP_HEIGHT: allow full controls + fader in the Edit ScrollArea.
+        ui.set_min_height(1100.0);
+        let strip_width = ui.available_width().clamp(155.0, 240.0); // SCULPT_CORE23_STRIP_FIT
+        strip(app, ui, id, snap.as_ref(), Some(strip_width));
+    });
+    app.ui.narrow_mix = old_narrow;
+    app.ui.mix_views = old_views;
 }

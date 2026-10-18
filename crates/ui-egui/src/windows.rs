@@ -334,8 +334,13 @@ fn workspace(app: &mut SoundApp, ctx: &egui::Context) {
                         }
                         let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
                         let ext = std::path::Path::new(&name).extension().and_then(|x| x.to_str()).unwrap_or("").to_ascii_lowercase();
-                        (is_dir || ["wav", "aif", "aiff", "flac", "mp3", "ogg", "m4a", "caf", "mid", "midi", "scraft"].contains(&ext.as_str()))
-                            .then_some((name, is_dir))
+                        (is_dir
+                            || [
+                                "wav", "aif", "aiff", "flac", "mp3", "ogg", "m4a", "caf", "mid", "midi", "scraft",
+                                "scdaw", /* SCULPT_CORE18_WORKSPACE_NATIVE */
+                            ]
+                            .contains(&ext.as_str()))
+                        .then_some((name, is_dir))
                     })
                     .collect()
             })
@@ -349,7 +354,8 @@ fn workspace(app: &mut SoundApp, ctx: &egui::Context) {
                 if r.double_clicked() {
                     if is_dir {
                         app.ui.workspace_dir = path;
-                    } else if name.ends_with(".scraft") {
+                    } else if name.ends_with(".scraft") || name.ends_with(".scdaw") {
+                        // SCULPT_CORE18_WORKSPACE_OPEN
                         let _ = crate::dialogs::run_or_ask(app, "session.open", json!({"path": path}));
                     } else if name.ends_with(".mid") || name.ends_with(".midi") {
                         let _ = app.run("file.import_midi", json!({"path": path}));
@@ -403,136 +409,159 @@ fn configurations(app: &mut SoundApp, ctx: &egui::Context) {
 }
 
 /// Setup › Playback Engine / Hardware.
+/// SCULPT_CORE22_AUDIO_SETTINGS: CoreAudio setup MUST precede I/O routing.
 pub fn playback_engine(app: &mut SoundApp, ctx: &egui::Context) {
     let mut open = app.ui.show_playback_engine;
-    win(ctx, &mut open, "Playback Engine", vec2(380.0, 220.0), |ui| {
-        egui::Grid::new("pe").num_columns(2).show(ui, |ui| {
-            ui.label("Output device");
-            ui.label(app.player.as_ref().map_or("none".to_string(), |p| p.device_name.clone()));
-            ui.end_row();
-            ui.label("Device rate");
-            ui.label(app.player.as_ref().map_or("-".to_string(), |p| format!("{} Hz", p.device_rate)));
-            ui.end_row();
-            ui.label("Session rate");
-            ui.label(format!("{} Hz", app.engine.session().sample_rate.hz()));
-            ui.end_row();
-            ui.label("Input device");
-            ui.label(
-                app.recorder
-                    .as_ref()
-                    .map_or("opened on first record".to_string(), |r| format!("{} ({} ch @ {} Hz)", r.device_name, r.channels, r.sample_rate)),
-            );
-            ui.end_row();
-            ui.label("Mix block size");
-            ui.label("512 samples (resampled to the device rate when they differ)");
-            ui.end_row();
-        });
-        let mut dc = app.engine.session().edit.delay_compensation;
-        if ui.checkbox(&mut dc, "Delay compensation").changed() {
-            let _ = app.run("options.delay_compensation", json!({"value": dc}));
+    win(ctx, &mut open, "Sculpt · Audio Settings", vec2(580.0, 435.0), |ui| {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use soundcraft_playback::sculpt_audio_settings::{AudioSettings, available_output_devices};
+            let id = egui::Id::new("sculpt_core22_audio_settings_draft");
+            let mut cfg: AudioSettings = ui.ctx().data(|d| d.get_temp(id)).unwrap_or_else(AudioSettings::read);
+            ui.heading("CoreAudio interface");
+            ui.label("A shared device profile is used by Sculpt Show and Sculpt DAW.");
+            let devices = available_output_devices();
+            ui.horizontal(|ui| {
+                ui.label("Output device");
+                egui::ComboBox::from_id_salt("sculpt_core22_audio_output")
+                    .selected_text(if cfg.output_name.is_empty() { "System default" } else { &cfg.output_name })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut cfg.output_name, String::new(), "System default");
+                        for d in &devices {
+                            ui.selectable_value(&mut cfg.output_name, d.name.clone(), format!("{} · {} out", d.name, d.channels));
+                        }
+                    });
+            });
+            ui.horizontal(|ui| {
+                ui.label("Input device");
+                ui.text_edit_singleline(&mut cfg.input_name)
+                    .on_hover_text("Optional exact CoreAudio input device name. Leave blank for default input.");
+            });
+            ui.horizontal(|ui| {
+                ui.label("Sample rate");
+                egui::ComboBox::from_id_salt("sculpt_core22_rate")
+                    .selected_text(if cfg.sample_rate == 0 { "Session rate".into() } else { format!("{} Hz", cfg.sample_rate) })
+                    .show_ui(ui, |ui| {
+                        for rate in [0, 44100, 48000, 88200, 96000, 176400, 192000] {
+                            ui.selectable_value(&mut cfg.sample_rate, rate, if rate == 0 { "Session rate".into() } else { format!("{} Hz", rate) });
+                        }
+                    });
+            });
+            ui.horizontal(|ui| {
+                ui.label("Buffer");
+                egui::ComboBox::from_id_salt("sculpt_core22_buffer")
+                    .selected_text(if cfg.buffer_frames == 0 { "Device default".into() } else { format!("{} samples", cfg.buffer_frames) })
+                    .show_ui(ui, |ui| {
+                        for frames in [0, 64, 128, 256, 512, 1024, 2048] {
+                            ui.selectable_value(
+                                &mut cfg.buffer_frames,
+                                frames,
+                                if frames == 0 { "Device default".into() } else { format!("{} samples", frames) },
+                            );
+                        }
+                    });
+            });
+            if let Some(device) = &app.player {
+                ui.separator();
+                ui.label(format!("Active: {} · {} Hz · {} output channels", device.device_name, device.device_rate, device.device_channels));
+            }
+            // SCULPT_CORE23_RATE_WARNING: distinguish device rate from session rate.
+            let project_rate = app.engine.session().sample_rate.hz();
+            ui.label(format!(
+                "Session: {} Hz · Device target: {} Hz",
+                project_rate,
+                if cfg.sample_rate == 0 { project_rate } else { cfg.sample_rate }
+            ));
+            if cfg.sample_rate > 0 && cfg.sample_rate != project_rate {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    "WARNING: hardware rate differs from session; playback is resampled. The session rate is not changed.",
+                );
+            }
+            ui.label("A device change is rejected during playback or recording. Stop transport first.");
+            let running = app.engine.transport.playing || app.engine.transport.recording;
+            if ui.add_enabled(!running, egui::Button::new("Apply and reconnect audio")).clicked() {
+                let previous = AudioSettings::read();
+                // A new choice by name must be resolved to an UID by Show when next opened.
+                if previous.output_name != cfg.output_name {
+                    cfg.output_uid.clear();
+                }
+                match cfg.save() {
+                    Ok(()) => {
+                        let trial = soundcraft_playback::Player::new(app.engine.session_arc());
+                        if trial.silent {
+                            let _ = previous.save();
+                            app.ui.status = "Audio setup failed; previous device configuration restored".into();
+                        } else {
+                            app.player = Some(trial);
+                            app.ui.status = "Audio interface reconnected; reopen Sculpt Show when idle to share it".into();
+                        }
+                    }
+                    Err(e) => app.ui.status = format!("Cannot save audio settings: {e}"),
+                }
+            }
+            ui.ctx().data_mut(|d| d.insert_temp(id, cfg));
         }
-        if ui.button("Reconnect audio device").clicked() {
-            app.player = Some(soundcraft_playback::Player::new(app.engine.session_arc()));
-        }
+        #[cfg(target_arch = "wasm32")]
+        ui.label("Native CoreAudio settings require the macOS desktop app.");
     });
     app.ui.show_playback_engine = open;
 }
 
 /// Setup › I/O: busses and output paths.
+/// SCULPT_CORE22_SIMPLE_IO: no user-editable matrix, just physical destinations.
 pub fn io_setup(app: &mut SoundApp, ctx: &egui::Context) {
     let mut open = app.ui.show_io_setup;
-    win(ctx, &mut open, "Sculpt DAW · I/O Setup", vec2(690.0, 490.0), |ui| {
-        let tab_key = egui::Id::new("sculpt_io_setup_tab");
-        let mut tab: String = ui.ctx().data(|d| d.get_temp(tab_key)).unwrap_or_else(|| "Output".into());
+    win(ctx, &mut open, "Sculpt · I/O Setup", vec2(540.0, 490.0), |ui| {
+        let count = app.player.as_ref().map(|p| usize::from(p.device_channels)).unwrap_or(0).min(64);
         ui.horizontal(|ui| {
-            for page in ["Input", "Output", "Bus"] {
-                if ui.selectable_label(tab == page, page.to_uppercase()).clicked() {
-                    tab = page.to_string();
-                }
+            ui.heading("Physical outputs");
+            if ui.button("Audio Settings…").clicked() {
+                app.ui.show_playback_engine = true;
             }
         });
-        ui.ctx().data_mut(|d| d.insert_temp(tab_key, tab.clone()));
-        ui.separator();
-        match tab.as_str() {
-            "Input" => {
-                ui.heading("Hardware Inputs");
-                ui.label("Audio inputs are provided by the active CoreAudio interface.");
-                ui.label("Per-channel input patching is not implemented in this version.");
-                if ui.button("Open Playback Engine / Hardware…").clicked() {
-                    app.ui.show_playback_engine = true;
-                }
-            }
-            "Output" => {
-                ui.heading("Output Paths");
-                ui.label("Main output format");
-                let main = app.engine.session().main_format();
-                egui::ComboBox::from_id_salt("sculpt_main_output_format")
-                    .selected_text(main.label())
-                    .show_ui(ui, |ui| {
-                        for f in soundcraft_model::ChannelFormat::ALL.into_iter().filter(|f| (2..=16).contains(&f.channels())) {
-                            if ui.selectable_label(f == main, f.label()).clicked() && f != main {
-                                let _ = app.run("setup.main_format", json!({"format": f.label()}));
-                            }
-                        }
-                    });
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.strong("Path");
-                    ui.add_space(240.0);
-                    ui.strong("Hardware channels");
-                });
-                let paths = app.engine.session().outputs.clone();
-                egui::ScrollArea::vertical().max_height(250.0).show(ui, |ui| {
-                    for p in paths {
-                        ui.horizontal(|ui| {
-                            let key = egui::Id::new(("sculpt_output_name", &p.name));
-                            let mut name: String = ui.ctx().data(|d| d.get_temp(key)).unwrap_or_else(|| p.name.clone());
-                            let response = ui.add(egui::TextEdit::singleline(&mut name).desired_width(250.0));
-                            ui.ctx().data_mut(|d| d.insert_temp(key, name.clone()));
-                            if response.lost_focus() && !name.trim().is_empty() && name != p.name {
-                                let _ = app.run("setup.io", json!({"action": "rename_output", "name": p.name, "new_name": name}));
-                            }
-                            ui.label(format!("{}–{} · {}", p.first_channel + 1, p.first_channel + p.format.channels() as u16, p.format.label()));
-                            if ui.small_button("Delete").clicked() {
-                                let _ = app.run("setup.io", json!({"action": "delete_output", "name": p.name}));
-                            }
-                        });
-                    }
-                });
-                if ui.button("+ Add Stereo Output Path").clicked() {
-                    let paths = &app.engine.session().outputs;
-                    let first = paths.iter().map(|p| p.first_channel as usize + p.format.channels()).max().unwrap_or(0);
-                    let name = format!("Out {}-{}", first + 1, first + 2);
-                    let _ = app.run("setup.io", json!({"action": "create_output", "name": name, "first_channel": first, "format": "stereo"}));
-                }
-            }
-            _ => {
-                ui.heading("Internal Busses");
-                ui.label("Rename a bus by editing its label, or create a stereo bus.");
-                let busses: Vec<(String, String)> = app.engine.session().busses.iter().map(|b| (b.name.clone(), b.format.label().to_string())).collect();
-                egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
-                    for (name, fmt) in busses {
-                        ui.horizontal(|ui| {
-                            let key = egui::Id::new(("sculpt_bus_name", &name));
-                            let mut edit: String = ui.ctx().data(|d| d.get_temp(key)).unwrap_or_else(|| name.clone());
-                            let response = ui.add(egui::TextEdit::singleline(&mut edit).desired_width(250.0));
-                            ui.ctx().data_mut(|d| d.insert_temp(key, edit.clone()));
-                            if response.lost_focus() && !edit.trim().is_empty() && edit != name {
-                                let _ = app.run("setup.io", json!({"action": "rename_bus", "name": name, "new_name": edit}));
-                            }
-                            ui.label(fmt);
-                            if ui.small_button("Delete").clicked() {
-                                let _ = app.run("setup.io", json!({"action": "delete_bus", "name": name}));
-                            }
-                        });
-                    }
-                });
-                if ui.button("+ New Stereo Bus").clicked() {
-                    let n = app.engine.session().busses.len() + 1;
-                    let _ = app.run("setup.io", json!({"action": "create_bus", "name": format!("Bus {n}"), "format": "stereo"}));
-                }
-            }
+        ui.label(app.player.as_ref().map_or("No connected audio output".into(), |p| format!("{} · {} active outputs", p.device_name, count)));
+        let selected = app.engine.session().edit.selected_tracks.first().copied();
+        let Some(track) = selected else {
+            ui.separator();
+            ui.label("Select a track in Edit or Mix to assign its output.");
+            return;
+        };
+        let current = app.engine.session().track(track).map(|t| format!("{:?}", t.mixer.output)).unwrap_or_default();
+        ui.label(format!("Track output: {current}"));
+        if ui.button("Main (monitor)").clicked() {
+            let _ = app.run("track.output", json!({"tracks":[track.0],"output":"main","create_bus":false}));
         }
+        ui.separator();
+        ui.label("Assign channel(s), with the same numbering used in Sculpt Show:");
+        egui::ScrollArea::vertical().max_height(275.0).show(ui, |ui| {
+            if count == 0 {
+                ui.label("Connect an interface in Audio Settings first.");
+                return;
+            }
+            for first in 0..count {
+                ui.horizontal(|ui| {
+                    let mono = format!("SCULPT HW MONO {:02}", first + 1);
+                    if ui.button(format!("Out {}", first + 1)).clicked() {
+                        let exists = app.engine.session().outputs.iter().any(|p| p.name == mono);
+                        if !exists {
+                            let _ = app.run("setup.io", json!({"action":"create_output","name":mono,"first_channel":first,"format":"mono"}));
+                        }
+                        let _ = app.run("track.output", json!({"tracks":[track.0],"output":mono,"create_bus":false}));
+                    }
+                    if first + 1 < count {
+                        let stereo = format!("SCULPT HW STEREO {:02}-{:02}", first + 1, first + 2);
+                        if ui.button(format!("Out {}–{}", first + 1, first + 2)).clicked() {
+                            let exists = app.engine.session().outputs.iter().any(|p| p.name == stereo);
+                            if !exists {
+                                let _ = app.run("setup.io", json!({"action":"create_output","name":stereo,"first_channel":first,"format":"stereo"}));
+                            }
+                            let _ = app.run("track.output", json!({"tracks":[track.0],"output":stereo,"create_bus":false}));
+                        }
+                    }
+                });
+            }
+        });
     });
     app.ui.show_io_setup = open;
 }

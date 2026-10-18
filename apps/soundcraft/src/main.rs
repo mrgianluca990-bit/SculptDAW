@@ -18,6 +18,9 @@ mod graphics;
 mod logging;
 #[cfg(target_os = "macos")]
 mod native_menu;
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)] // SCULPT_CORE21_FINDER_FFI_SCOPE: this one FFI module only
+mod sculpt_open_documents; // SCULPT_CORE20_FINDER_MODULE
 
 use soundcraft_engine::Engine;
 use soundcraft_ui_egui::{Services, SoundApp, UiState, dialogs};
@@ -46,8 +49,16 @@ impl eframe::App for App {
         }
         self.0.logic(ctx);
         #[cfg(target_os = "macos")]
+        sculpt_drain_finder_documents(&mut self.0); // SCULPT_CORE19_FINDER_POLL
+        #[cfg(target_os = "macos")]
         if let Some(menu) = &mut self.2 {
             menu.sync(&self.0);
+        }
+        // SCULPT_CORE20_FINDER_DRAIN: queued macOS Open Document events are
+        // delivered on the GUI thread and use the existing document handler.
+        #[cfg(target_os = "macos")]
+        for path in sculpt_open_documents::drain() {
+            open_path(&mut self.0, &path);
         }
         // Files dropped on the window: sessions open, audio/MIDI import.
         let dropped: Vec<String> =
@@ -103,9 +114,60 @@ impl eframe::App for App {
     }
 }
 
+// SCULPT_CORE21_BRIDGE_RESTORE: Show's current import creates SCULPT HW
+// physical output paths and stores stem->path in each track's comment. Resolve
+// these after session load; do not require any Show source change.
+fn sculpt_restore_show_routes(app: &mut SoundApp) {
+    let s = app.engine.session();
+    let available: Vec<String> = s.outputs.iter().map(|p| p.name.clone()).collect();
+    let updates: Vec<(u64, String, String)> = s
+        .tracks
+        .iter()
+        .filter_map(|t| {
+            if serde_json::to_value(&t.mixer.output).ok() != Some(serde_json::Value::String("Main".into())) {
+                return None;
+            } // SCULPT_CORE21_ROUTE_JSON
+            // Migrate only the unconverted Show import. A later operator choice
+            // to return a track to Main must survive a save/reopen cycle.
+            if !t.comments.contains("Prepared only:") {
+                return None;
+            }
+            let start = t.comments.find("(SCULPT HW ")? + 1;
+            let tail = &t.comments[start..];
+            let end = tail.find(')')?;
+            let path = &tail[..end];
+            let name = available.iter().find(|n| n.eq_ignore_ascii_case(path))?.clone();
+            Some((t.id.0, name, t.comments.clone()))
+        })
+        .collect();
+    for (id, path, comments) in updates {
+        if let Err(e) = app.run(
+            "track.output",
+            serde_json::json!({
+                "tracks": [id], "output": path, "create_bus": false
+            }),
+        ) {
+            log::warn!("Sculpt Show output route {id} -> {path}: {e}");
+        } else {
+            // After migration, stop treating an intentional future Main
+            // assignment as a pending import route. Keep Show stem UUID/path.
+            let migrated = comments.replace("Prepared only:", "Routing enabled:");
+            if let Err(e) = app.run(
+                "track.comments",
+                serde_json::json!({
+                    "track": id, "comments": migrated
+                }),
+            ) {
+                log::warn!("Sculpt Show route annotation {id}: {e}");
+            }
+        }
+    }
+}
+
 fn open_path(app: &mut SoundApp, p: &str) {
     let lower = p.to_ascii_lowercase();
-    let r = if lower.ends_with(".scraft") {
+    let r = if lower.ends_with(".scdaw") || lower.ends_with(".scraft") {
+        // SCULPT_CORE16_OPEN_LEGACY
         dialogs::run_or_ask(app, "session.open", serde_json::json!({"path": p}))
     } else if lower.ends_with(".mid") || lower.ends_with(".midi") || lower.ends_with(".smf") {
         app.run("file.import_midi", serde_json::json!({"path": p}))
@@ -115,6 +177,35 @@ fn open_path(app: &mut SoundApp, p: &str) {
     };
     if let Err(e) = r {
         log::warn!("{p}: {e}");
+    } else if lower.ends_with(".scdaw") || lower.ends_with(".scraft") {
+        sculpt_restore_show_routes(app); // SCULPT_CORE21_BRIDGE_ON_OPEN
+        // A newly opened Show session may require a different CoreAudio channel
+        // count. Reopen the output only on this explicit file-open event.
+        let desired = soundcraft_playback::sculpt_required_output_channels(app.engine.session());
+        let current = app.player.as_ref().map_or(0, |player| usize::from(player.device_channels));
+        if desired > current && !app.is_playing() {
+            app.player = Some(soundcraft_playback::Player::new(app.engine.session_arc()));
+        }
+        let actual = app.player.as_ref().map_or(0, |p| usize::from(p.device_channels));
+        if desired > actual {
+            app.ui.status =
+                format!("Hardware routing needs {desired} channels; device exposes {actual}. Unavailable channels are monitored on Main.");
+            log::warn!("Sculpt Bridge hardware output not fully available: requested {desired}, active {actual}");
+        }
+    }
+}
+
+/// SCULPT_CORE19_FINDER_DOCUMENTS: drain AppKit kAEOpenDocuments on the UI thread.
+#[cfg(target_os = "macos")]
+fn sculpt_drain_finder_documents(app: &mut SoundApp) {
+    let spool = std::env::temp_dir().join(format!("sculpt-open-documents-{}.txt", std::process::id()));
+    let Ok(data) = std::fs::read_to_string(&spool) else { return };
+    let _ = std::fs::remove_file(&spool);
+    for line in data.lines() {
+        if !line.is_empty() {
+            // The path is already a local filename, not a user-supplied shell command.
+            open_path(app, line);
+        }
     }
 }
 
@@ -162,7 +253,7 @@ fn services() -> Services {
         pick_open: Some(Box::new(|purpose: &str, _exts: &[&str]| {
             let d = rfd::FileDialog::new();
             let d = match purpose {
-                "session.open" => d.add_filter("Sculpt DAW Session", &["scraft"]),
+                "session.open" => d.add_filter("Sculpt DAW Session", &["scdaw", "scraft"]), // SCULPT_CORE17_OPEN_PICKER
                 "file.import_midi" => d.add_filter("MIDI", &["mid", "midi", "smf"]),
                 _ => d.add_filter(
                     "Audio",
@@ -173,13 +264,16 @@ fn services() -> Services {
         })),
         pick_open_many: Some(Box::new(|_purpose: &str, _exts: &[&str]| {
             rfd::FileDialog::new()
-                .add_filter("Audio", &["wav", "wave", "bwf", "aif", "aiff", "aifc", "flac", "mp3", "ogg", "oga", "m4a", "aac", "mp4", "caf", "mkv", "webm"])
+                .add_filter(
+                    "Audio",
+                    &["wav", "wave", "bwf", "aif", "aiff", "aifc", "flac", "mp3", "ogg", "oga", "m4a", "aac", "mp4", "caf", "mkv", "webm"],
+                )
                 .pick_files()
                 .map(|files| files.into_iter().map(|p| p.to_string_lossy().into_owned()).collect())
         })),
         pick_save: Some(Box::new(|_purpose: &str, default: &str| {
             let path = std::path::Path::new(default);
-            let mut d = rfd::FileDialog::new().add_filter("Sculpt DAW Session", &["scraft"]);
+            let mut d = rfd::FileDialog::new().add_filter("Sculpt DAW Session", &["scdaw"]); // SCULPT_CORE17_SAVE_PICKER
             if let Some(n) = path.file_name().and_then(|n| n.to_str()) {
                 d = d.set_file_name(n);
             }
@@ -206,6 +300,24 @@ fn main() -> eframe::Result {
     // Engine) is captured; see `logging`.
     let logger = logging::install();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // SCULPT_CORE20_BRIDGE_CAPABILITIES: stable versioned DAW-side contract.
+    if args.iter().any(|a| a == "--sculpt-bridge-capabilities") {
+        println!(
+            "{}",
+            serde_json::json!({
+                "protocol": "com.sculpt.bridge.daw", "version": 1,
+                "application": "audio.sculpt.daw", "sessionExtensions": ["scdaw", "scraft"],
+                "commands": ["session.open", "file.import_audio", "file.save", "transport.play", "transport.stop"],
+                "cliRelativePath": "Contents/Helpers/soundcraft-cli",
+                "hardwareRouting": {"enabled": true, "maxOutputChannels": 64,
+                                    "pathFormats": ["mono", "stereo"],
+                                    "bridgeMainPreview": true,
+                                    "unavailableOutputFallback": "main"}, // SCULPT_CORE21_BRIDGE_HW_CAPS
+                "control": {"transport": "json-lines", "enabledBy": "--control PORT", "default": "disabled"}
+            })
+        );
+        return Ok(());
+    }
     if args.iter().any(|a| a == "--version" || a == "-V") {
         println!("Sculpt DAW {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
@@ -267,17 +379,19 @@ fn main() -> eframe::Result {
     // Before eframe creates the wgpu instance: default Windows to DirectX 12 with FXC (see graphics.rs).
     #[cfg(target_os = "windows")]
     graphics::configure(&mut options, eframe::wgpu::Backends::from_env(), eframe::wgpu::Dx12Compiler::from_env());
+    #[cfg(target_os = "macos")]
+    sculpt_open_documents::install(); // SCULPT_CORE20_FINDER_INSTALL
     eframe::run_native(
         "Sculpt DAW",
         options,
         Box::new(move |cc| {
             let player = if no_audio { None } else { Some(soundcraft_playback::Player::new(Arc::new(engine.session().clone()))) };
+            #[cfg(target_os = "macos")]
+            sculpt_open_documents::install(); // SCULPT_CORE20_FINDER_REINSTALL
             let mut app = SoundApp::new(engine, player, services());
-            for (flag, cmd) in [
-                ("edit_view.io", "view.edit_io"),
-                ("edit_view.inserts_ae", "view.edit_inserts_ae"),
-                ("edit_view.inserts_fj", "view.edit_inserts_fj"),
-            ] {
+            for (flag, cmd) in
+                [("edit_view.io", "view.edit_io"), ("edit_view.inserts_ae", "view.edit_inserts_ae"), ("edit_view.inserts_fj", "view.edit_inserts_fj")]
+            {
                 if !app.engine.session().edit.flag(flag) {
                     let _ = app.run(cmd, serde_json::json!({}));
                 }

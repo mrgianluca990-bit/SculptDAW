@@ -1,3 +1,5 @@
+> Sculpt fork update — 2026-10-18: Core15–24 consolidated into source; development infrastructure and bidirectional bridge in feature verification. See [development status](SCULPT_DEVELOPMENT.md). Upstream assessments below are historical, not new test results.
+
 # Where SoundCraft falls short of Pro Tools
 
 > **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-10 · **Change:** minor (alpha blockers marked after the core-workflow gate) · **Target:** Avid Pro Tools Ultimate 2026.4.1

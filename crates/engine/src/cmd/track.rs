@@ -19,6 +19,7 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("track.group", "Group...", ["Track"], Some("Cmd+G"), "{name?, tracks?, edit?: true, mix?: true}", has_selection, group),
         cmd!("track.ungroup", "Delete Group", [], None, "{group: id|name}", always, delete_group),
         cmd!("track.group_toggle", "Toggle Group Active", [], None, "{group: id|name}", always, toggle_group),
+        cmd!("track.group_update", "Edit Group", [], None, "{group, name?, tracks?, edit?, mix?}", always, update_group), // SCULPT_CORE19_GROUP_UPDATE_SPEC
         cmd!(
             "track.duplicate",
             "Duplicate...",
@@ -68,7 +69,7 @@ pub fn specs() -> Vec<CommandSpec> {
             |t| t.hidden
         )),
         cmd!("track.pin", "Pin Track", [], None, "{tracks?}", has_selection, |e, p| flag(e, p, "track.pin", |t, v| t.pinned = v, |t| t.pinned)),
-        cmd!("track.move", "Move Track", [], None, "{track, to: index}", has_tracks, move_track),
+        cmd!("track.move", "Move Track", [], None, "{track? | tracks?: [..], to: index}", has_tracks, move_track), // SCULPT_CORE18_MOVE_SPEC
         cmd!("track.freeze", "Freeze", ["Track"], None, "{tracks?}", has_selection, |e, p| flag(
             e,
             p,
@@ -179,7 +180,7 @@ pub fn specs() -> Vec<CommandSpec> {
             }
         ),
         cmd!("track.input", "Track Input", [], None, "{tracks?, input: none|bus name|hardware name}", has_selection, |e, p| route(e, p, true)),
-        cmd!("track.output", "Track Output", [], None, "{tracks?, output: main|none|bus name}", has_selection, |e, p| route(e, p, false)),
+        cmd!("track.output", "Track Output", [], None, "{tracks?, output: main|none|bus name|hardware path}", has_tracks, |e, p| route(e, p, false)), // SCULPT_CORE21_BRIDGE_ROUTE_WITHOUT_SELECTION
         cmd!("track.timebase", "Track Timebase", [], None, "{tracks?, ticks: bool}", has_selection, |e, p| flag(
             e,
             p,
@@ -274,6 +275,31 @@ fn find_group(e: &Engine, p: &Value, cmd: &str) -> Result<GroupId> {
         _ => None,
     };
     g.map(|g| g.id).ok_or_else(|| bad(cmd, "unknown `group`"))
+}
+
+/// SCULPT_CORE19_GROUP_UPDATE: modification is one undoable session command.
+fn update_group(e: &mut Engine, p: &Value) -> Result<Value> {
+    let id = find_group(e, p, "track.group_update")?;
+    let name = str_param(p, "name").map(str::trim).map(str::to_owned);
+    if name.as_ref().is_some_and(|s| s.is_empty()) {
+        return Err(bad("track.group_update", "empty name"));
+    }
+    let members = if p.get("tracks").is_some() { Some(tracks_param(e, "track.group_update", p)?) } else { None };
+    let s = e.session_mut();
+    let g = s.groups.iter_mut().find(|g| g.id == id).ok_or_else(|| bad("track.group_update", "missing group"))?;
+    if let Some(v) = name {
+        g.name = v;
+    }
+    if let Some(v) = members {
+        g.members = v;
+    }
+    if let Some(v) = p.get("edit").and_then(serde_json::Value::as_bool) {
+        g.edit = v;
+    }
+    if let Some(v) = p.get("mix").and_then(serde_json::Value::as_bool) {
+        g.mix = v;
+    }
+    Ok(json!({"group":id.0}))
 }
 
 fn delete_group(e: &mut Engine, p: &Value) -> Result<Value> {
@@ -513,14 +539,53 @@ fn view(e: &mut Engine, p: &Value) -> Result<Value> {
 }
 
 fn move_track(e: &mut Engine, p: &Value) -> Result<Value> {
-    let t = track_param(e, "track.move", p, "track")?.ok_or_else(|| bad("track.move", "`track` required"))?;
-    let to = i64_or(p, "to", 0).max(0) as usize;
-    let s = e.session_mut();
-    if let Some(i) = s.track_index(t) {
-        let tr = s.tracks.remove(i);
-        s.tracks.insert(to.min(s.tracks.len()), tr);
+    // SCULPT_CORE18_GROUP_TRACK_MOVE: atomic reorder across selected rows.
+    let s = e.session();
+    let requested: Vec<TrackId> = if let Some(values) = p.get("tracks").and_then(Value::as_array) {
+        values.iter().filter_map(Value::as_u64).map(TrackId).collect()
+    } else if let Some(id) = track_param(e, "track.move", p, "track")? {
+        vec![id]
+    } else {
+        s.edit.selected_tracks.clone()
+    };
+    let selected: std::collections::HashSet<TrackId> = requested.into_iter().collect();
+    if selected.is_empty() {
+        return Err(bad("track.move", "no tracks selected"));
     }
-    Ok(json!({}))
+    let original = &s.tracks;
+    let requested_to = i64_or(p, "to", 0).max(0) as usize;
+    // Existing one-track command used a post-removal index; keep that API stable.
+    let legacy_single = p.get("tracks").is_none() && selected.len() == 1;
+    let moving_index = original.iter().position(|t| selected.contains(&t.id));
+    let desired = if legacy_single && moving_index.is_some_and(|i| i < requested_to) { requested_to.saturating_add(1) } else { requested_to };
+    // Master remains the final output strip, never a row that audio tracks pass.
+    let master_pos = original.iter().position(|t| t.kind == TrackKind::Master).unwrap_or(original.len());
+    let to = desired.min(master_pos);
+    let before = original.iter().take(to).filter(|t| selected.contains(&t.id) && t.kind != TrackKind::Master).count();
+    let moving: Vec<TrackId> = original.iter().filter(|t| selected.contains(&t.id) && t.kind != TrackKind::Master).map(|t| t.id).collect();
+    if moving.is_empty() {
+        return Ok(json!({"moved": 0}));
+    }
+    let original_ids: Vec<TrackId> = original.iter().map(|t| t.id).collect();
+    let s = e.session_mut();
+    let mut block = Vec::new();
+    let mut rest = Vec::new();
+    for track in std::mem::take(&mut s.tracks) {
+        if moving.contains(&track.id) {
+            block.push(track);
+        } else {
+            rest.push(track);
+        }
+    }
+    let count = block.len();
+    let position = to.saturating_sub(before).min(rest.len());
+    rest.splice(position..position, block);
+    if rest.iter().map(|t| t.id).eq(original_ids.iter().copied()) {
+        s.tracks = rest;
+        return Ok(json!({"moved": 0, "to": position}));
+    }
+    s.tracks = rest;
+    Ok(json!({"moved": count, "to": position}))
 }
 
 fn commit(e: &mut Engine, p: &Value) -> Result<Value> {
@@ -631,6 +696,8 @@ fn route(e: &mut Engine, p: &Value, input: bool) -> Result<Value> {
     if let Route::Hardware(name) = &r
         && create_bus
         && !name.to_ascii_lowercase().starts_with("in ")
+        && !s.outputs.iter().any(|out| out.name.eq_ignore_ascii_case(name))
+    // SCULPT_CORE21_ROUTE_PRESERVE_HARDWARE
     {
         let fmt = tracks
             .first()
@@ -653,6 +720,40 @@ fn route(e: &mut Engine, p: &Value, input: bool) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sculpt_core18_reorders_multiple_tracks_as_one_block() {
+        let mut e = Engine::default();
+        let ids: Vec<u64> = ["A", "B", "C", "D", "E"]
+            .iter()
+            .map(|name| e.session_mut().add_track(TrackKind::Audio, soundcraft_model::ChannelFormat::Mono, Some(name)).0)
+            .collect();
+        e.execute("track.move", &json!({"tracks": [ids[0], ids[1]], "to": 4})).unwrap();
+        let labels: Vec<&str> = e.session().tracks.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(labels, ["C", "D", "A", "B", "E"]);
+        e.execute("track.move", &json!({"tracks": [ids[2], ids[3]], "to": 5})).unwrap();
+        let labels: Vec<&str> = e.session().tracks.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(labels, ["A", "B", "E", "C", "D"]);
+        e.execute("edit.undo", &json!({})).unwrap();
+        let labels: Vec<&str> = e.session().tracks.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(labels, ["C", "D", "A", "B", "E"]);
+    }
+
+    #[test]
+    fn sculpt_core19_group_editor_updates_existing_group() {
+        let mut e = Engine::default();
+        let a = e.session_mut().add_track(TrackKind::Audio, ChannelFormat::Mono, Some("A"));
+        let b = e.session_mut().add_track(TrackKind::Audio, ChannelFormat::Mono, Some("B"));
+        e.execute("edit.select", &json!({"tracks":[a.0]})).unwrap();
+        let g = e.execute("track.group", &json!({"tracks":[a.0],"name":"G"})).unwrap()["group"].as_u64().unwrap();
+        e.execute("track.group_update", &json!({"group":g,"name":"New Group","tracks":[a.0,b.0],"mix":false})).unwrap();
+        assert_eq!(e.session().groups.len(), 1);
+        assert_eq!(e.session().groups[0].name, "New Group");
+        assert_eq!(e.session().groups[0].members.len(), 2);
+        assert!(!e.session().groups[0].mix);
+        e.execute("edit.undo", &json!({})).unwrap();
+        assert_eq!(e.session().groups[0].members.len(), 1);
+    }
 
     #[test]
     fn comp_from_alternate_playlist() {

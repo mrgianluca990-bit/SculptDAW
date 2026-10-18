@@ -7,7 +7,7 @@ use crate::{
 use soundcraft_time::{FrameRate, GridValue, Range, SampleRate, Samples, TempoMap, TimeFormat};
 
 /// Native session file extension.
-pub const SESSION_EXTENSION: &str = "scraft";
+pub const SESSION_EXTENSION: &str = "scdaw"; // SCULPT_CORE16_NATIVE_EXTENSION
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum SessionError {

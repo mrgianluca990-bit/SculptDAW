@@ -43,10 +43,24 @@ impl NativeMenu {
         app_menu.append(&PredefinedMenuItem::separator())?;
         native.add_item(app, &app_menu, "Quit Sculpt DAW", "", Some("app.quit".into()))?;
         native.menu.append(&app_menu)?;
+        // SCULPT_CORE24_NATIVE_MENU: File (including Publish), Setup, remaining menus.
         let aliases = menus::ui_aliases();
         for root in menus::tree() {
             let submenu = native.add_branch(app, &root, &aliases)?;
+            if root.label == "File" {
+                let publish = Submenu::new("Publish in Show", true);
+                native.add_item(app, &publish, "Publish in Show", "", Some("ui.publish_in_show".into()))?;
+                native.add_item(app, &publish, "Publish in Show as a New Cue", "", Some("ui.publish_in_show_new".into()))?;
+                submenu.append(&PredefinedMenuItem::separator())?;
+                submenu.append(&publish)?;
+            }
             native.menu.append(&submenu)?;
+            if root.label == "File" {
+                let setup = Submenu::new("Setup", true);
+                native.add_item(app, &setup, "Audio Settings...", "", Some("window.playback_engine".into()))?;
+                native.add_item(app, &setup, "I/O Setup...", "", Some("window.io_setup".into()))?;
+                native.menu.append(&setup)?;
+            }
         }
         native.menu.init_for_nsapp();
         let ctx = ctx.clone();
@@ -73,7 +87,11 @@ impl NativeMenu {
     fn add_item(&mut self, app: &SoundApp, parent: &Submenu, label: &str, path: &str, command: Option<String>) -> muda::Result<()> {
         let (enabled, checked) = menus::item_state(app, path, command.as_deref());
         // egui owns keyboard shortcuts, so a key press is dispatched only once.
-        let display = match label { "Inserts F-J" => "Inserts F-H", "Sends F-J" => "Sends F-H", _ => label };
+        let display = match label {
+            "Inserts F-J" => "Inserts F-H",
+            "Sends F-J" => "Sends F-H",
+            _ => label,
+        };
         let item = CheckMenuItem::new(display, enabled, checked, None);
         parent.append(&item)?;
         self.entries.push(Entry { item, command, path: path.into(), enabled, checked });

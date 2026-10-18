@@ -14,27 +14,7 @@ export CARGO_TARGET_DIR="$ROOT/target"
 export SOUNDCRAFT_BUILD_SHA="$(git rev-parse HEAD 2>/dev/null || echo source-archive)"
 VERSION=0.4.0
 
-# CORE20 and CORE21 must overlay the full Core19 source restored by the GitHub workflow.
-# The patch aborts immediately if the upstream file shapes have drifted.
-python3 -m py_compile QA/SculptDAW_Core20_Patch.py
-python3 QA/SculptDAW_Core20_Patch.py
-python3 -m py_compile QA/SculptDAW_Core21_IO_Patch.py
-python3 QA/SculptDAW_Core21_IO_Patch.py
-# Core22 must run after all legacy overlays, before the universal release build.
-python3 -m py_compile QA/SculptDAW_Core22_Patch.py
-python3 QA/SculptDAW_Core22_Patch.py
-# DAW Core23: tested field corrections after the stable Core22 overlay.
-python3 -m py_compile QA/SculptDAW_Core23_Patch.py
-python3 QA/SculptDAW_Core23_Patch.py
-# Sculpt DAW Core24: publish handoff, menu order and regression fixes.
-python3 -m py_compile QA/SculptDAW_Core24_Patch.py
-python3 QA/SculptDAW_Core24_Patch.py
-# We validate the final, actually packaged source (the earlier workflow tests
-# run before the patch for historical reasons).
-cargo check --locked --target x86_64-apple-darwin -p sculpt-daw
-# Real DSP test: channel 64 + no-device Main fallback, not just UI snapshots.
-cargo test --locked --target x86_64-apple-darwin -p soundcraft-mix --lib sculpt_core21_hardware_output64
-
+# Sources are committed in their final form. Packaging never rewrites Rust.
 for target in aarch64-apple-darwin x86_64-apple-darwin; do
   rustup target add "$target"
   cargo build --release --locked --target "$target" -p sculpt-daw -p soundcraft-cli

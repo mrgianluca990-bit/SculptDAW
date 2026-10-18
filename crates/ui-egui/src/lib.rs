@@ -19,6 +19,7 @@ pub mod ops_windows;
 pub mod palette;
 pub mod panels;
 pub mod score_editor;
+pub mod sculpt_publish; // SCULPT_CORE24_PUBLISH_MODULE
 pub mod shortcuts;
 pub mod theme;
 pub mod toolbar;
@@ -66,6 +67,8 @@ pub struct UiState {
     pub show_clip_list: bool,
     pub show_transport: bool,
     pub show_memory_locations: bool,
+    pub sculpt_core20_marker_placed: bool, // SCULPT_CORE20_LAYOUT_FIELD
+    pub sculpt_core20_marker_placed_mix: bool,
     pub show_big_counter: bool,
     pub show_undo_history: bool,
     pub show_session_info: bool,
@@ -83,6 +86,8 @@ pub struct UiState {
     /// Fade/crossfade highlighted in Edit; selecting one does not select or delete its clip.
     #[serde(skip)]
     pub selected_fade: Option<FadeSelection>,
+    #[serde(skip)]
+    pub selected_group_fades: Vec<FadeSelection>, // SCULPT_CORE24_FADE_STATE
     pub audiosuite: Option<String>,
     pub status: String,
     pub show_automation: bool,
@@ -97,6 +102,8 @@ pub struct UiState {
     pub show_configurations: bool,
     pub show_playback_engine: bool,
     pub show_io_setup: bool,
+    pub sculpt_core22_layout_migrated: bool, // SCULPT_CORE22_LAYOUT_FLAG
+    pub sculpt_core23_layout_migrated: bool, // SCULPT_CORE23_LAYOUT_FLAG
     pub show_shortcuts: bool,
     pub show_clip_effects: bool,
     pub show_beat_detective: bool,
@@ -127,10 +134,12 @@ impl Default for UiState {
             docking: docking::Workspace::default(),
             mix_docking: docking::mix_default(),
             window: MainWindow::Edit,
-            show_tracks_list: true,
-            show_clip_list: true,
+            show_tracks_list: false, // SCULPT_CORE22_NO_TRACKS_SIDEBAR
+            show_clip_list: false,
             show_transport: false,
-            show_memory_locations: false,
+            show_memory_locations: true,        // SCULPT_CORE22_MARKERS_VISIBLE
+            sculpt_core20_marker_placed: false, // SCULPT_CORE20_LAYOUT_DEFAULT
+            sculpt_core20_marker_placed_mix: false,
             show_big_counter: false,
             show_undo_history: false,
             show_session_info: false,
@@ -143,6 +152,7 @@ impl Default for UiState {
             edit_views: vec!["color".into()],
             plugin_windows: Vec::new(),
             selected_fade: None,
+            selected_group_fades: Vec::new(), // SCULPT_CORE24_FADE_DEFAULT
             audiosuite: None,
             status: String::new(),
             show_automation: false,
@@ -157,6 +167,8 @@ impl Default for UiState {
             show_configurations: false,
             show_playback_engine: false,
             show_io_setup: false,
+            sculpt_core22_layout_migrated: false, // SCULPT_CORE22_LAYOUT_INIT
+            sculpt_core23_layout_migrated: false, // SCULPT_CORE23_LAYOUT_DEFAULT
             show_shortcuts: false,
             show_clip_effects: false,
             show_beat_detective: false,
@@ -255,7 +267,7 @@ pub struct SoundApp {
     pub meters: HashMap<TrackId, MeterDisplay>,
     pub main_meter: MeterDisplay,
     /// Reused multichannel snapshot; populated at an adaptive rate by `logic`.
-    meter_snapshot: soundcraft_playback::MeterSnapshot,
+    pub(crate) meter_snapshot: soundcraft_playback::MeterSnapshot, // SCULPT_CORE16_METER_SNAPSHOT
     pub gesture: Option<Gesture>,
     pub edit_layout: edit_window::EditLayout,
     pub midi: midi_editor::MidiEditorState,
@@ -374,6 +386,16 @@ impl SoundApp {
                         format!("Session opened: {name} — {missing} missing audio file(s)")
                     };
                 }
+                // SCULPT_CORE24_IMPORT_UI_WARNING: e.message alone is not the UI status.
+                if id == "file.import_audio" {
+                    let source = v.get("source_sample_rate").and_then(Value::as_u64).unwrap_or(0);
+                    let rate = v.get("session_sample_rate").and_then(Value::as_u64).unwrap_or(0);
+                    self.ui.status = if source > 0 && source != rate {
+                        format!("Imported and RESAMPLED: {} Hz → {} Hz (session rate unchanged)", source, rate)
+                    } else {
+                        format!("Imported audio at {} Hz", rate)
+                    };
+                }
                 if id == "options.scrolling" {
                     // Re-selecting a scrolling mode resumes the playhead follow.
                     self.edit_layout.follow_hold = false;
@@ -384,7 +406,13 @@ impl SoundApp {
                 Ok(v)
             }
             Err(e) => {
-                self.ui.status = e.to_string();
+                if id == "session.open" {
+                    // SCULPT_CORE14_SESSION_ERROR_PATH: do not hide the exact restart error.
+                    let path = params.get("path").and_then(Value::as_str).unwrap_or("(unknown path)");
+                    self.ui.status = format!("Unable to open session [{}]: {}", path, e);
+                } else {
+                    self.ui.status = e.to_string();
+                }
                 log::warn!("{id}: {e}");
                 Err(e.to_string())
             }
@@ -711,6 +739,7 @@ impl SoundApp {
                     self.punch = None;
                     self.gesture = None;
                     self.ui.selected_fade = None;
+                    self.ui.selected_group_fades.clear(); // SCULPT_CORE24_FADE_RESET
                     self.touched.clear();
                     self.last_write_at = i64::MIN;
                     self.edit_layout.follow_hold = false;
@@ -773,7 +802,8 @@ impl SoundApp {
                 self.engine.transport.position = p.position();
             }
             let now = self.last_frame.unwrap_or_default();
-            let meter_interval = if self.ui.window == MainWindow::Mix { 1.0 / 60.0 } else { 1.0 / 20.0 };
+            // SCULPT_CORE14_METER_PARITY: same sampling/ballistics in Edit and Mix.
+            let meter_interval = 1.0 / 60.0;
             if now - self.last_meter_poll >= meter_interval {
                 p.copy_meters(&mut self.meter_snapshot);
                 self.last_meter_poll = now;
@@ -863,7 +893,16 @@ impl SoundApp {
         // Autosave and the macOS menu bar only run on frames, and plugin editors are native windows egui never hears from.
         // egui takes its predicted frame time off every delay, so add it back.
         let editors = self.player.as_ref().is_some_and(Player::any_editor_open);
-        ctx.request_repaint_after_secs(if editors { 0.03 } else { 1.0 } + ctx.input(|i| i.predicted_dt));
+        // SCULPT_CORE16_LIVE_REPAINT: the 60 Hz audio meter needs 60 Hz frames.
+        let active = self.meters_live();
+        let repaint = if active {
+            0.0
+        } else if editors {
+            0.03
+        } else {
+            1.0
+        };
+        ctx.request_repaint_after_secs(repaint + if active { 0.0 } else { ctx.input(|i| i.predicted_dt) });
         control::collect_screenshots(self, ctx);
     }
 

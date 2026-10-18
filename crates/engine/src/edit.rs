@@ -221,6 +221,8 @@ pub fn trim_to(s: &mut Session, track: TrackId, range: Range) -> usize {
             n += 1;
         }
     }
+    // SCULPT_CORE15_UPSTREAM_070_TRIM_ORDER: retain chronological order.
+    pl.sort();
     n
 }
 
@@ -284,6 +286,29 @@ pub fn move_clips(s: &mut Session, ids: &[ClipId], delta: Samples, to_track: Opt
     // SCULPT_CORE_GROUP_MOVE_PRESERVES_XFADE_V1: extract *all* moving clips first,
     // clear destination material before inserting any, then append all moving clips together.
     // The former per-clip place_clip() erased the overlap of the preceding moved clip.
+    // SCULPT_CORE17_GROUP_TRACK_OFFSETS: for multi-track selections the
+    // destination is relative to the first (dragged) clip's track.
+    let mut destinations = std::collections::HashMap::<TrackId, TrackId>::new();
+    if let Some(dest) = to_track {
+        let order: Vec<TrackId> = s.tracks.iter().map(|t| t.id).collect();
+        let Some(anchor) = ids.iter().find_map(|id| s.find_clip(*id).map(|(tid, _)| tid)) else { return 0 };
+        let Some(from_idx) = order.iter().position(|t| *t == anchor) else { return 0 };
+        let Some(to_idx) = order.iter().position(|t| *t == dest) else { return 0 };
+        let shift = to_idx as isize - from_idx as isize;
+        for id in ids {
+            let Some((from, _)) = s.find_clip(*id) else { continue };
+            let Some(idx) = order.iter().position(|t| *t == from) else { return 0 };
+            let new_idx = idx as isize + shift;
+            if new_idx < 0 || new_idx >= order.len() as isize {
+                return 0;
+            }
+            let target = order[new_idx as usize];
+            if s.track(target).is_none_or(|t| !t.kind.has_playlist()) {
+                return 0;
+            }
+            destinations.insert(from, target);
+        }
+    }
     let moving_ids: std::collections::HashSet<ClipId> = ids.iter().copied().collect();
     let mut joints = Vec::new();
     for t in &s.tracks {
@@ -295,15 +320,8 @@ pub fn move_clips(s: &mut Session, ids: &[ClipId], delta: Samples, to_track: Opt
             }
         }
     }
-    // Moving only one side breaks the crossfade association intentionally; remove
-    // both linked fades so no misleading standalone fade remains.
-    for (a, b, key) in &joints {
-        if moving_ids.contains(a) != moving_ids.contains(b) {
-            if let Some(c) = s.find_clip_mut(*a) { c.fade_out = Fade::default(); }
-            if let Some(c) = s.find_clip_mut(*b) { c.fade_in = Fade::default(); }
-            s.edit.values.remove(key);
-        }
-    }
+    // SCULPT_CORE14_LIVE_CROSSFADE: decide whether to unlink only AFTER moving.
+    // An unchanged physical overlap must remain a crossfade, not two broken fades.
     let mut moving: Vec<(TrackId, Clip)> = Vec::new();
     for t in &mut s.tracks {
         let tid = t.id;
@@ -312,7 +330,9 @@ pub fn move_clips(s: &mut Session, ids: &[ClipId], delta: Samples, to_track: Opt
                 if moving_ids.contains(&c.id) && !c.time_locked && !c.edit_locked {
                     moving.push((tid, c.clone()));
                     false
-                } else { true }
+                } else {
+                    true
+                }
             });
         }
     }
@@ -320,19 +340,70 @@ pub fn move_clips(s: &mut Session, ids: &[ClipId], delta: Samples, to_track: Opt
     let mut relocated = Vec::with_capacity(n);
     for (tid, mut c) in moving {
         c.start = c.start.saturating_add(delta).max(0);
-        relocated.push((to_track.unwrap_or(tid), c));
+        relocated.push((destinations.get(&tid).copied().unwrap_or(tid), c)); // SCULPT_CORE17_GROUP_TARGET
     }
-    // Clear only STATIONARY material before any of the moved clips are inserted.
-    for (target, c) in &relocated { clear_range(s, *target, c.range(), false); }
+    // Clear only STATIONARY material before any moved clips are inserted.
+    // SCULPT_CORE14_PROTECT_XFADE_PARTNER: moving one side of a linked crossfade
+    // must not trim its stationary partner while both still overlap on the same track.
+    for (target, c) in &relocated {
+        let preserve_linked_partner = joints.iter().any(|(a, b, _)| {
+            if moving_ids.contains(a) == moving_ids.contains(b) || (c.id != *a && c.id != *b) {
+                return false;
+            }
+            let partner = if c.id == *a { *b } else { *a };
+            s.find_clip(partner)
+                .is_some_and(|(tid, peer)| tid == *target && c.is_audio() && peer.is_audio() && c.start < peer.end() && peer.start < c.end())
+        });
+        if !preserve_linked_partner {
+            clear_range(s, *target, c.range(), false);
+        }
+    }
     for (target, c) in relocated {
-        if let Some(pl) = s.track_mut(target).and_then(|t| t.playlist_mut()) { pl.clips.push(c); }
+        if let Some(pl) = s.track_mut(target).and_then(|t| t.playlist_mut()) {
+            pl.clips.push(c);
+        }
     }
-    for t in &mut s.tracks { if let Some(pl) = t.playlist_mut() { pl.sort(); } }
-    // Keep the saved, undoable crossfade seam aligned with the pair when both move.
+    for t in &mut s.tracks {
+        if let Some(pl) = t.playlist_mut() {
+            pl.sort();
+        }
+    }
+    // SCULPT_CORE14_UPDATE_XFADE_OVERLAP: recalculate both fades from the real
+    // overlap. A crossfade never turns into an unpaired fade after a clip drag.
     for (a, b, key) in joints {
-        if moving_ids.contains(&a) && moving_ids.contains(&b)
-            && let Some(v) = s.edit.values.get_mut(&key)
-        { *v = (*v + delta as f64).max(0.0); }
+        let updated = match (s.find_clip(a), s.find_clip(b)) {
+            (Some((ta, left)), Some((tb, right)))
+                if ta == tb && left.is_audio() && right.is_audio() && left.start <= right.start && left.end() > right.start =>
+            {
+                Some((right.start, left.end(), left.length.min(right.length)))
+            }
+            _ => None,
+        };
+        if let Some((overlap_start, overlap_end, usable)) = updated {
+            let len = (overlap_end - overlap_start).min(usable).max(1);
+            if let Some(left) = s.find_clip_mut(a) {
+                left.fade_out.len = len;
+            }
+            if let Some(right) = s.find_clip_mut(b) {
+                right.fade_in.len = len;
+            }
+            if let Some(seam) = s.edit.values.get_mut(&key) {
+                if moving_ids.contains(&a) && moving_ids.contains(&b) {
+                    *seam = (*seam + delta as f64).max(0.0);
+                } else if moving_ids.contains(&a) || moving_ids.contains(&b) {
+                    *seam = (*seam).clamp(overlap_start as f64, overlap_end as f64);
+                }
+            }
+        } else if moving_ids.contains(&a) || moving_ids.contains(&b) {
+            // The overlap is gone: these fades are no longer a crossfade.
+            if let Some(left) = s.find_clip_mut(a) {
+                left.fade_out = Fade::default();
+            }
+            if let Some(right) = s.find_clip_mut(b) {
+                right.fade_in = Fade::default();
+            }
+            s.edit.values.remove(&key);
+        }
     }
     n
 }
@@ -350,22 +421,22 @@ pub fn create_fades(s: &mut Session, track: TrackId, range: Range, shape: FadeSh
 }
 
 /// Fade-out and fade-in curves can be independently selected, as in the Pro Tools fade dialog.
-pub fn create_fades_with_shapes(
-    s: &mut Session, track: TrackId, range: Range, shape_out: FadeShape, shape_in: FadeShape,
-) -> usize {
+pub fn create_fades_with_shapes(s: &mut Session, track: TrackId, range: Range, shape_out: FadeShape, shape_in: FadeShape) -> usize {
     if range.is_empty() {
         return 0;
     }
     // Resizing an existing crossfade must be one undoable edit. Restore the saved
     // original cut before recomputing handles, so previous extensions do not accumulate.
     let rebuild: Vec<(ClipId, ClipId, Samples)> = s.track(track).map_or_else(Vec::new, |tr| {
-        tr.clips().windows(2).filter_map(|pair| {
-            let (a, b) = (&pair[0], &pair[1]);
-            let original = s.edit.values.get(&sculpt_xfade_join_key(a.id, b.id))?;
-            let seam = *original as Samples;
-            (range.start < seam && seam < range.end && a.end() > b.start && a.fade_out.len > 0 && b.fade_in.len > 0)
-                .then_some((a.id, b.id, seam))
-        }).collect()
+        tr.clips()
+            .windows(2)
+            .filter_map(|pair| {
+                let (a, b) = (&pair[0], &pair[1]);
+                let original = s.edit.values.get(&sculpt_xfade_join_key(a.id, b.id))?;
+                let seam = *original as Samples;
+                (range.start < seam && seam < range.end && a.end() > b.start && a.fade_out.len > 0 && b.fade_in.len > 0).then_some((a.id, b.id, seam))
+            })
+            .collect()
     });
     if let Some(pl) = s.track_mut(track).and_then(|t| t.playlist_mut()) {
         for (aid, bid, seam) in rebuild {
@@ -463,13 +534,17 @@ pub fn delete_selected_fade(s: &mut Session, track: TrackId, id: ClipId, other: 
         let Some(pl) = s.track_mut(track).and_then(|t| t.playlist_mut()) else { return 0 };
         let Some(i) = pl.clips.iter().position(|c| c.id == id) else { return 0 };
         let Some(j) = pl.clips.iter().position(|c| c.id == next) else { return 0 };
-        if j != i + 1 { return 0; }
+        if j != i + 1 {
+            return 0;
+        }
         let (a, b) = (&pl.clips[i], &pl.clips[j]);
         if !a.is_audio() || !b.is_audio() || a.end() <= b.start || a.fade_out.len == 0 || b.fade_in.len == 0 {
             return 0;
         }
         let seam = original.map_or(b.start + (a.end() - b.start) / 2, |v| v as Samples);
-        if seam <= a.start || seam >= b.end() { return 0; }
+        if seam <= a.start || seam >= b.end() {
+            return 0;
+        }
         let left = &mut pl.clips[i];
         left.fade_out = Fade::default();
         left.trim_end_to(seam);
@@ -481,7 +556,9 @@ pub fn delete_selected_fade(s: &mut Session, track: TrackId, id: ClipId, other: 
     }
     let Some(c) = s.track_mut(track).and_then(|t| t.playlist_mut()).and_then(|p| p.clips.iter_mut().find(|c| c.id == id)) else { return 0 };
     let fade = if fade_in { &mut c.fade_in } else { &mut c.fade_out };
-    if fade.len <= 0 { return 0; }
+    if fade.len <= 0 {
+        return 0;
+    }
     *fade = Fade::default();
     1
 }
@@ -493,12 +570,10 @@ pub fn delete_fades(s: &mut Session, track: TrackId, range: Range) -> usize {
     let mut used_keys = Vec::new();
     let Some(pl) = s.track_mut(track).and_then(|t| t.playlist_mut()) else { return 0 };
     let selected = |start: Samples, end: Samples| -> bool {
-        if end <= start { return false; }
-        if range.is_empty() {
-            start <= range.start && range.start < end
-        } else {
-            start < range.end && range.start < end
+        if end <= start {
+            return false;
         }
+        if range.is_empty() { start <= range.start && range.start < end } else { start < range.end && range.start < end }
     };
     let mut changed = 0usize;
     pl.sort();
@@ -509,7 +584,9 @@ pub fn delete_fades(s: &mut Session, track: TrackId, range: Range) -> usize {
         }
         let key = sculpt_xfade_join_key(a.id, b.id);
         let seam = remembered.get(&key).map_or(b.start + (a.end() - b.start) / 2, |x| *x as Samples);
-        if seam <= a.start || seam >= b.end() { continue; }
+        if seam <= a.start || seam >= b.end() {
+            continue;
+        }
         if let Some(left) = pl.clips.get_mut(i) {
             left.fade_out = Fade::default();
             left.trim_end_to(seam);
@@ -531,9 +608,13 @@ pub fn delete_fades(s: &mut Session, track: TrackId, range: Range) -> usize {
             c.fade_out = Fade::default();
             erased = true;
         }
-        if erased { changed += 1; }
+        if erased {
+            changed += 1;
+        }
     }
-    for key in used_keys { s.edit.values.remove(&key); }
+    for key in used_keys {
+        s.edit.values.remove(&key);
+    }
     changed
 }
 
@@ -568,6 +649,56 @@ mod tests {
     }
 
     #[test]
+    fn sculpt_core14_one_clip_move_keeps_actual_crossfade() {
+        let (mut s, t) = session_with_clip();
+        let a = s.track(t).unwrap().clips()[0].id;
+        let b = s.new_clip_id();
+        if let Some(pl) = s.track_mut(t).and_then(|t| t.playlist_mut()) {
+            pl.clips.push(Clip::audio(b, "second", SourceId(500), 5000, 5000, 2500));
+            pl.sort();
+        }
+        assert!(create_fades(&mut s, t, Range::new(4750, 5250), FadeShape::EqualPower) > 0);
+        let key = sculpt_xfade_join_key(a, b);
+        assert!(s.edit.values.contains_key(&key));
+        assert_eq!(move_clips(&mut s, &[b], 100, None), 1);
+        let (left, right) = (s.find_clip(a).unwrap().1, s.find_clip(b).unwrap().1);
+        let overlap = left.end() - right.start;
+        assert!(overlap > 0, "still overlapping after moving the incoming clip");
+        assert_eq!(left.fade_out.len, overlap, "outgoing fade must follow overlap");
+        assert_eq!(right.fade_in.len, overlap, "incoming fade must follow overlap");
+        assert!(s.edit.values.contains_key(&key), "join must survive partial move");
+        assert_eq!(move_clips(&mut s, &[b], 1000, None), 1);
+        assert!(!s.edit.values.contains_key(&key), "join must go when overlap ends");
+        assert_eq!(s.find_clip(a).unwrap().1.fade_out.len, 0);
+        assert_eq!(s.find_clip(b).unwrap().1.fade_in.len, 0);
+    }
+
+    #[test]
+    fn sculpt_core15_trim_keeps_chronological_order() {
+        let (mut s, t) = session_with_clip();
+        let second = s.new_clip_id();
+        if let Some(pl) = s.track_mut(t).and_then(|t| t.playlist_mut()) {
+            pl.clips.push(Clip::audio(second, "earlier", SourceId(500), 0, 500, 2000));
+        }
+        let _ = trim_to(&mut s, t, Range::new(100, 8000));
+        let list = s.track(t).unwrap().clips();
+        assert_eq!(list.len(), 2);
+        assert!(list.windows(2).all(|w| w[0].start <= w[1].start));
+    }
+
+    #[test]
+    fn sculpt_core17_multitrack_group_move_keeps_rows_and_relative_positions() {
+        let (mut s, a) = session_with_clip();
+        let b = s.add_track(soundcraft_model::TrackKind::Audio, soundcraft_model::ChannelFormat::Mono, Some("B"));
+        let c = s.add_track(soundcraft_model::TrackKind::Audio, soundcraft_model::ChannelFormat::Mono, Some("C"));
+        let aid = s.track(a).unwrap().clips()[0].id;
+        let bid = s.new_clip_id();
+        s.track_mut(b).unwrap().playlist_mut().unwrap().clips.push(Clip::audio(bid, "B", SourceId(501), 1000, 1000, 2000));
+        assert_eq!(move_clips(&mut s, &[aid, bid], 500, Some(b)), 2);
+        assert_eq!(s.find_clip(aid).map(|(tid, c)| (tid, c.start)), Some((b, 1500)));
+        assert_eq!(s.find_clip(bid).map(|(tid, c)| (tid, c.start)), Some((c, 1500)));
+    }
+    #[test]
     fn sculpt_core_group_move_keeps_crossfade() {
         let (mut s, t) = session_with_clip();
         let first = s.track(t).unwrap().clips()[0].id;
@@ -577,18 +708,18 @@ mod tests {
             pl.sort();
         }
         let key = sculpt_xfade_join_key(first, second);
-        assert!(create_fades(&mut s, t, Range::new(4750, 5250), FadeShape::EqualPower)>0);
+        assert!(create_fades(&mut s, t, Range::new(4750, 5250), FadeShape::EqualPower) > 0);
         let original = *s.edit.values.get(&key).expect("crossfade seam");
-        assert_eq!(move_clips(&mut s, &[first,second], 1000, None), 2);
+        assert_eq!(move_clips(&mut s, &[first, second], 1000, None), 2);
         let v = s.track(t).unwrap().clips();
-        assert_eq!(v.len(),2, "moving two clips must not delete one side");
-        assert!(v[0].end()>v[1].start, "overlap must survive group move");
-        assert!(v[0].fade_out.len>0 && v[1].fade_in.len>0, "both fades remain linked");
-        assert_eq!(s.edit.values.get(&key).copied(),Some(original+1000.0));
+        assert_eq!(v.len(), 2, "moving two clips must not delete one side");
+        assert!(v[0].end() > v[1].start, "overlap must survive group move");
+        assert!(v[0].fade_out.len > 0 && v[1].fade_in.len > 0, "both fades remain linked");
+        assert_eq!(s.edit.values.get(&key).copied(), Some(original + 1000.0));
         assert_eq!(move_clips(&mut s, &[second], 1500, None), 1);
         assert!(!s.edit.values.contains_key(&key));
-        assert_eq!(s.find_clip(first).unwrap().1.fade_out.len,0);
-        assert_eq!(s.find_clip(second).unwrap().1.fade_in.len,0);
+        assert_eq!(s.find_clip(first).unwrap().1.fade_out.len, 0);
+        assert_eq!(s.find_clip(second).unwrap().1.fade_in.len, 0);
     }
 
     #[test]
@@ -721,4 +852,37 @@ mod tests {
         s.find_clip_mut(id).unwrap().time_locked = true;
         assert_eq!(move_clips(&mut s, &[id], 500, None), 0);
     }
+}
+
+/// SCULPT_CORE23_GROUP_EDIT_HELPERS: resolve active Edit group membership.
+pub fn sculpt_group_tracks(s: &soundcraft_model::Session, track: soundcraft_model::TrackId) -> Vec<soundcraft_model::TrackId> {
+    let mut out = vec![track];
+    for g in &s.groups {
+        if g.active && g.edit && g.members.contains(&track) {
+            for id in &g.members {
+                if !out.contains(id) {
+                    out.push(*id);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A clip gesture is applied to overlapping clips on other active Edit-group tracks.
+/// Preserve the original clicked clip and avoid duplicate IDs.
+pub fn sculpt_group_clips(s: &soundcraft_model::Session, selected: &[soundcraft_model::ClipId]) -> Vec<soundcraft_model::ClipId> {
+    let mut out = selected.to_vec();
+    for cid in selected {
+        let Some((track, clip)) = s.find_clip(*cid) else { continue };
+        for member in sculpt_group_tracks(s, track) {
+            let Some(t) = s.track(member) else { continue };
+            for c in t.clips() {
+                if c.start < clip.end() && c.end() > clip.start && !out.contains(&c.id) {
+                    out.push(c.id);
+                }
+            }
+        }
+    }
+    out
 }

@@ -64,7 +64,12 @@ pub fn import_audio_bytes(e: &mut Engine, name: &str, bytes: &[u8], path: Option
     if buf.frames() == 0 {
         return Err(EngineError::Io(format!("{name}: no audio")));
     }
+    // SCULPT_CORE23_IMPORT_RATE_NOTICE: sources are resampled by add_source.
+    if buf.sample_rate > 0 && buf.sample_rate != e.session().sample_rate.hz() {
+        e.message(format!("{}: imported at {} Hz, resampled to session {} Hz", name, buf.sample_rate, e.session().sample_rate.hz()));
+    }
     let channels = buf.num_channels();
+    let original_rate = buf.sample_rate; // SCULPT_CORE24_IMPORT_ORIGINAL_RATE
     let s = e.session_mut();
     let src = add_source(s, name, buf, path, info.format);
     if let (Some(bwf), Some(sx)) = (info.bwf.as_ref(), s.sources.last_mut()) {
@@ -81,7 +86,8 @@ pub fn import_audio_bytes(e: &mut Engine, name: &str, bytes: &[u8], path: Option
     let cid = s.new_clip_id();
     let stem = s.source(src).map(|x| x.name.clone()).unwrap_or_default();
     crate::edit::place_clip(s, track, Clip::audio(cid, stem, src, 0, at, frames));
-    Ok(json!({"track": track, "clip": cid, "source": src, "frames": frames, "channels": channels}))
+    Ok(json!({"track": track, "clip": cid, "source": src, "frames": frames, "channels": channels,
+              "source_sample_rate":original_rate,"session_sample_rate":s.sample_rate.hz()})) // SCULPT_CORE24_IMPORT_RESULT_RATE
 }
 
 /// Import a movie: a Video track clip spanning the picture (the movie is referenced by `path`,
@@ -320,6 +326,11 @@ pub fn bounce_stems_with(e: &Engine, dir: &str, r: Range, opts: &EncodeOptions, 
         let mut solo = s.clone();
         for t in &mut solo.tracks {
             t.mixer.solo = t.id == id;
+            if t.id == id {
+                // SCULPT_CORE24_STEM_MONITOR: a hardware-only route would render silence
+                // in an offline Main bounce. Preserve the original session unchanged.
+                t.mixer.output = soundcraft_model::Route::Main;
+            }
         }
         let (ch, fmt) = render_main(&solo, r, fold_stereo);
         let buf = AudioBuffer { sample_rate: s.sample_rate.hz(), channels: ch };
@@ -543,6 +554,8 @@ fn write_session(session: &Session, path: &str, overwrite: bool) -> Result<(Sess
     let p = session_file(path);
     let dir = p.parent().map(Path::to_path_buf).unwrap_or_default();
     let audio_dir = dir.join("Audio Files");
+    // SCULPT_CORE17_AUDIO_FOLDER: project layout exists from first save.
+    std::fs::create_dir_all(&audio_dir).map_err(|err| EngineError::Io(format!("{}: {err}", audio_dir.display())))?;
     let mut s = session.clone();
     let from = s.folder.clone();
     let same_dir = from.as_deref().is_some_and(|f| same_path(f, &dir));
@@ -659,7 +672,34 @@ fn back_up(file: &Path) {
 /// extension and isn't an existing file.
 pub fn session_file(path: &str) -> PathBuf {
     let p = PathBuf::from(path);
-    if p.extension().is_none() && !p.is_file() { p.with_extension(soundcraft_model::SESSION_EXTENSION) } else { p }
+    // SCULPT_CORE16_SESSION_LOOKUP: first try the native extension, then legacy.
+    if p.extension().is_none() && !p.is_file() {
+        let native = p.with_extension(soundcraft_model::SESSION_EXTENSION);
+        if native.exists() {
+            return native;
+        }
+        let legacy = p.with_extension("scraft");
+        if legacy.exists() {
+            return legacy;
+        }
+        return native;
+    }
+    p
+}
+
+/// SCULPT_CORE17_PROJECT_FOLDER: a new native project always gets its own folder.
+/// Existing sessions keep their exact paths, including legacy .scraft files.
+pub fn sculpt_project_file(path: &str) -> PathBuf {
+    let file = session_file(path);
+    if file.exists() || file.extension().and_then(|x| x.to_str()) != Some(soundcraft_model::SESSION_EXTENSION) {
+        return file;
+    }
+    let Some(stem) = file.file_stem().and_then(|x| x.to_str()) else { return file };
+    if file.parent().and_then(Path::file_name).and_then(|x| x.to_str()) == Some(stem) {
+        return file;
+    }
+    let Some(filename) = file.file_name() else { return file };
+    file.with_file_name(stem).join(filename)
 }
 
 /// True when `command` would write a session over the existing `file`. Save, Save As and Save
@@ -1338,5 +1378,32 @@ mod sculpt_core_session_roundtrip_tests {
         again.execute("session.open", &json!({"path":base.join("My Sculpt Session").to_str().unwrap()})).unwrap();
         assert_eq!(again.session().tracks[0].clips()[0].fade_in.len, 600);
         let _ = std::fs::remove_dir_all(base);
+    }
+}
+
+#[cfg(test)]
+mod sculpt_core16_file_type_tests {
+    use super::*;
+
+    #[test]
+    fn sculpt_core16_scdaw_is_native_and_scraft_remains_readable() {
+        assert_eq!(soundcraft_model::SESSION_EXTENSION, "scdaw");
+        let root = std::env::temp_dir().join(format!("sculpt-core16-types-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&root);
+        let native = root.join("Native.scdaw");
+        let legacy = root.join("Legacy.scraft");
+        let json = Session::default().to_json().unwrap();
+        std::fs::write(&native, &json).unwrap();
+        std::fs::write(&legacy, &json).unwrap();
+        for p in [&native, &legacy] {
+            let mut e = Engine::default();
+            let missing = open_session(&mut e, p.to_str().unwrap()).unwrap();
+            assert!(missing.is_empty());
+            assert!(e.path.as_deref().is_some_and(|s| s == p.to_str().unwrap()));
+        }
+        assert_eq!(session_file(root.join("Native").to_str().unwrap()), native);
+        assert_eq!(session_file(root.join("Legacy").to_str().unwrap()), legacy);
+        assert_eq!(session_file(root.join("New Project").to_str().unwrap()), root.join("New Project.scdaw"));
+        let _ = std::fs::remove_dir_all(root);
     }
 }

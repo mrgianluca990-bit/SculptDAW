@@ -12,12 +12,9 @@ pub const HEADER_W: f32 = 236.0;
 pub const COLUMN_W: f32 = 112.0;
 
 /// Optional Edit-window columns (View › Edit Window Views) that are switched on.
-pub fn edit_columns(s: &Session) -> Vec<&'static str> {
-    let all = s.edit.flag("edit_view.all");
-    ["io", "inserts_ae", "inserts_fj", "sends_ae", "sends_fj", "comments"]
-        .into_iter()
-        .filter(|c| all || s.edit.flag(&format!("edit_view.{c}")))
-        .collect()
+pub fn edit_columns(_s: &Session) -> Vec<&'static str> {
+    // SCULPT_CORE19_EDIT_NO_MIX_COLUMNS: timeline stays clean; selected channel is in the sidebar.
+    Vec::new()
 }
 
 pub fn header_width(s: &Session) -> f32 {
@@ -89,6 +86,15 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
     if app.ui.show_universe {
         egui::Panel::top("universe").exact_size(64.0).frame(egui::Frame::NONE.fill(Tokens::current().universe_bg)).show(ui, |ui| universe(app, ui));
     }
+    // SCULPT_CORE22_EDIT_LEFT_STRIP: channel strip identical to the mixer, never bottom docked.
+    // egui 0.36 uses Panel::{left,right}, default_size/min_size/max_size.
+    egui::Panel::left("sculpt_core22_channel_strip")
+        .resizable(true)
+        .default_size(180.0)
+        .min_size(155.0)
+        .max_size(240.0) // SCULPT_CORE23_STRIP_WIDTH
+        .frame(egui::Frame::NONE.fill(t.panel_bg2))
+        .show(ui, |ui| crate::mix_window::sculpt_core22_selected_strip(app, ui));
     crate::docking::show(app, ui, crate::MainWindow::Edit);
 }
 
@@ -706,7 +712,9 @@ fn track_row(app: &mut SoundApp, ui: &mut Ui, id: TrackId, row: Rect, tl: Rect) 
         }
         draw_clip(app, &painter, &s, &track, clip, tl, lane, auto_view.is_some());
     }
-    sculpt_draw_crossfades(&painter, &s, &track, tl, lane, app.ui.selected_fade);
+    // SCULPT_CORE24_FADE_LINKED_HIGHLIGHT: each linked track renders its selected fade.
+    let active_fade = app.ui.selected_group_fades.iter().copied().find(|f| f.track == track.id).or(app.ui.selected_fade);
+    sculpt_draw_crossfades(&painter, &s, &track, tl, lane, active_fade);
     crate::video_track::draw_lane(app, &painter, &s, &track, tl, lane);
     if let Some(p) = &auto_view {
         draw_automation(&painter, &s, &track, p, tl, lane);
@@ -842,11 +850,13 @@ fn track_header(app: &mut SoundApp, ui: &mut Ui, track: &Track, head: Rect, sele
         // Convert the visible-row index to a session index.
         let s = app.engine.session();
         let to = rows.get(target_row).and_then(|(tid, _)| s.track_index(TrackId(*tid))).unwrap_or(s.tracks.len());
-        let from = s.track_index(id).unwrap_or(0);
-        let to = if to > from { to - 1 } else { to };
-        if to != from {
-            let _ = app.run("track.move", json!({"track": id.0, "to": to}));
-        }
+        // SCULPT_CORE18_GROUP_TRACK_DRAG: do not lose selected rows on drag.
+        let ids: Vec<u64> = if s.edit.selected_tracks.contains(&id) {
+            s.tracks.iter().filter(|t| s.edit.selected_tracks.contains(&t.id)).map(|t| t.id.0).collect()
+        } else {
+            vec![id.0]
+        };
+        let _ = app.run("track.move", json!({"tracks": ids, "to": to}));
     }
     // Playlist selector arrow.
     let pl_r = Rect::from_min_size(pos2(name_r.max.x + 3.0, name_r.min.y), vec2(16.0, 17.0));
@@ -964,18 +974,27 @@ fn track_header(app: &mut SoundApp, ui: &mut Ui, track: &Track, head: Rect, sele
     } else {
         crate::widgets::meter(ui, mr, md.level[0], md.hold[0], md.clip);
     }
-    // Volume readout and inserts summary.
-    let info = format!("vol {}  pan {}", crate::widgets::db_text(m.volume_db), m.pan.first().map_or("-".into(), |p| crate::widgets::pan_text(*p)));
-    ui.painter().text(pos2(view_r.max.x + 8.0, view_r.center().y), Align2::LEFT_CENTER, info, regular(10.0), t.text_dim);
-    let ins: Vec<&str> = m.inserts.iter().flatten().filter_map(|i| soundcraft_dsp::plugin_info(&i.plugin).map(|p| p.short_name)).collect();
-    if !ins.is_empty() {
-        ui.painter().with_clip_rect(Rect::from_min_max(pos2(am_r.max.x + 6.0, am_r.min.y), pos2(head.max.x - 20.0, am_r.max.y))).text(
-            pos2(am_r.max.x + 8.0, am_r.center().y),
-            Align2::LEFT_CENTER,
-            ins.join(" · "),
-            regular(10.0),
-            t.text_dim,
-        );
+    // SCULPT_CORE16_EDIT_FADER_PAN: editable track volume and pan in Edit, same
+    // engine commands and grouped undo semantics as the Mix window.
+    let edit_value_x = view_r.max.x + 5.0;
+    let vol_r = Rect::from_min_size(pos2(edit_value_x, view_r.min.y), vec2(72.0, 16.0));
+    let mut cvol = ui.new_child(egui::UiBuilder::new().max_rect(vol_r));
+    let mut db = m.volume_db;
+    if cvol
+        .add(egui::DragValue::new(&mut db).speed(0.1).range(-144.0..=12.0).fixed_decimals(1).prefix("V ").suffix(" dB"))
+        .on_hover_text("Track volume: drag or double-click to type")
+        .changed()
+    {
+        let _ = app.engine.execute_merged("mix.volume", &json!({"track": id.0, "db": db}), &format!("fader:{}", id.0));
+    }
+    if let Some(&p) = m.pan.first() {
+        let pan_r = Rect::from_min_size(pos2(edit_value_x, am_r.min.y), vec2(72.0, 16.0));
+        let mut cpan = ui.new_child(egui::UiBuilder::new().max_rect(pan_r));
+        let mut amount = (p * 100.0).round();
+        let resp = cpan.add(egui::DragValue::new(&mut amount).speed(1.0).range(-100.0..=100.0).fixed_decimals(0).prefix("P "));
+        if resp.on_hover_text("Track pan: -100=L, 0=C, +100=R; drag or double-click to type").changed() {
+            let _ = app.engine.execute_merged("mix.pan", &json!({"track": id.0, "pan": amount / 100.0, "index": 0}), &format!("pan:{}:0", id.0));
+        }
     }
 }
 
@@ -1036,7 +1055,8 @@ fn header_column(app: &mut SoundApp, ui: &mut Ui, track: &Track, col: &str, r: R
                     let by_fill = if insert.bypass { t.insert_bypass } else { t.insert_on };
                     ui.painter().rect_filled(bypass_rect, 2.0, by_fill);
                     ui.painter().text(bypass_rect.center(), Align2::CENTER_CENTER, "B", regular(9.0), t.text);
-                    if ui.interact(bypass_rect, ui.id().with(("sculpt_edit_insert_bypass", track.id.0, slot)), Sense::click())
+                    if ui
+                        .interact(bypass_rect, ui.id().with(("sculpt_edit_insert_bypass", track.id.0, slot)), Sense::click())
                         .on_hover_text(if insert.bypass { "Enable plugin" } else { "Bypass plugin" })
                         .clicked()
                     {
@@ -1053,15 +1073,10 @@ fn header_column(app: &mut SoundApp, ui: &mut Ui, track: &Track, col: &str, r: R
         "sends_ae" | "sends_fj" => {
             let off = if col == "sends_ae" { 0 } else { 5 };
             for i in 0..(if off == 5 { 3 } else { 5 }).min(rows) {
-                let s = track
-                    .mixer
-                    .sends
-                    .get(off + i)
-                    .cloned()
-                    .flatten()
-                    .map(|x| format!("{} {:.0}", route(&x.target), x.level_db.max(-99.0)))
-                    .unwrap_or_default();
-                text(ui, item(i), &s, t.text);
+                // SCULPT_CORE14_EDIT_SEND_SHARED: one control implementation in Edit and Mix.
+                // Empty send: click to assign a bus. Active send: destination, amount,
+                // pre/post-fader, mute and pan all use the same controls as Mix.
+                crate::mix_window::send_slot(app, ui, track, off + i, item(i));
             }
         }
         _ => {
@@ -1185,12 +1200,19 @@ fn sculpt_draw_crossfades(painter: &egui::Painter, s: &Session, track: &Track, t
         }
         let x0 = x_of(s, tl, b.start);
         let x1 = x_of(s, tl, a.end());
-        if x1 < tl.min.x || x0 > tl.max.x || (x1 - x0) < 3.0 { continue; }
+        if x1 < tl.min.x || x0 > tl.max.x || (x1 - x0) < 3.0 {
+            continue;
+        }
         let area = Rect::from_min_max(pos2(x0, lane.min.y + 1.0), pos2(x1, lane.max.y - 1.0));
         // SCULPT_CORE_XFADE_PAINT_V1: subtle overlap with two distinguishable envelopes.
         painter.rect_filled(area, 0.0, Color32::from_rgba_unmultiplied(210, 215, 220, 26));
         let chosen = selection.is_some_and(|f| f.track == track.id && f.clip == a.id && f.other == Some(b.id));
-        painter.rect_stroke(area, 0.0, Stroke::new(if chosen { 3.0 } else { 1.5 }, if chosen { Color32::from_rgb(255, 248, 175) } else { Color32::from_rgb(230, 190, 105) }), StrokeKind::Inside);
+        painter.rect_stroke(
+            area,
+            0.0,
+            Stroke::new(if chosen { 3.0 } else { 1.5 }, if chosen { Color32::from_rgb(255, 248, 175) } else { Color32::from_rgb(230, 190, 105) }),
+            StrokeKind::Inside,
+        );
         let mut outgoing = Vec::new();
         let mut incoming = Vec::new();
         for i in 0..=32 {
@@ -1350,21 +1372,27 @@ fn draw_clip(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track
     }
     // SCULPT_CORE_XFADE_SINGLE_OVERLAY_V1: a crossfade is drawn only by sculpt_draw_crossfades.
     // Prevent the same two envelopes from also looking like independent corner fades.
-    let crossfade_in = track.clips().windows(2).any(|p| p[1].id == clip.id && p[0].end() > p[1].start
-        && p[0].fade_out.len > 0 && p[1].fade_in.len > 0);
-    let crossfade_out = track.clips().windows(2).any(|p| p[0].id == clip.id && p[0].end() > p[1].start
-        && p[0].fade_out.len > 0 && p[1].fade_in.len > 0);
+    let crossfade_in =
+        track.clips().windows(2).any(|p| p[1].id == clip.id && p[0].end() > p[1].start && p[0].fade_out.len > 0 && p[1].fade_in.len > 0);
+    let crossfade_out =
+        track.clips().windows(2).any(|p| p[0].id == clip.id && p[0].end() > p[1].start && p[0].fade_out.len > 0 && p[1].fade_in.len > 0);
     // Sculpt: fades must stay legible against waveforms, even without selecting the clip.
     let fade_col = Color32::from_rgba_unmultiplied(255, 255, 255, 225);
-    let select_in = app.ui.selected_fade.is_some_and(|f| f.track == track.id && f.clip == clip.id && f.other.is_none() && f.fade_in);
-    let select_out = app.ui.selected_fade.is_some_and(|f| f.track == track.id && f.clip == clip.id && f.other.is_none() && !f.fade_in);
+    let select_in = app.ui.selected_group_fades.iter().any(|f| f.track == track.id && f.clip == clip.id && f.other.is_none() && f.fade_in)
+        || app.ui.selected_fade.is_some_and(|f| f.track == track.id && f.clip == clip.id && f.other.is_none() && f.fade_in); // SCULPT_CORE24_FADE_IN_HIGHLIGHT
+    let select_out = app.ui.selected_group_fades.iter().any(|f| f.track == track.id && f.clip == clip.id && f.other.is_none() && !f.fade_in)
+        || app.ui.selected_fade.is_some_and(|f| f.track == track.id && f.clip == clip.id && f.other.is_none() && !f.fade_in); // SCULPT_CORE24_FADE_OUT_HIGHLIGHT
     if clip.fade_in.len > 0 && !crossfade_in {
         let fx = x_of(s, tl, clip.start + clip.fade_in.len);
-        if fx > x0 { painter.rect_filled(Rect::from_min_max(pos2(x0, body_r.min.y), pos2(fx, body_r.max.y)), 0.0, Color32::from_white_alpha(16)); }
+        if fx > x0 {
+            painter.rect_filled(Rect::from_min_max(pos2(x0, body_r.min.y), pos2(fx, body_r.max.y)), 0.0, Color32::from_white_alpha(16));
+        }
     }
     if clip.fade_out.len > 0 && !crossfade_out {
         let fx = x_of(s, tl, clip.end() - clip.fade_out.len);
-        if x1 > fx { painter.rect_filled(Rect::from_min_max(pos2(fx, body_r.min.y), pos2(x1, body_r.max.y)), 0.0, Color32::from_white_alpha(16)); }
+        if x1 > fx {
+            painter.rect_filled(Rect::from_min_max(pos2(fx, body_r.min.y), pos2(x1, body_r.max.y)), 0.0, Color32::from_white_alpha(16));
+        }
     }
     if clip.fade_in.len > 0 && !crossfade_in {
         let fx = x_of(s, tl, clip.start + clip.fade_in.len);
@@ -1374,7 +1402,10 @@ fn draw_clip(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track
                 pos2(x0 + (fx - x0) * k, body_r.max.y - body_r.height() * clip.fade_in.shape.gain(k))
             })
             .collect();
-        painter.add(Shape::line(pts, Stroke::new(if select_in { 3.0 } else { 2.0 }, if select_in { Color32::from_rgb(255, 224, 112) } else { fade_col })));
+        painter.add(Shape::line(
+            pts,
+            Stroke::new(if select_in { 3.0 } else { 2.0 }, if select_in { Color32::from_rgb(255, 224, 112) } else { fade_col }),
+        ));
         painter.line_segment([pos2(x0, body_r.min.y), pos2(fx, body_r.min.y)], Stroke::new(1.0, fade_col));
     }
     if clip.fade_out.len > 0 && !crossfade_out {
@@ -1385,7 +1416,10 @@ fn draw_clip(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track
                 pos2(fx + (x1 - fx) * k, body_r.max.y - body_r.height() * clip.fade_out.shape.gain(1.0 - k))
             })
             .collect();
-        painter.add(Shape::line(pts, Stroke::new(if select_out { 3.0 } else { 2.0 }, if select_out { Color32::from_rgb(255, 224, 112) } else { fade_col })));
+        painter.add(Shape::line(
+            pts,
+            Stroke::new(if select_out { 3.0 } else { 2.0 }, if select_out { Color32::from_rgb(255, 224, 112) } else { fade_col }),
+        ));
     }
     // Optional clip overlays (View › Clip).
     let ov = Color32::from_rgb(16, 16, 16);
@@ -1537,20 +1571,22 @@ fn clip_gain_popup(ctx: &egui::Context, fader_bottom: Pos2, pos: f32) {
 
 /// Locate the fade explicitly clicked, without selecting or deleting the audio clip.
 fn sculpt_fade_at_pointer(s: &Session, track: &Track, tl: Rect, lane: Rect, p: Pos2) -> Option<FadeSelection> {
-    if !lane.contains(p) { return None; }
+    if !lane.contains(p) {
+        return None;
+    }
     let at = sample_at(s, tl, p.x).max(0);
     for pair in track.clips().windows(2) {
         let (a, b) = (&pair[0], &pair[1]);
-        if a.is_audio() && b.is_audio() && a.end() > b.start && a.fade_out.len > 0 && b.fade_in.len > 0
-            && b.start <= at && at < a.end()
-        {
+        if a.is_audio() && b.is_audio() && a.end() > b.start && a.fade_out.len > 0 && b.fade_in.len > 0 && b.start <= at && at < a.end() {
             return Some(FadeSelection { track: track.id, clip: a.id, other: Some(b.id), fade_in: false });
         }
     }
     let top = lane.min.y + if lane.height() >= 40.0 && s.edit.flag("view.clip.name") { 13.0 } else { 0.0 };
     let h = (lane.max.y - top).max(1.0);
     for c in track.clips() {
-        if !c.is_audio() { continue; }
+        if !c.is_audio() {
+            continue;
+        }
         if c.fade_in.len > 0 && c.start <= at && at < c.start + c.fade_in.len {
             let phase = (at - c.start) as f32 / c.fade_in.len as f32;
             let y = lane.max.y - h * c.fade_in.shape.gain(phase);
@@ -1571,17 +1607,60 @@ fn sculpt_fade_at_pointer(s: &Session, track: &Track, tl: Rect, lane: Rect, p: P
     None
 }
 
-fn sculpt_delete_target(app: &mut SoundApp, target: FadeSelection) {
-    let result = app.run("edit.fade_delete_target", json!({
-        "track": target.track.0,
-        "clip": target.clip.0,
-        "other": target.other.map(|id| id.0),
-        "fade_in": target.fade_in,
-    }));
-    match result {
-        Ok(_) => app.ui.selected_fade = None,
-        Err(e) => app.ui.status = e,
+// SCULPT_CORE24_FADE_LINKED_TARGETS: associate the matching fade handle on edit-group tracks.
+fn sculpt_core24_fade_targets(s: &Session, selected: FadeSelection) -> Vec<FadeSelection> {
+    let mut out = vec![selected];
+    let Some((tid, original)) = s.find_clip(selected.clip) else { return out };
+    for t in soundcraft_engine::edit::sculpt_group_tracks(s, tid) {
+        if t == tid {
+            continue;
+        }
+        let Some(track) = s.track(t) else { continue };
+        let same = track
+            .clips()
+            .iter()
+            .filter(|c| {
+                c.start < original.end() && c.end() > original.start && (if selected.fade_in { c.fade_in.len > 0 } else { c.fade_out.len > 0 })
+            })
+            .min_by_key(|c| c.start.abs_diff(original.start));
+        let Some(c) = same else { continue };
+        let other = if selected.other.is_some() {
+            track.clips().iter().find(|x| x.id != c.id && x.start < c.end() && x.end() > c.start).map(|x| x.id)
+        } else {
+            None
+        };
+        if selected.other.is_some() && other.is_none() {
+            continue;
+        }
+        out.push(FadeSelection { track: t, clip: c.id, other, fade_in: selected.fade_in });
     }
+    out
+}
+fn sculpt_delete_target(app: &mut SoundApp, target: FadeSelection) {
+    // SCULPT_CORE24_FADE_GROUP_DELETE: one context-menu action deletes matching group fades.
+    let targets = if app.ui.selected_group_fades.contains(&target) {
+        app.ui.selected_group_fades.clone()
+    } else {
+        sculpt_core24_fade_targets(app.engine.session(), target)
+    };
+    let mut deleted = 0usize;
+    for fade in targets {
+        if app
+            .run(
+                "edit.fade_delete_target",
+                json!({
+                    "track": fade.track.0,"clip":fade.clip.0,
+                    "other":fade.other.map(|id|id.0),"fade_in":fade.fade_in,
+                }),
+            )
+            .is_ok()
+        {
+            deleted += 1;
+        }
+    }
+    app.ui.selected_fade = None;
+    app.ui.selected_group_fades.clear();
+    app.ui.status = format!("Deleted {} linked fade(s)", deleted);
 }
 
 fn lane_interaction(app: &mut SoundApp, ui: &mut Ui, track: &Track, lane: Rect, tl: Rect) {
@@ -1606,8 +1685,7 @@ fn lane_interaction(app: &mut SoundApp, ui: &mut Ui, track: &Track, lane: Rect, 
             let at = sample_at(s, tl, p.x).max(0);
             track.clips().windows(2).find_map(|pair| {
                 let (a, b) = (&pair[0], &pair[1]);
-                (a.end() > b.start && a.fade_out.len > 0 && b.fade_in.len > 0
-                    && b.start <= at && at < a.end()).then_some((b.start, a.end()))
+                (a.end() > b.start && a.fade_out.len > 0 && b.fade_in.len > 0 && b.start <= at && at < a.end()).then_some((b.start, a.end()))
             })
         });
         ui.ctx().data_mut(|d| d.insert_temp(menu_xfade_id, xfade));
@@ -1618,7 +1696,13 @@ fn lane_interaction(app: &mut SoundApp, ui: &mut Ui, track: &Track, lane: Rect, 
     let menu_fade = ui.ctx().data(|d| d.get_temp::<Option<FadeSelection>>(menu_fade_id)).flatten();
     resp.context_menu(|ui| {
         if let Some(target) = menu_fade {
-            let label = if target.other.is_some() { "Delete Crossfade" } else if target.fade_in { "Delete Fade In" } else { "Delete Fade Out" };
+            let label = if target.other.is_some() {
+                "Delete Crossfade"
+            } else if target.fade_in {
+                "Delete Fade In"
+            } else {
+                "Delete Fade Out"
+            };
             ui.label(if target.other.is_some() { "Crossfade" } else { "Fade" });
             if ui.button(label).clicked() {
                 sculpt_delete_target(app, target);
@@ -1650,10 +1734,12 @@ fn lane_interaction(app: &mut SoundApp, ui: &mut Ui, track: &Track, lane: Rect, 
     if resp.clicked() {
         if let Some(fade) = sculpt_fade_at_pointer(&s, track, tl, lane, p) {
             app.ui.selected_fade = Some(fade);
+            app.ui.selected_group_fades = sculpt_core24_fade_targets(&s, fade); // SCULPT_CORE24_FADE_GROUP_SELECT
             ui.ctx().request_repaint();
             return;
         }
         app.ui.selected_fade = None;
+        app.ui.selected_group_fades.clear(); // SCULPT_CORE24_FADE_GROUP_CLEAR
     }
     let upper = origin.y < lane.center().y;
     // Pro Tools Smart Tool: a drag at the LOWER part of a clip seam creates
@@ -1661,14 +1747,17 @@ fn lane_interaction(app: &mut SoundApp, ui: &mut Ui, track: &Track, lane: Rect, 
     let sculpt_seam = if tool == Tool::Smart && origin.y > lane.min.y + lane.height() * 0.65 {
         track.clips().windows(2).find_map(|pair| {
             let (a, b) = (&pair[0], &pair[1]);
-            if !a.is_audio() || !b.is_audio() { return None; }
+            if !a.is_audio() || !b.is_audio() {
+                return None;
+            }
             let stored = s.edit.values.get(&format!("sculpt.xfade.join.{}.{}", a.id.0, b.id.0));
             let seam = stored.map_or(a.end(), |v| *v as Samples);
-            let adjacent_or_faded = a.end() == b.start ||
-                (a.end() > b.start && a.fade_out.len > 0 && b.fade_in.len > 0);
+            let adjacent_or_faded = a.end() == b.start || (a.end() > b.start && a.fade_out.len > 0 && b.fade_in.len > 0);
             (adjacent_or_faded && (origin.x - x_of(&s, tl, seam)).abs() < 12.0).then_some(seam)
         })
-    } else { None };
+    } else {
+        None
+    };
     let near_edge = |c: &Clip| -> Option<bool> {
         let xs = x_of(&s, tl, c.start);
         let xe = x_of(&s, tl, c.end());
@@ -1760,13 +1849,35 @@ fn lane_interaction(app: &mut SoundApp, ui: &mut Ui, track: &Track, lane: Rect, 
         && let (Some(fade_in), Some(c)) = (fade_corner, hit.as_ref())
     {
         app.gesture = Some(Gesture::Fade { clip: c.id, track: track.id, fade_in, to: at });
-    } else if resp.drag_started() && let Some(seam) = sculpt_seam {
+    } else if resp.drag_started()
+        && let Some(seam) = sculpt_seam
+    {
         app.gesture = Some(Gesture::Crossfade { track: track.id, seam, to: at });
     } else if resp.drag_started() {
         app.gesture = match eff {
             Tool::Selector | Tool::Smart => Some(Gesture::Select { track: track.id, anchor: snap(&s, at_origin), tracks: vec![track.id] }),
             Tool::Grabber => hit.as_ref().map(|c| {
-                let clips = if s.edit.selected_clips.contains(&c.id) { s.edit.selected_clips.clone() } else { vec![c.id] };
+                // SCULPT_CORE17_GROUP_SELECTION: keep explicit clip selections;
+                // otherwise dragging on a selected track brings matching-time clips
+                // on the other selected tracks, not every clip in the session.
+                let mut clips = if s.edit.selected_clips.contains(&c.id) {
+                    s.edit.selected_clips.clone()
+                } else if s.edit.selected_tracks.contains(&track.id) && s.edit.selected_tracks.len() > 1 {
+                    let mut group = vec![c.id];
+                    for t in &s.tracks {
+                        if t.id != track.id && s.edit.selected_tracks.contains(&t.id) {
+                            group.extend(t.clips().iter().filter(|other| other.range().overlaps(&c.range())).map(|other| other.id));
+                        }
+                    }
+                    group
+                } else {
+                    vec![c.id]
+                };
+                clips.retain(|id| *id != c.id);
+                clips.insert(0, c.id); // drag-origin anchors vertical track offsets
+                clips.dedup();
+                // SCULPT_CORE23_GROUP_DRAG: all linked clips move together.
+                let clips = soundcraft_engine::edit::sculpt_group_clips(&s, &clips);
                 Gesture::MoveClips { clips, grab_at: at_origin, delta: 0, from_track: track.id, to_track: track.id }
             }),
             Tool::Trim => hit.as_ref().map(|c| match near_edge(c) {
@@ -1803,7 +1914,11 @@ fn lane_interaction(app: &mut SoundApp, ui: &mut Ui, track: &Track, lane: Rect, 
                 if let Some(c) = &hit {
                     let mut ids = if mods.shift { s.edit.selected_clips.iter().map(|x| x.0).collect::<Vec<_>>() } else { Vec::new() };
                     ids.push(c.id.0);
-                    let _ = app.run("edit.select", json!({"clips": ids}));
+                    let _ = app.run("edit.select", json!({"clips": ids.clone()}));
+                    // SCULPT_CORE16_SPOT_CLICK: Spot has a real placement dialog.
+                    if s.edit.edit_mode == soundcraft_model::EditMode::Spot {
+                        app.dialogs.open_spot(ids.into_iter().map(ClipId).collect(), &s);
+                    }
                 }
             }
             Tool::Zoom => {
@@ -1939,6 +2054,11 @@ fn drive_drag(app: &mut SoundApp, ctx: &egui::Context) {
 fn finish_drag(app: &mut SoundApp, s: &Session, tl: Rect, p: Option<Pos2>) {
     match app.gesture.take() {
         Some(Gesture::MoveClips { clips, delta, from_track, to_track, .. }) => {
+            // SCULPT_CORE16_SPOT_DRAG: unlike Slip/Grid, Spot waits for typed destination.
+            if s.edit.edit_mode == soundcraft_model::EditMode::Spot {
+                app.dialogs.open_spot(clips, s);
+                return;
+            }
             let ids: Vec<u64> = clips.iter().map(|c| c.0).collect();
             let mut params = json!({"clips": ids, "by": delta});
             if to_track != from_track {
@@ -1952,7 +2072,9 @@ fn finish_drag(app: &mut SoundApp, s: &Session, tl: Rect, p: Option<Pos2>) {
             if let Some((_, c)) = s.find_clip(clip) {
                 // Not clamp: it panics on a zero-length clip.
                 let (a, b) = if fade_in { (c.start, to.max(c.start + 1).min(c.end())) } else { (to.max(c.start).min(c.end() - 1), c.end()) };
-                let _ = app.run("edit.fades_create", json!({"tracks": [track.0], "start": a, "end": b, "shape": "equal power"}));
+                // SCULPT_CORE23_GROUP_FADE: apply same time range to grouped tracks.
+                let tracks = soundcraft_engine::edit::sculpt_group_tracks(s, track).iter().map(|t| t.0).collect::<Vec<_>>();
+                let _ = app.run("edit.fades_create", json!({"tracks": tracks, "start": a, "end": b, "shape": "equal power"}));
             }
         }
         Some(Gesture::Crossfade { track, seam, to }) => {
@@ -1960,7 +2082,9 @@ fn finish_drag(app: &mut SoundApp, s: &Session, tl: Rect, p: Option<Pos2>) {
             let half = (to - seam).abs().max(s.sample_rate.samples(0.005));
             let start = (seam - half).max(0);
             let end = seam.saturating_add(half);
-            let _ = app.run("edit.fades_create", json!({"tracks": [track.0], "start": start, "end": end, "shape": "equal power"}));
+            // SCULPT_CORE23_GROUP_CROSSFADE: same seam on linked tracks.
+            let tracks = soundcraft_engine::edit::sculpt_group_tracks(s, track).iter().map(|t| t.0).collect::<Vec<_>>();
+            let _ = app.run("edit.fades_create", json!({"tracks": tracks, "start": start, "end": end, "shape": "equal power"}));
         }
         Some(Gesture::TrimStart { clip, track, to }) => trim_clip(app, clip, track, to, true),
         Some(Gesture::TrimEnd { clip, track, to }) => trim_clip(app, clip, track, to, false),
@@ -1999,22 +2123,40 @@ fn automation_id(p: &AutoParam) -> String {
     }
 }
 
-fn trim_clip(app: &mut SoundApp, clip: ClipId, track: TrackId, to: Samples, start: bool) {
-    let cmd = if start { "edit.trim_start_to_insertion" } else { "edit.trim_end_to_insertion" };
-    // Trims through the command layer: select the clip's track and position the insertion.
-    let sel_before = app.engine.session().edit.selection;
-    let tracks_before: Vec<u64> = app.engine.session().edit.selected_tracks.iter().map(|x| x.0).collect();
-    let c = app.engine.session().find_clip(clip).map(|(_, c)| c.clone());
-    if let Some(c) = c {
-        if start && to < c.start || !start && to > c.end() {
-            // Extending: use trim to fill selection with handles.
-            let r = if start { Range::new(to, c.end()) } else { Range::new(c.start, to) };
-            let _ = app.run("edit.trim_to_fill_selection", json!({"clips": [clip.0], "start": r.start, "end": r.end}));
-        } else {
-            let _ = app.run(cmd, json!({"tracks": [track.0], "at": to}));
+fn trim_clip(app: &mut SoundApp, clip: ClipId, _track: TrackId, to: Samples, start: bool) {
+    // SCULPT_CORE24_RELATIVE_TRIM: target the corresponding clip on each linked track,
+    // preserving the amount trimmed even when grouped clips start at different times.
+    let s = app.engine.session().clone();
+    let Some((_, origin)) = s.find_clip(clip) else { return };
+    let delta = if start { to.saturating_sub(origin.start) } else { to.saturating_sub(origin.end()) };
+    let related = soundcraft_engine::edit::sculpt_group_clips(&s, &[clip]);
+    let old_tracks: Vec<u64> = s.edit.selected_tracks.iter().map(|t| t.0).collect();
+    let old_selection = s.edit.selection;
+    let mut edited = 0usize;
+    for cid in related {
+        let Some((tid, c)) = s.find_clip(cid) else { continue };
+        if tid != s.find_clip(clip).map(|(id, _)| id).unwrap_or(tid) && !(c.start < origin.end() && c.end() > origin.start) {
+            continue;
+        }
+        let new_edge = if start { c.start.saturating_add(delta).clamp(0, c.end() - 1) } else { c.end().saturating_add(delta).max(c.start + 1) };
+        let range = if start { Range::new(new_edge, c.end()) } else { Range::new(c.start, new_edge) };
+        // Use the clip-specific operation, not track-wide trims. It clamps to the source file.
+        let done = app.run(
+            "edit.trim_to_fill_selection",
+            json!({
+                "clips":[cid.0], "start":range.start, "end":range.end
+            }),
+        );
+        if done.is_ok() {
+            edited += 1;
         }
     }
-    let _ = app.engine.execute("edit.select", &json!({"tracks": tracks_before, "start": sel_before.start, "end": sel_before.end}));
+    let _ = app.engine.execute(
+        "edit.select",
+        &json!({
+        "tracks":old_tracks,"start":old_selection.start,"end":old_selection.end}),
+    );
+    app.ui.status = format!("Group trim: {} linked clip(s)", edited);
 }
 
 fn clip_context_menu(app: &mut SoundApp, ui: &mut Ui, clip: Option<ClipId>) {
@@ -2179,8 +2321,12 @@ fn overlay(app: &mut SoundApp, ui: &mut Ui, tl: Rect, area: Rect) {
     {
         let half = (to - seam).abs();
         let (x0, x1) = (x_of(s, tl, (seam - half).max(0)), x_of(s, tl, seam + half));
-        painter.rect_stroke(Rect::from_min_max(pos2(x0, r[1] + 2.0), pos2(x1, r[3] - 2.0)),
-            0.0, Stroke::new(2.0, Color32::from_rgb(244, 205, 116)), StrokeKind::Inside);
+        painter.rect_stroke(
+            Rect::from_min_max(pos2(x0, r[1] + 2.0), pos2(x1, r[3] - 2.0)),
+            0.0,
+            Stroke::new(2.0, Color32::from_rgb(244, 205, 116)),
+            StrokeKind::Inside,
+        );
     }
     if let Some(Gesture::Fade { clip, fade_in, to, .. }) = &app.gesture
         && let Some((tid, c)) = s.find_clip(*clip)
@@ -2654,3 +2800,93 @@ mod tests {
 }
 
 // SCULPT_FADES_UI_MIGRATION_V1
+
+/// SCULPT_CORE20_SELECTED_CHANNEL_WIDGET
+/// Persistent Edit-channel controls: visible fader, pan, I/O and current inserts/sends.
+fn sculpt_core20_selected_strip(app: &mut SoundApp, ui: &mut Ui) {
+    ui.horizontal(|ui| {
+        ui.strong("SELECTED CHANNEL");
+        ui.separator();
+        let selected = app.engine.session().edit.selected_tracks.first().copied();
+        let track = selected.and_then(|id| app.engine.session().track(id)).cloned();
+        let Some(track) = track else {
+            ui.label("Select a track in Edit to show its channel strip");
+            return;
+        };
+        ui.strong(&track.name);
+    });
+    let selected = app.engine.session().edit.selected_tracks.first().copied();
+    let Some(track) = selected.and_then(|id| app.engine.session().track(id)).cloned() else { return };
+    let id = track.id;
+    ui.horizontal_top(|ui| {
+        ui.vertical(|ui| {
+            ui.label("FADER");
+            let (fr, _) = ui.allocate_exact_size(vec2(36.0, 83.0), Sense::hover());
+            if let Some(db) = crate::widgets::fader(ui, fr, track.mixer.volume_db, ui.id().with(("sculpt_core20_fader", id.0))) {
+                let _ = app.engine.execute_merged("mix.volume", &json!({"track": id.0, "db": db}), &format!("fader:{}", id.0));
+            }
+            ui.label(egui::RichText::new(format!("{:.1} dB", track.mixer.volume_db)).small());
+        });
+        ui.separator();
+        ui.vertical(|ui| {
+            ui.label("PAN");
+            let mut pan = track.mixer.pan.first().copied().unwrap_or_default();
+            if ui.add_sized([120.0, 22.0], egui::Slider::new(&mut pan, -1.0..=1.0).show_value(true)).changed() {
+                let _ = app.engine.execute_merged("mix.pan", &json!({"track": id.0, "pan": pan, "index": 0}), &format!("pan:{}:0", id.0));
+            }
+            if ui.small_button("Centre").clicked() {
+                let _ = app.run("mix.pan", json!({"track": id.0, "pan": 0.0, "index": 0}));
+            }
+            ui.horizontal(|ui| {
+                if ui.selectable_label(track.mixer.mute, "MUTE").clicked() {
+                    let _ = app.run("mix.mute", json!({"track": id.0}));
+                }
+                if ui.selectable_label(track.mixer.solo, "SOLO").clicked() {
+                    let _ = app.run("mix.solo", json!({"track": id.0}));
+                }
+            });
+        });
+        ui.separator();
+        ui.vertical(|ui| {
+            ui.label("I/O");
+            ui.label(egui::RichText::new(format!("IN: {:?}", track.mixer.input)).small());
+            ui.label(egui::RichText::new(format!("OUT: {:?}", track.mixer.output)).small());
+            if ui.small_button("Routing...").clicked() {
+                app.ui.show_io_setup = true;
+            }
+        });
+        ui.separator();
+        egui::ScrollArea::vertical().max_height(108.0).show(ui, |ui| {
+            ui.horizontal_top(|ui| {
+                ui.vertical(|ui| {
+                    ui.label("INSERTS");
+                    for (slot, insert) in track.mixer.inserts.iter().take(8).enumerate() {
+                        if let Some(ins) = insert {
+                            let name = crate::mix_window::plugin_info(&ins.plugin).map_or(ins.plugin.as_str(), |p| p.name);
+                            if ui.small_button(format!("{}: {}", slot + 1, name)).clicked() && !app.ui.plugin_windows.contains(&(id, slot)) {
+                                app.ui.plugin_windows.push((id, slot));
+                            }
+                        }
+                    }
+                });
+                ui.add_space(24.0);
+                ui.vertical(|ui| {
+                    ui.label("SENDS");
+                    for (slot, send) in track.mixer.sends.iter().take(8).enumerate() {
+                        if let Some(send) = send {
+                            ui.label(egui::RichText::new(format!("{}: {:?}", slot + 1, send.target)).small());
+                            let mut level = send.level_db;
+                            if ui.add_sized([135.0, 17.0], egui::Slider::new(&mut level, -60.0..=12.0).text("dB")).changed() {
+                                let _ = app.engine.execute_merged(
+                                    "mix.send_level",
+                                    &json!({"track": id.0, "slot": slot, "db": level}),
+                                    &format!("send:{}:{slot}", id.0),
+                                );
+                            }
+                        }
+                    }
+                });
+            });
+        });
+    });
+}

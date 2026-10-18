@@ -7,8 +7,14 @@ license.workspace = true
 publish = false
 default-run = "sculpt-daw"
 
-[lints]
-workspace = true
+[lints.rust]
+unsafe_code = "deny" # SCULPT_CORE21_APP_DENY_UNSAFE
+
+[lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+too_many_arguments = "allow"
+type_complexity = "allow"
 
 [dependencies]
 soundcraft-engine.workspace = true

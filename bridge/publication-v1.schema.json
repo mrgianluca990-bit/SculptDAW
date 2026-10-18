@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Sculpt Bridge publication v1",
+  "type": "object",
+  "required": [
+    "format",
+    "version",
+    "publicationID",
+    "publishMode",
+    "originSessionPath",
+    "cueListID",
+    "cueID",
+    "cueName",
+    "durationSeconds",
+    "stems",
+    "markers"
+  ],
+  "properties": {
+    "format": {
+      "const": "com.sculpt.bridge.cue"
+    },
+    "version": {
+      "const": 1
+    },
+    "publicationID": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "publishMode": {
+      "enum": [
+        "updateCue",
+        "newCue"
+      ]
+    },
+    "durationSeconds": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "maximum": 14400
+    },
+    "stems": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64
+    },
+    "markers": {
+      "type": "array",
+      "maxItems": 10000
+    }
+  },
+  "additionalProperties": true
+}

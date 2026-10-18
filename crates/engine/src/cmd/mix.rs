@@ -106,6 +106,15 @@ pub fn specs() -> Vec<CommandSpec> {
         ),
         cmd!("mix.insert_move", "Move Insert", [], None, "{track?, from, to}", has_selection, insert_move),
         cmd!(
+            "mix.insert_drag",
+            "Move/Copy Insert",
+            [],
+            None,
+            "{source_track, source_slot, target_track, target_slot, copy?:false}",
+            has_tracks,
+            insert_drag
+        ), // SCULPT_CORE19_INSERT_DRAG_SPEC
+        cmd!(
             "mix.send",
             "Assign Send",
             [],
@@ -382,6 +391,52 @@ fn insert_params(e: &mut Engine, p: &Value) -> Result<Value> {
         ins.preset = name;
     }
     Ok(json!({"set": n}))
+}
+
+/// SCULPT_CORE19_INSERT_TRANSFER: atomic insert swap or safe copy across tracks.
+fn insert_drag(e: &mut Engine, p: &Value) -> Result<Value> {
+    let src = track_param(e, "mix.insert_drag", p, "source_track")?.ok_or_else(|| bad("mix.insert_drag", "source_track missing"))?;
+    let dst = track_param(e, "mix.insert_drag", p, "target_track")?.ok_or_else(|| bad("mix.insert_drag", "target_track missing"))?;
+    let from = slot_of(p, "source_slot", INSERT_SLOTS).ok_or_else(|| bad("mix.insert_drag", "source_slot invalid"))?;
+    let to = slot_of(p, "target_slot", INSERT_SLOTS).ok_or_else(|| bad("mix.insert_drag", "target_slot invalid"))?;
+    let copy = bool_or(p, "copy", false);
+    if src == dst && from == to {
+        return Ok(json!({"unchanged":true}));
+    }
+    let s = e.session_mut();
+    let item = s
+        .track(src)
+        .and_then(|t| t.mixer.inserts.get(from))
+        .and_then(Option::as_ref)
+        .cloned()
+        .ok_or_else(|| bad("mix.insert_drag", "source slot is empty"))?;
+    let occupied = s.track(dst).and_then(|t| t.mixer.inserts.get(to)).and_then(Option::as_ref).is_some();
+    if copy && occupied {
+        return Err(bad("mix.insert_drag", "target slot occupied: copy cancelled"));
+    }
+    if s.track(dst).and_then(|t| t.mixer.inserts.get(to)).is_none() {
+        return Err(bad("mix.insert_drag", "target slot invalid"));
+    }
+    if src == dst {
+        if let Some(t) = s.track_mut(src) {
+            if copy {
+                t.mixer.inserts[to] = Some(item);
+            } else {
+                t.mixer.inserts.swap(from, to);
+            }
+        }
+    } else {
+        let other = if copy { None } else { s.track_mut(dst).and_then(|t| t.mixer.inserts[to].take()) };
+        if let Some(t) = s.track_mut(dst) {
+            t.mixer.inserts[to] = Some(item);
+        }
+        if !copy {
+            if let Some(t) = s.track_mut(src) {
+                t.mixer.inserts[from] = other;
+            }
+        }
+    }
+    Ok(json!({"copied":copy,"swapped":occupied&&!copy}))
 }
 
 fn insert_move(e: &mut Engine, p: &Value) -> Result<Value> {
@@ -694,6 +749,20 @@ mod tests {
     use soundcraft_model::{ChannelFormat, Clip, SourceAudio, SourceId, TrackKind};
     use soundcraft_time::Range;
     use std::sync::Arc;
+
+    #[test]
+    fn sculpt_core19_insert_drag_between_tracks_and_copy_safely() {
+        let mut e = Engine::default();
+        let a = e.session_mut().add_track(TrackKind::Audio, ChannelFormat::Mono, Some("A"));
+        let b = e.session_mut().add_track(TrackKind::Audio, ChannelFormat::Mono, Some("B"));
+        e.session_mut().track_mut(a).unwrap().mixer.inserts[0] = Some(Insert::new("gain"));
+        e.execute("mix.insert_drag", &json!({"source_track":a.0,"source_slot":0,"target_track":b.0,"target_slot":2})).unwrap();
+        assert!(e.session().track(a).unwrap().mixer.inserts[0].is_none());
+        assert!(e.session().track(b).unwrap().mixer.inserts[2].is_some());
+        e.execute("mix.insert_drag", &json!({"source_track":b.0,"source_slot":2,"target_track":a.0,"target_slot":1,"copy":true})).unwrap();
+        assert!(e.session().track(a).unwrap().mixer.inserts[1].is_some());
+        assert!(e.execute("mix.insert_drag", &json!({"source_track":b.0,"source_slot":2,"target_track":a.0,"target_slot":1,"copy":true})).is_err());
+    }
 
     fn rms_db(before: &[f32], after: &[f32]) -> f32 {
         let energy = |xs: &[f32]| xs.iter().map(|x| x * x).sum::<f32>() / xs.len().max(1) as f32;

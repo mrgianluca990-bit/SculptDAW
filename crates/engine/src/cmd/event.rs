@@ -377,3 +377,25 @@ mod tests {
         assert!((s.tempo.tempo_at_tick(tick) - 133.5).abs() < 1e-9);
     }
 }
+
+#[cfg(test)]
+mod sculpt_core17_marker_tests {
+    use super::*;
+    #[test]
+    fn sculpt_core17_markers_survive_session_roundtrip_and_recall() {
+        let mut e = Engine::default();
+        let m = e.execute("markers.add", &json!({"at": 96000, "name": "Verse A"})).unwrap();
+        let n = m["number"].as_u64().unwrap();
+        assert_eq!(e.session().markers.len(), 1);
+        e.execute("markers.edit", &json!({"number": n, "rename": "Verse B", "at": 192000})).unwrap();
+        e.execute("markers.recall", &json!({"number": n})).unwrap();
+        assert_eq!(e.session().edit.selection.start, 192000);
+        let json = e.session().to_json().unwrap();
+        let loaded = soundcraft_model::Session::from_json(&json).unwrap();
+        assert_eq!(loaded.markers.len(), 1);
+        assert_eq!(loaded.markers[0].name, "Verse B");
+        assert_eq!(loaded.markers[0].start, 192000);
+        e.execute("markers.delete", &json!({"number": n})).unwrap();
+        assert!(e.session().markers.is_empty());
+    }
+}

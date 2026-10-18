@@ -53,7 +53,7 @@
   <array>
     <dict>
       <key>UTTypeIdentifier</key>
-      <string>ai.storyteller.soundcraft.session</string>
+      <string>audio.sculpt.daw.session</string>
       <key>UTTypeDescription</key>
       <string>Sculpt DAW Session</string>
       <key>UTTypeConformsTo</key>
@@ -66,9 +66,9 @@
       <key>UTTypeTagSpecification</key>
       <dict>
         <key>public.filename-extension</key>
-        <array><string>scraft</string></array>
+        <array><string>scdaw</string></array>
         <key>public.mime-type</key>
-        <array><string>application/x-soundcraft-session</string></array>
+        <array><string>application/x-sculpt-daw-session</string></array>
       </dict>
     </dict>
   </array>
@@ -85,7 +85,7 @@
       <key>CFBundleTypeIconFile</key>
       <string>Sculpt DAW</string>
       <key>LSItemContentTypes</key>
-      <array><string>ai.storyteller.soundcraft.session</string></array>
+      <array><string>audio.sculpt.daw.session</string></array>
     </dict>
     <!-- Audio and MIDI: offered under "Open With" (imported into a session), never taking over
          the user's default player. -->

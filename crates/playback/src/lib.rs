@@ -23,6 +23,8 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod record;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod sculpt_audio_settings; // SCULPT_CORE22_AUDIO_MODULE
 
 use soundcraft_dsp::{Plugin, PluginEditor};
 use soundcraft_mix::{MAX_CHANNELS, MixEngine, PreparedInstance, StripMeter, itu_stereo_fold, main_channels};
@@ -95,6 +97,7 @@ struct AudioState {
     pending_len: usize,
     read: f64,
     device_rate: f64,
+    device_output_channels: usize, // SCULPT_CORE21_PLAY_DEVICE_FIELD
     input: Option<Arc<record::InputRing>>,
     recording: bool,
     /// Retired plugin instances go back to the UI thread to be dropped there.
@@ -127,6 +130,7 @@ impl AudioState {
             pending_len: 0,
             read: 0.0,
             device_rate,
+            device_output_channels: nch, // SCULPT_CORE21_PLAY_DEVICE_DEFAULT
             input: None,
             recording: false,
         }
@@ -165,7 +169,9 @@ impl AudioState {
                     }
                     self.mix.adopt(instances);
                     // The main format changed (a document edit, not steady state): resize.
-                    let nch = main_channels(&s);
+                    // SCULPT_CORE21_PLAY_RESIZE: preserve physical channels on
+                    // a session swap (especially when Show opens a multistem cue).
+                    let nch = main_channels(&s).max(self.device_output_channels);
                     if self.pending.len() != nch {
                         self.pending = vec![vec![0.0; BLOCK]; nch];
                         self.pending_len = 0;
@@ -248,6 +254,7 @@ impl AudioState {
         }
         self.mix.monitor_only = !self.playing;
         self.mix.recording = self.recording;
+        self.mix.set_device_output_channels(self.device_output_channels); // SCULPT_CORE21_PLAY_ROUTE_DEVICE
         self.mix.render(&self.session, self.pos, n, &mut self.pending);
         self.send_garbage();
         self.pending_len = n;
@@ -402,12 +409,17 @@ impl Player {
         });
         let (tx, rx) = channel();
         let want = session.sample_rate.hz();
-        let want_ch = u16::try_from(main_channels(&session)).unwrap_or(2);
+        // SCULPT_CORE21_PLAY_REQUEST64: take hardware endpoints into account
+        // before opening CoreAudio rather than silently truncating to Main 1-2.
+        let want_ch = u16::try_from(sculpt_required_output_channels(&session)).unwrap_or(2);
         match open_device(want, want_ch) {
             Ok((device, config, name)) => {
                 let rate = config.sample_rate.0;
                 let channels = usize::from(config.channels);
                 let mut state = AudioState::new(rx, Arc::clone(&shared), session, f64::from(rate), gtx);
+                state.device_output_channels = channels;
+                let render_channels = channels.max(main_channels(&state.session));
+                state.pending.resize_with(render_channels, || vec![0.0; BLOCK]); // SCULPT_CORE21_PLAY_64_BUFFER
                 // cpal may call this on the audio thread (on ALSA in a loop while the device
                 // stays broken): marked, so the logger hands the record off instead of writing it.
                 let err_fn = |e: cpal::StreamError| {
@@ -639,9 +651,7 @@ impl Player {
             side.shadow.clear();
         }
         let (reply, done) = channel();
-        if self.tx.send(Cmd::Shutdown(reply)).is_ok()
-            && done.recv_timeout(std::time::Duration::from_secs(2)).is_err()
-        {
+        if self.tx.send(Cmd::Shutdown(reply)).is_ok() && done.recv_timeout(std::time::Duration::from_secs(2)).is_err() {
             log::warn!("audio shutdown timed out; leaving still-referenced VST3 modules loaded");
         }
         // Dropping the stream stops further callbacks. The callback has
@@ -752,16 +762,47 @@ fn fold_gains(s: &Session) -> [(f32, f32); MAX_CHANNELS] {
     g
 }
 
+/// SCULPT_CORE21_PLAY_DESIRED_CHANNELS: requested physical I/O width (max 64).
+pub fn sculpt_required_output_channels(s: &Session) -> usize {
+    let mut want = main_channels(s);
+    for t in &s.tracks {
+        if let soundcraft_model::Route::Hardware(path) = &t.mixer.output {
+            if let Some(p) = s.outputs.iter().find(|o| o.name.eq_ignore_ascii_case(path)) {
+                want = want.max(usize::from(p.first_channel).saturating_add(p.format.channels()).min(64));
+            }
+        }
+    }
+    want.clamp(2, 64)
+}
+
 /// Open the default output device: f32 at the session rate if possible, with as many channels as
 /// it offers up to `want_ch` (at least stereo when available).
 fn open_device(want_rate: u32, want_ch: u16) -> Result<(cpal::Device, cpal::StreamConfig, String), String> {
     use cpal::traits::{DeviceTrait, HostTrait};
     let host = cpal::default_host();
-    let device = host.default_output_device().ok_or_else(|| "no default output device".to_string())?;
+    // SCULPT_CORE22_EXPLICIT_DEVICE: select the same named CoreAudio device as Show.
+    // CPAL 0.16 has no portable device UID; reject ambiguous duplicate names.
+    let settings = crate::sculpt_audio_settings::AudioSettings::read();
+    let device = if settings.output_name.trim().is_empty() {
+        host.default_output_device().ok_or_else(|| "no default output device".to_string())?
+    } else {
+        #[allow(deprecated)]
+        let mut matches = host.output_devices().map_err(|e| e.to_string())?.filter(|d| d.name().is_ok_and(|name| name == settings.output_name));
+        let match_one = matches.next().ok_or_else(|| format!("Selected CoreAudio interface disconnected: {}", settings.output_name))?;
+        if matches.next().is_some() {
+            return Err(format!("Ambiguous interface name: {} (use a uniquely named CoreAudio device)", settings.output_name));
+        }
+        match_one
+    };
     #[allow(deprecated)]
     let name = device.name().unwrap_or_else(|_| "Audio device".into());
     // Prefer an f32 config at the session rate; else the device default (we resample).
-    let want_ch = want_ch.max(2);
+    // SCULPT_CORE23_MAX_PHYSICAL_CHANNELS: prefer actual hardware capacity
+    // up to the platform's 64-channel routing limit, not existing path count.
+    let _requested_paths = want_ch;
+    let want_ch = 64u16;
+    let want_rate = if settings.sample_rate > 0 { settings.sample_rate } else { want_rate };
+    // SCULPT_CORE22_REQUEST_RATE
     let mut chosen: Option<cpal::StreamConfig> = None;
     if let Ok(configs) = device.supported_output_configs() {
         for c in configs {
@@ -776,7 +817,11 @@ fn open_device(want_rate: u32, want_ch: u16) -> Result<(cpal::Device, cpal::Stre
             }
         }
     }
-    let config = match chosen {
+    if settings.sample_rate > 0 && chosen.is_none() {
+        return Err(format!("{} Hz unsupported by selected interface {}", want_rate, settings.output_name));
+    }
+    let mut config = match chosen {
+        // SCULPT_CORE22_BUFFER_CONFIG
         Some(c) => c,
         None => {
             let d = device.default_output_config().map_err(|e| e.to_string())?;
@@ -786,7 +831,13 @@ fn open_device(want_rate: u32, want_ch: u16) -> Result<(cpal::Device, cpal::Stre
             d.config()
         }
     };
-    Ok((device, config, name))
+    if settings.buffer_frames > 0 {
+        if ![64, 128, 256, 512, 1024, 2048].contains(&settings.buffer_frames) {
+            return Err("Unsupported requested audio buffer size".into());
+        }
+        config.buffer_size = cpal::BufferSize::Fixed(settings.buffer_frames);
+    }
+    Ok((device, config, name)) // SCULPT_CORE22_BUFFER_APPLIED
 }
 
 #[cfg(test)]

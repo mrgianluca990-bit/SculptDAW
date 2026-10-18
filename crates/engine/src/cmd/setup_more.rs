@@ -269,7 +269,12 @@ fn io_setup(e: &mut Engine, p: &Value) -> Result<Value> {
             if s.outputs.iter().any(|o| o.name.eq_ignore_ascii_case(&name)) {
                 return Err(bad(id, format!("an output named `{name}` exists")));
             }
-            let first = i64_or(p, "first_channel", 0).clamp(0, 1023) as u16;
+            // SCULPT_CORE21_IO_LIMIT64: no invalid/unplayable hardware paths.
+            let requested = i64_or(p, "first_channel", 0);
+            if requested < 0 || requested as usize + format.channels() > 64 {
+                return Err(bad(id, "hardware output path exceeds channel 64"));
+            }
+            let first = requested as u16;
             s.outputs.push(OutputPath { name, first_channel: first, format });
         }
         "rename_output" => {

@@ -1,430 +1,46 @@
-name: Sculpt DAW Core 19 - Finder and Channel Strip (Repaired)
+name: Sculpt DAW — source build and bridge checks
 on:
   push:
-    branches: [main]
+    branches: [main, develop, 'feature/**']
+  pull_request:
+    branches: [main, develop]
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: sculpt-core19-${{ github.ref }}
-  cancel-in-progress: false
+  group: sculpt-daw-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   macos:
-    name: Sculpt DAW Core19 Mac Universal (one build)
     runs-on: macos-15-intel
     timeout-minutes: 120
     steps:
-      - name: Checkout Sculpt
-        uses: actions/checkout@v4
-      - name: Checkout pinned SoundCraft sources
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          repository: storytold/soundcraft
-          ref: 6cf896e76c0ec82a11bf2494f209cfe7c8507f74
-          path: soundcraft-upstream
-          persist-credentials: false
-      - name: Verify approved amber Sculpt DAW app icon
-        shell: bash
+          targets: aarch64-apple-darwin,x86_64-apple-darwin,wasm32-unknown-unknown
+      - name: Check exact committed sources
+        run: cargo check --locked -p sculpt-daw -p soundcraft-cli
+      - name: Engine and bridge regression tests
         run: |
-          set -euo pipefail
-          test -s assets/sculpt-daw/sculpt-daw-512.png
-          test -s QA/SculptDAW_Core17_Patch.py
-          echo '923b49c8994363786b46b3a71aef73e5779e97a22a63966d85db63bb1c4555cd  assets/sculpt-daw/sculpt-daw-512.png' | shasum -a 256 -c -
-          python3 -m py_compile QA/SculptDAW_Core17_Patch.py
-      - name: Restore missing source files and proven Core15 patches
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p crates/dsp/src xtask/src
-          rsync -a --ignore-existing soundcraft-upstream/crates/dsp/src/ crates/dsp/src/
-          if [ ! -f xtask/src/main.rs ]; then cp soundcraft-upstream/xtask/src/main.rs xtask/src/main.rs; fi
-          git fetch --no-tags --depth=1 origin 6d0b50cef84523e44c9e6ad1af13b0570574c933
-          git show 6d0b50cef84523e44c9e6ad1af13b0570574c933:.github/workflows/build-macos.yml > /tmp/sculpt-core15.yml
-          python3 - <<'PY_REPLAY'
-          from pathlib import Path
-          import subprocess
-          src=Path('/tmp/sculpt-core15.yml').read_text(encoding='utf-8')
-          names = ['Install Sculpt Core QA menu (do not remove underlying commands)', 'Limit visible plugins to VST3 and Audio Units', 'Patch Sculpt Core 13 - eight slots, fades, crossfade moves, Return, session and exit', 'Sculpt Core 15 - Shared Send, Meter and Crossfade Corrections', 'Sculpt Core 15 - Targeted SoundCraft 0.7 trim fix']
-          for name in names:
-              key = '      - name: '+name+'\n'
-              if src.count(key)!=1: raise SystemExit('Baseline Core15 step not found: '+name)
-              section=src.split(key,1)[1].split('\n      - name:',1)[0]
-              marker='        run: |\n'
-              if section.count(marker)!=1: raise SystemExit('Expected one run block in '+name)
-              lines=section.split(marker,1)[1].splitlines()
-              code='\n'.join(line[10:] if line.startswith('          ') else line for line in lines)+'\n'
-              if not code.strip().startswith('set -euo pipefail'): raise SystemExit('Baseline script prefix wrong: '+name)
-              print('CORE15 RESTORE:', name, flush=True)
-              subprocess.run(['bash','-euo','pipefail','-c',code],check=True)
-          PY_REPLAY
-      - name: Apply Core16 changes and Spot dialog
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY_PATCH'
-          import base64,lzma
-          payload = """
-          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
-          AAAABFla
-          """
-          source=lzma.decompress(base64.b64decode(''.join(payload.split()))).decode('utf-8')
-          compile(source,'sculpt_core16_and_spot.py','exec')
-          exec(source,{'__name__':'__main__'})
-          print('CORE16 AND SPOT PATCH APPLIED; SHUFFLE/SLIP/GRID UNCHANGED')
-          PY_PATCH
-      - name: Apply repository Core17 patch and verify native .scdaw (prebuild)
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Already committed in SculptDAW; fail early if the file is missing.
-          test -s QA/SculptDAW_Core17_Patch.py
-          python3 -m py_compile QA/SculptDAW_Core17_Patch.py
-          python3 QA/SculptDAW_Core17_Patch.py
-          # Manifest must be modified before the packaging process runs.
-          python3 - <<'PY_AUDIT'
-          from pathlib import Path
-          import plistlib
-          p=Path('packaging/macos/Info.plist.in')
-          info=plistlib.loads(p.read_bytes())
-          uti=info['UTExportedTypeDeclarations'][0]
-          assert uti['UTTypeIdentifier']=='audio.sculpt.daw.session', uti
-          assert 'scdaw' in uti['UTTypeTagSpecification']['public.filename-extension'], uti
-          assert all('ai.storyteller.soundcraft.session' != t.get('UTTypeIdentifier') for t in info['UTExportedTypeDeclarations'])
-          assert 'View > Rulers > Markers' in Path('sculpt/qa-core-menu.txt').read_text()
-          assert 'Window > Memory Locations' in Path('sculpt/qa-core-menu.txt').read_text()
-          print('CORE17: patch + plist + marker UI verified BEFORE compile')
-          PY_AUDIT
-      - name: Apply Core18 - direct session pickers, right markers, multi-track reorder
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY_CORE18'
-          import base64, lzma
-          payload = """
-          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
-          """
-          source=lzma.decompress(base64.b64decode(''.join(payload.split()))).decode('utf8')
-          compile(source, 'SculptDAW_Core18_Patch.py', 'exec')
-          exec(source, {'__name__':'__main__'})
-          PY_CORE18
-      - name: Apply Core19 - Finder documents, shared markers, selected strip, groups and insert DnD
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY_CORE19'
-          import base64,lzma
-          payload = """
-          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
-          """
-          content=lzma.decompress(base64.b64decode(''.join(payload.split()))).decode('utf-8')
-          compile(content, 'SculptDAW_Core19_Patch.py', 'exec')
-          exec(content, {'__name__':'__main__'})
-          PY_CORE19
-      - name: Install Rust for both Mac architectures
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-apple-darwin,aarch64-apple-darwin
-      - name: Validate and regression test
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY_CHECK'
-          from pathlib import Path
-          e=Path('crates/ui-egui/src/edit_window.rs').read_text()
-          d=Path('crates/ui-egui/src/dialogs.rs').read_text()
-          assert 'SCULPT_CORE16_SPOT_CLICK' in e and 'SCULPT_CORE16_SPOT_DRAG' in e
-          assert 'SCULPT_CORE16_SPOT_CONFIRM' in d
-          assert 'SCULPT_CORE16_EDIT_FADER_PAN' in e
-          print('Source guards OK')
-          PY_CHECK
-          cargo check --locked --target x86_64-apple-darwin -p sculpt-daw
-          cargo test --locked --target x86_64-apple-darwin -p soundcraft-engine --lib sculpt_
-          # All new Core17 regression cases are included in the same library test set.
-          cargo test --locked --target x86_64-apple-darwin -p soundcraft-engine --lib sculpt_core17_
-          cargo test --locked --target x86_64-apple-darwin -p soundcraft-engine --lib sculpt_core18_
-          cargo test --locked --target x86_64-apple-darwin -p soundcraft-engine --lib sculpt_core19_
-          cargo test --locked --target x86_64-apple-darwin -p soundcraft-ui-egui --lib sculpt_core18_
-          cargo test --locked --target x86_64-apple-darwin -p soundcraft-mix --lib
-          cargo test --locked --target x86_64-apple-darwin -p soundcraft-ui-egui --lib sculpt_
-          cargo test --locked --target x86_64-apple-darwin -p soundcraft-ui-egui --test shortcuts
-          cargo test --locked --target x86_64-apple-darwin -p soundcraft-playback --lib
-          cargo test --locked --target x86_64-apple-darwin -p soundcraft-vst3-host --test fixture_e2e
-          cargo test --locked --target x86_64-apple-darwin -p soundcraft-au-host --test system_units
-      - name: Build Sculpt DAW Mac app
-        shell: bash
+          cargo test --locked -p soundcraft-engine --lib
+          cargo test --locked -p soundcraft-mix --lib
+          cargo test --locked -p soundcraft-ui-egui --lib
+          cargo test --locked -p soundcraft-ui-egui --test shortcuts
+          cargo test --locked -p soundcraft-playback --lib
+          cargo test --locked -p soundcraft-vst3-host --test fixture_e2e
+          cargo test --locked -p soundcraft-au-host --test system_units
+      - name: Full repository quality gate
+        run: cargo xtask ci
+      - name: Build universal app with embedded CLI
         run: bash sculpt/build-macos.sh
-      - name: Validate native document and zip
-        shell: bash
+      - name: Verify archive
         run: |
-          set -euo pipefail
-          ZIP=dist/sculpt/Sculpt_DAW_0.4.0_Mac_Universal.zip
-          test -s "$ZIP"
-          shasum -a 256 -c "$ZIP.sha256"
-          unzip -t "$ZIP" > /dev/null
-          python3 - <<'PY_PLIST'
-          from pathlib import Path
-          import plistlib, zipfile
-          zpath=Path('dist/sculpt/Sculpt_DAW_0.4.0_Mac_Universal.zip')
-          with zipfile.ZipFile(zpath) as z:
-              paths=[p for p in z.namelist() if p.endswith('Sculpt DAW.app/Contents/Info.plist')]
-              if len(paths)!=1:
-                  raise SystemExit(f'Expected 1 Info.plist in signed ZIP, found {paths}')
-              info=plistlib.loads(z.read(paths[0]))
-              matches=[n for n in z.namelist() if n.endswith('Sculpt DAW.app/Contents/Resources/Sculpt DAW.icns')]
-              assert len(matches)==1, 'Icon missing from signed app ZIP'
-          assert info['CFBundleIdentifier']=='audio.sculpt.daw', info.get('CFBundleIdentifier')
-          assert any(t.get('UTTypeIdentifier')=='audio.sculpt.daw.session' and 'scdaw' in t.get('UTTypeTagSpecification',{}).get('public.filename-extension',[]) for t in info.get('UTExportedTypeDeclarations',[])), info.get('UTExportedTypeDeclarations')
-          assert any('audio.sculpt.daw.session' in t.get('LSItemContentTypes',[]) for t in info.get('CFBundleDocumentTypes',[])), info.get('CFBundleDocumentTypes')
-          print('CORE17: signed ZIP, app icon, native UTI, .scdaw document type verified')
-          PY_PLIST
-      - name: Upload Sculpt DAW Core19 Mac (one artifact)
-        uses: actions/upload-artifact@v4
+          shasum -a 256 -c dist/sculpt/Sculpt_DAW_0.4.0_Mac_Universal.zip.sha256
+          unzip -t dist/sculpt/Sculpt_DAW_0.4.0_Mac_Universal.zip
+      - uses: actions/upload-artifact@v4
         with:
-          name: Sculpt-DAW-Core19-Mac-Universal
-          path: |
-            dist/sculpt/Sculpt_DAW_0.4.0_Mac_Universal.zip
-            dist/sculpt/Sculpt_DAW_0.4.0_Mac_Universal.zip.sha256
+          name: Sculpt-DAW-Bridge-${{ github.sha }}
+          path: dist/sculpt/Sculpt_DAW_0.4.0_Mac_Universal.zip*
           if-no-files-found: error
           retention-days: 14
-# SCULPT_CORE17_WORKFLOW_COMPLETE
-
-# SCULPT_CORE17_FIXED_WORKFLOW_COMPLETE
-
-# SCULPT_CORE19_WORKFLOW_COMPLETE
-# SCULPT_CORE19_FIXED_WORKFLOW_COMPLETE
-
-# SCULPT_CORE19_REPAIRED_WORKFLOW_COMPLETE

@@ -355,6 +355,8 @@ fn select(e: &mut Engine, p: &Value) -> Result<Value> {
         p.get("clips").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_u64).map(soundcraft_model::ClipId).collect::<Vec<_>>());
     let sources =
         p.get("sources").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_u64).map(soundcraft_model::SourceId).collect::<Vec<_>>());
+    // SCULPT_CORE23_GROUP_CLIP_SELECTION: clip selection spans all active Edit-group members.
+    let clips = clips.map(|ids| crate::edit::sculpt_group_clips(e.session(), &ids));
     let list_changes = clips.is_some() || sources.is_some() || st.is_some();
     let exact = bool_or(p, "exact", false);
     let s = e.session();
@@ -677,10 +679,10 @@ fn fades_create(e: &mut Engine, p: &Value) -> Result<Value> {
     let shape = str_param(p, "shape")
         .map_or(Some(FadeShape::EqualPower), FadeShape::from_id)
         .ok_or_else(|| bad("edit.fades_create", "unknown fade shape"))?;
-    let shape_out = str_param(p, "shape_out").map_or(Some(shape), FadeShape::from_id)
-        .ok_or_else(|| bad("edit.fades_create", "unknown fade-out shape"))?;
-    let shape_in = str_param(p, "shape_in").map_or(Some(shape), FadeShape::from_id)
-        .ok_or_else(|| bad("edit.fades_create", "unknown fade-in shape"))?;
+    let shape_out =
+        str_param(p, "shape_out").map_or(Some(shape), FadeShape::from_id).ok_or_else(|| bad("edit.fades_create", "unknown fade-out shape"))?;
+    let shape_in =
+        str_param(p, "shape_in").map_or(Some(shape), FadeShape::from_id).ok_or_else(|| bad("edit.fades_create", "unknown fade-in shape"))?;
     let s = e.session_mut();
     let n: usize = tracks.iter().map(|t| ops::create_fades_with_shapes(s, *t, r, shape_out, shape_in)).sum();
     if n == 0 {
@@ -696,7 +698,9 @@ fn fade_delete_target(e: &mut Engine, p: &Value) -> Result<Value> {
     let other = p.get("other").and_then(Value::as_u64).map(ClipId);
     let fade_in = p.get("fade_in").and_then(Value::as_bool).unwrap_or(false);
     let count = ops::delete_selected_fade(e.session_mut(), track, clip, other, fade_in);
-    if count == 0 { return Err(bad(cmd, "selected fade or crossfade no longer exists")); }
+    if count == 0 {
+        return Err(bad(cmd, "selected fade or crossfade no longer exists"));
+    }
     Ok(json!({"deleted": count}))
 }
 

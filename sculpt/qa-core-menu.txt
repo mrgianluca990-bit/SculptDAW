@@ -31,3 +31,5 @@ View > Edit Window Views > I/O
 Window > Edit
 Window > Mix
 Window > Transport
+View > Rulers > Markers
+Window > Memory Locations

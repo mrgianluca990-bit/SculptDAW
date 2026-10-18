@@ -22,13 +22,21 @@ pub fn specs() -> Vec<CommandSpec> {
             Ok(json!({"path": path, "audio_files_written": written}))
         }),
         cmd!(noundo "session.save_as", "Save Session As...", ["File"], Some("Cmd+Shift+S"), "{path, replace?: false}", always, |e, p| {
-            let path = str_param(p, "path").ok_or_else(|| bad("session.save_as", "`path` required"))?.to_string();
+            let requested = str_param(p, "path").ok_or_else(|| bad("session.save_as", "`path` required"))?.to_string();
+            // SCULPT_CORE17_SAVE_AS_FOLDER: keep audio next to its own project, not loose in a shared directory.
+            let path = if bool_or(p, "project_folder", false) {
+                crate::io::sculpt_project_file(&requested).to_string_lossy().into_owned()
+            } else { requested };
             refuse_replacing(e, "session.save_as", &crate::io::session_file(&path), p)?;
             let written = crate::io::save_session(e, &path)?;
             Ok(json!({"path": path, "audio_files_written": written}))
         }),
         cmd!(noundo "session.save_copy", "Save Session Copy In...", ["File"], None, "{path, replace?: false}", always, |e, p| {
-            let path = str_param(p, "path").ok_or_else(|| bad("session.save_copy", "`path` required"))?.to_string();
+            let requested = str_param(p, "path").ok_or_else(|| bad("session.save_copy", "`path` required"))?.to_string();
+            // SCULPT_CORE17_SAVE_COPY_FOLDER
+            let path = if bool_or(p, "project_folder", false) {
+                crate::io::sculpt_project_file(&requested).to_string_lossy().into_owned()
+            } else { requested };
             refuse_replacing(e, "session.save_copy", &crate::io::session_file(&path), p)?;
             let written = crate::io::save_session_copy(e, &path)?;
             Ok(json!({"path": path, "audio_files_written": written}))
@@ -667,5 +675,26 @@ mod tests {
         assert_eq!(from_copy.session().tracks.len(), 2);
         assert!(from_copy.session().track_by_name("Extra").is_some());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod sculpt_core17_project_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn sculpt_core17_new_project_creates_folder_and_audio_files() {
+        let root = std::env::temp_dir().join(format!("sculpt17-project-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&root);
+        let wanted = root.join("New Session.scdaw");
+        let mut e = Engine::default();
+        let result = e.execute("session.save_as", &json!({"path": wanted.to_string_lossy(), "project_folder": true})).unwrap();
+        let file = root.join("New Session/New Session.scdaw");
+        assert_eq!(result["path"].as_str(), file.to_str());
+        assert!(file.is_file());
+        assert!(root.join("New Session/Audio Files").is_dir());
+        let mut other = Engine::default();
+        assert!(other.execute("session.open", &json!({"path": file.to_string_lossy()})).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -294,6 +294,10 @@ pub struct MixEngine {
     busses: HashMap<BusId, BusBuf>,
     main: Vec<Vec<f32>>,
     main_fmt: ChannelFormat,
+    // SCULPT_CORE21_HW_FIELDS: independent physical output bus, 1..64.
+    // Never allocate on the device callback; every channel has max_block capacity.
+    hardware: Vec<Vec<f32>>,
+    hardware_channels: usize,
     pub meters: HashMap<TrackId, StripMeter>,
     pub main_meter: StripMeter,
     pub pan_law: PanLaw,
@@ -374,6 +378,8 @@ impl MixEngine {
             busses: HashMap::new(),
             main: vec![vec![0.0; max_block]; MAIN_CHANNELS],
             main_fmt: ChannelFormat::Stereo,
+            hardware: vec![vec![0.0; max_block]; 64], // SCULPT_CORE21_HW_INIT
+            hardware_channels: 0,
             meters: HashMap::new(),
             main_meter: StripMeter::default(),
             pan_law: PanLaw::Minus3,
@@ -395,6 +401,12 @@ impl MixEngine {
 
     /// Realtime mode: third-party plugins are created by the host and handed over with
     /// [`MixEngine::adopt`] instead of being created in `sync` (see the crate docs).
+    /// SCULPT_CORE21_HW_AVAILABILITY: 0 in offline/silent mode; the physical
+    /// route then falls back to Main instead of muting the track.
+    pub fn set_device_output_channels(&mut self, channels: usize) {
+        self.hardware_channels = channels.min(64);
+    }
+
     pub fn set_external_instances(&mut self, on: bool) {
         self.external = on;
     }
@@ -588,6 +600,10 @@ impl MixEngine {
         for c in &mut self.main {
             c.iter_mut().take(frames).for_each(|x| *x = 0.0);
         }
+        // SCULPT_CORE21_HW_CLEAR: distinct physical bus is zeroed every block.
+        for c in &mut self.hardware {
+            c.iter_mut().take(frames).for_each(|x| *x = 0.0);
+        }
         let any_solo = s.tracks.iter().any(|t| t.mixer.solo && !t.inactive);
         let order = std::mem::take(&mut self.order);
         let live = |t: &Track| !(t.kind == TrackKind::Master || t.inactive || t.kind == TrackKind::Vca);
@@ -643,7 +659,7 @@ impl MixEngine {
         }
         for (i, st) in work.iter_mut() {
             if let Some(t) = s.tracks.get(*i) {
-                self.route_strip(t, st, pos, frames);
+                self.route_strip(s, t, st, pos, frames); // SCULPT_CORE21_HW_PASS_SESSION
             }
         }
         for (i, st) in work.drain(..) {
@@ -665,7 +681,7 @@ impl MixEngine {
             st.align.set(if pdc { lmax_a.saturating_sub(st.latency) } else { 0 }, ch);
             st.align.process(&mut st.buf, frames);
             st.out_extra.set(0, ch);
-            self.route_strip(t, &mut st, pos, frames);
+            self.route_strip(s, t, &mut st, pos, frames); // SCULPT_CORE21_HW_PASS_AUX
             self.strips.insert(t.id, st);
         }
         self.order = order;
@@ -688,12 +704,28 @@ impl MixEngine {
                 }
                 let v0 = volume_db_at(t, pos);
                 let v1 = volume_db_at(t, pos + frames as i64);
-                for (ch, src) in strip.buf.iter().enumerate().take(self.main.len()) {
-                    if let Some(m) = self.main.get_mut(ch) {
-                        for i in 0..frames {
-                            let g = lerp_gain(v0, v1, i, frames);
-                            if let (Some(d), Some(x)) = (m.get_mut(i), src.get(i)) {
-                                *d = x * g;
+                // SCULPT_CORE17_MASTER_PAN: previously the master panners
+                // changed UI values but not actual stereo output samples.
+                if self.main.len() == 2 && strip.buf.len() >= 2 && t.mixer.pan.len() >= 2 {
+                    let p0 = t.mixer.pan[0].clamp(-1.0, 1.0);
+                    let p1 = t.mixer.pan[1].clamp(-1.0, 1.0);
+                    let (l0, r0) = (((1.0 - p0) * 0.5).sqrt(), ((1.0 + p0) * 0.5).sqrt());
+                    let (l1, r1) = (((1.0 - p1) * 0.5).sqrt(), ((1.0 + p1) * 0.5).sqrt());
+                    for i in 0..frames {
+                        let g = lerp_gain(v0, v1, i, frames);
+                        let x0 = strip.buf[0][i];
+                        let x1 = strip.buf[1][i];
+                        self.main[0][i] = (x0 * l0 + x1 * l1) * g;
+                        self.main[1][i] = (x0 * r0 + x1 * r1) * g;
+                    }
+                } else {
+                    for (ch, src) in strip.buf.iter().enumerate().take(self.main.len()) {
+                        if let Some(m) = self.main.get_mut(ch) {
+                            for i in 0..frames {
+                                let g = lerp_gain(v0, v1, i, frames);
+                                if let (Some(d), Some(x)) = (m.get_mut(i), src.get(i)) {
+                                    *d = x * g;
+                                }
                             }
                         }
                     }
@@ -712,7 +744,9 @@ impl MixEngine {
         for (c, o) in out.iter_mut().enumerate() {
             let src = self.main.get(c);
             for i in 0..frames {
-                let v = src.and_then(|m| m.get(i)).copied().unwrap_or(0.0);
+                // SCULPT_CORE21_HW_DEVICE_SUM: independent physical paths are
+                // summed with the existing Main (physical channels 1..main_width).
+                let v = src.and_then(|m| m.get(i)).copied().unwrap_or(0.0) + self.hardware.get(c).and_then(|bus| bus.get(i)).copied().unwrap_or(0.0);
                 if let Some(d) = o.get_mut(i) {
                     *d = if v.is_finite() { v } else { 0.0 };
                 }
@@ -740,7 +774,8 @@ impl MixEngine {
     }
 
     /// Send, meter and pan a processed strip into the busses / main mix.
-    fn route_strip(&mut self, t: &Track, strip: &mut Strip, pos: Samples, frames: usize) {
+    fn route_strip(&mut self, s: &Session, t: &Track, strip: &mut Strip, pos: Samples, frames: usize) {
+        // SCULPT_CORE21_HW_ROUTE_SIGNATURE
         self.meters.entry(t.id).or_default().measure(&strip.buf, frames, strip.gr);
         let src_fmt = strip_format(t, strip.buf.len());
         let law = self.pan_law;
@@ -785,6 +820,36 @@ impl MixEngine {
                 if let Some(dst) = self.busses.get_mut(b) {
                     let m = build_matrix(src_fmt, strip.buf.len(), dst.fmt, dst.buf.len(), &spec, law);
                     apply_matrix(&strip.buf, frames, &mut dst.buf, &m, 1.0);
+                }
+            }
+            // SCULPT_CORE21_HW_RENDER: a named I/O path is a physical endpoint,
+            // NOT an internal bus. Never discard this signal when unavailable.
+            Route::Hardware(name) => {
+                let endpoint = s.outputs.iter().find(|p| p.name.eq_ignore_ascii_case(name));
+                let assigned = endpoint.and_then(|p| {
+                    let first = usize::from(p.first_channel);
+                    let width = p.format.channels();
+                    (width > 0 && first.checked_add(width).is_some_and(|end| end <= 64)).then_some((first, width, p.format))
+                });
+                if let Some((first, width, format)) = assigned
+                    && first + width <= self.hardware_channels
+                {
+                    if let Some(dst) = self.hardware.get_mut(first..first + width) {
+                        let m = build_matrix(src_fmt, strip.buf.len(), format, dst.len(), &spec, law);
+                        apply_matrix(&strip.buf, frames, dst, &m, 1.0);
+                    }
+                    // SCULPT_CORE21_BRIDGE_MAIN_PREVIEW: only Show's dedicated
+                    // SCULPT HW outputs keep a parallel Main 1-2 monitor while
+                    // editing. Do not double-sum an output already on Main.
+                    if name.starts_with("SCULPT HW") && first >= self.main.len() {
+                        let m = build_matrix(src_fmt, strip.buf.len(), self.main_fmt, self.main.len(), &spec, law);
+                        apply_matrix(&strip.buf, frames, &mut self.main, &m, 1.0);
+                    }
+                } else {
+                    // Device has too few output channels, or this path is absent:
+                    // safe Main monitoring, retaining the original Hardware assignment.
+                    let m = build_matrix(src_fmt, strip.buf.len(), self.main_fmt, self.main.len(), &spec, law);
+                    apply_matrix(&strip.buf, frames, &mut self.main, &m, 1.0);
                 }
             }
             _ => {}
@@ -2026,6 +2091,24 @@ mod tests {
             pl.clips.push(Clip::audio(id, "dc", SourceId(900), 0, 0, frames as i64));
         }
         (s, t)
+    }
+
+    // SCULPT_CORE21_TEST_OUTPUT64: physical 64 + safe stereo fallback.
+    #[test]
+    fn sculpt_core21_hardware_output64_and_missing_device_fallback() {
+        let (mut s, t) = session_with_dc(0.5, 4800);
+        s.outputs.push(soundcraft_model::OutputPath { name: "SCULPT HW MONO 64".into(), first_channel: 63, format: ChannelFormat::Mono });
+        s.track_mut(t).unwrap().mixer.output = Route::Hardware("SCULPT HW MONO 64".into());
+        let mut e = MixEngine::new(48_000.0, 512);
+        e.set_device_output_channels(64);
+        let mut out = vec![vec![0.0; 512]; 64];
+        e.render(&s, 0, 512, &mut out);
+        assert!(out[63][100].abs() > 0.1, "hardware 64 must carry audio");
+        assert!(out[0][100].abs() > 0.1, "Show bridge output must also be previewed on Main");
+        e.set_device_output_channels(2);
+        e.render(&s, 512, 512, &mut out);
+        assert!(out[0][100].abs() > 0.1, "unavailable hardware output must be monitored via Main");
+        assert!(out[63][100].abs() < 1e-6, "unavailable output must not emit a signal");
     }
 
     #[test]

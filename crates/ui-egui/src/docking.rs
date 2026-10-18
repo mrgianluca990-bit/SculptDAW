@@ -14,11 +14,12 @@ pub enum Panel {
     Clips,
     Midi,
     Memory,
+    Groups, // SCULPT_CORE22_GROUP_PANEL
     History,
 }
 
 impl Panel {
-    pub const ALL: &[Self] = &[Self::Canvas, Self::Tracks, Self::Clips, Self::Midi, Self::Memory, Self::History];
+    pub const ALL: &[Self] = &[Self::Canvas, Self::Tracks, Self::Clips, Self::Midi, Self::Memory, Self::Groups, Self::History]; // SCULPT_CORE22_GROUP_ALL
     pub fn id(self) -> &'static str {
         match self {
             Self::Canvas => "canvas",
@@ -26,16 +27,18 @@ impl Panel {
             Self::Clips => "clips",
             Self::Midi => "midi",
             Self::Memory => "memory",
+            Self::Groups => "groups", // SCULPT_CORE22_GROUP_ID
             Self::History => "history",
         }
     }
     fn label(self) -> &'static str {
         match self {
             Self::Canvas => "Session",
-            Self::Tracks => "Tracks and Groups",
+            Self::Tracks => "Groups / Selected Channel", // SCULPT_CORE19_PANEL_NAME
             Self::Clips => "Clips",
             Self::Midi => "MIDI Editor",
             Self::Memory => "Memory Locations",
+            Self::Groups => "Groups", // SCULPT_CORE22_GROUP_LABEL
             Self::History => "Undo History",
         }
     }
@@ -45,7 +48,8 @@ impl Panel {
             Self::Tracks => Zone::Left,
             Self::Clips => Zone::Right,
             Self::Midi => Zone::Bottom,
-            Self::Memory => Zone::Bottom,
+            Self::Memory => Zone::Left,  // SCULPT_CORE19_MEMORY_LEFT_BOTH
+            Self::Groups => Zone::Right, // SCULPT_CORE22_MEMORY_RIGHT
             Self::History => Zone::Right,
         }
     }
@@ -80,21 +84,14 @@ impl Default for Workspace {
     fn default() -> Self {
         Self {
             layout: Layout {
+                // SCULPT_CORE22_EDIT_DOCK: session center, Memory and Groups on right.
                 root: Some(split(
-                    SplitAxis::Vertical,
-                    SplitSize::FixedSecond(320.0 + MIDI_TAB_HEIGHT),
-                    split(
-                        SplitAxis::Horizontal,
-                        SplitSize::FixedFirst(168.0),
-                        tabs(Panel::Tracks),
-                        split(SplitAxis::Horizontal, SplitSize::FixedSecond(230.0), tabs(Panel::Canvas), tabs(Panel::Clips)),
-                    ),
-                    tabs(Panel::Midi),
+                    SplitAxis::Horizontal,
+                    SplitSize::FixedSecond(295.0),
+                    tabs(Panel::Canvas),
+                    split(SplitAxis::Vertical, SplitSize::FixedFirst(240.0), tabs(Panel::Memory), tabs(Panel::Groups)),
                 )),
-                floating: vec![
-                    craft_ui::docking::Floating { panels: vec![Panel::Memory], active: 0, rect: [160.0, 120.0, 480.0, 280.0] },
-                    craft_ui::docking::Floating { panels: vec![Panel::History], active: 0, rect: [680.0, 120.0, 260.0, 300.0] },
-                ],
+                floating: vec![],
             },
             hidden: Vec::new(),
         }
@@ -282,13 +279,17 @@ impl Workspace {
 /// Mix retains its own arrangement; the timeline-only Clips and MIDI panels stay in Edit.
 pub fn mix_default() -> Workspace {
     let mut workspace = Workspace::default();
+    // SCULPT_CORE22_MIX_DOCK: main Mix canvas uses the full display.
+    let _ = workspace.set_visible(Panel::Groups, false);
+    let _ = workspace.set_visible(Panel::Memory, false);
     let _ = workspace.set_visible(Panel::Clips, false);
     let _ = workspace.set_visible(Panel::Midi, false);
+    let _ = workspace.set_visible(Panel::Tracks, false); // SCULPT_CORE19_MIX_NO_TRACKS_SIDEBAR
     workspace
 }
 
 fn sync(workspace: &mut Workspace, app: &crate::SoundApp, edit: bool) -> Result<(), String> {
-    workspace.set_visible(Panel::Tracks, app.ui.show_tracks_list)?;
+    workspace.set_visible(Panel::Tracks, edit && app.ui.show_tracks_list)?; // SCULPT_CORE19_TRACKS_EDIT_ONLY
     workspace.set_visible(Panel::Memory, app.ui.show_memory_locations)?;
     workspace.set_visible(Panel::History, app.ui.show_undo_history)?;
     if edit {
@@ -299,8 +300,10 @@ fn sync(workspace: &mut Workspace, app: &crate::SoundApp, edit: bool) -> Result<
 }
 
 fn publish_visibility(app: &mut crate::SoundApp, workspace: &Workspace, edit: bool) {
-    app.ui.show_tracks_list = workspace.layout.contains(&Panel::Tracks);
-    app.ui.show_memory_locations = workspace.layout.contains(&Panel::Memory);
+    if edit {
+        app.ui.show_tracks_list = workspace.layout.contains(&Panel::Tracks);
+    }
+    app.ui.show_memory_locations = workspace.layout.contains(&Panel::Memory); // SCULPT_CORE19_SHARED_MEMORY_VISIBILITY
     app.ui.show_undo_history = workspace.layout.contains(&Panel::History);
     if edit {
         app.ui.show_clip_list = workspace.layout.contains(&Panel::Clips);
@@ -389,11 +392,61 @@ pub fn show(app: &mut crate::SoundApp, ui: &mut egui::Ui, window: crate::MainWin
     let t = crate::theme::Tokens::current();
     let edit = window == crate::MainWindow::Edit;
     let mut workspace = if edit { std::mem::take(&mut app.ui.docking) } else { std::mem::replace(&mut app.ui.mix_docking, mix_default()) };
+    // SCULPT_CORE20_MARKER_DEFAULT_RIGHT: Core18's right default is preserved.
+    // SCULPT_CORE20_MARKER_RIGHT_MIGRATION: move a pre-Core20 Marker/Memory
+    // panel to the right once, while leaving subsequent operator panel moves intact.
+    if (edit && !app.ui.sculpt_core20_marker_placed) || (!edit && !app.ui.sculpt_core20_marker_placed_mix) {
+        if workspace.layout.contains(&Panel::Memory) {
+            let _ = workspace.apply(Action::Move { panel: Panel::Memory, anchor: Panel::Canvas, placement: Placement::Split(Zone::Right) });
+        } else {
+            workspace.hidden.retain(|(panel, _)| *panel != Panel::Memory);
+        }
+        if edit {
+            app.ui.sculpt_core20_marker_placed = true;
+        } else {
+            app.ui.sculpt_core20_marker_placed_mix = true;
+        }
+    }
+    // SCULPT_CORE22_LAYOUT_MIGRATION: old persisted sidebars should not survive first launch.
+    if edit && !app.ui.sculpt_core22_layout_migrated {
+        workspace = Workspace::default();
+        app.ui.show_tracks_list = false;
+        app.ui.show_clip_list = false;
+        app.ui.show_midi_editor = false;
+        app.ui.show_memory_locations = true;
+        app.ui.sculpt_core22_layout_migrated = true;
+    }
+    // SCULPT_CORE23_RIGHT_DOCK_MIGRATION: a single intentional layout reset.
+    // Both right-hand panes are docked; neither is a floating Memory window.
+    if edit && !app.ui.sculpt_core23_layout_migrated {
+        workspace = Workspace::default();
+        app.ui.show_tracks_list = false;
+        app.ui.show_clip_list = false;
+        app.ui.show_midi_editor = false;
+        app.ui.show_memory_locations = true;
+        app.ui.sculpt_core20_marker_placed = true;
+        app.ui.sculpt_core22_layout_migrated = true;
+        app.ui.sculpt_core23_layout_migrated = true;
+    }
     let before_sync = workspace.clone();
     if let Err(error) = (if edit { workspace.validate() } else { workspace.validate_mix() }).and_then(|()| sync(&mut workspace, app, edit)) {
         app.ui.status = format!("Panel layout could not be restored: {error}");
         workspace = if edit { Workspace::default() } else { mix_default() };
         let _ = sync(&mut workspace, app, edit);
+    }
+    // SCULPT_CORE19_MEMORY_MIGRATE_BOTH: migrate saved floating/right layouts once
+    // for each view; visibility is shared, layout is independent.
+    let migrated = egui::Id::new(("sculpt19-memory-left", edit));
+    if workspace.layout.contains(&Panel::Memory) && !ui.ctx().data(|d| d.get_temp::<bool>(migrated).unwrap_or(false)) {
+        if let Err(error) = workspace.apply(Action::Move {
+            panel: Panel::Memory,
+            anchor: if edit && workspace.layout.contains(&Panel::Tracks) { Panel::Tracks } else { Panel::Canvas },
+            placement: Placement::Split(Zone::Left),
+        }) {
+            app.ui.status = format!("Cannot dock Memory Locations: {error}");
+        } else {
+            ui.ctx().data_mut(|d| d.insert_temp(migrated, true));
+        }
     }
     cancel_replaced_workspace(app, &before_sync, &workspace, edit);
     let mut style = DockStyle::from_ui(ui);
@@ -423,13 +476,14 @@ pub fn show(app: &mut crate::SoundApp, ui: &mut egui::Ui, window: crate::MainWin
                     crate::mix_window::content(app, ui);
                 }
             }
-            Panel::Tracks => crate::panels::tracks_and_groups(app, ui),
+            Panel::Tracks => crate::panels::groups_and_selected_channel(app, ui), // SCULPT_CORE19_GROUP_CHANNEL_PANEL
             Panel::Clips => crate::panels::clip_list(app, ui),
             Panel::Midi => {
                 ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new("soundcraft-midi-body"), ui.max_rect()));
                 minimum_body(ui, egui::vec2(420.0, 260.0), |ui| crate::midi_editor::show(app, ui));
             }
             Panel::Memory => crate::panels::memory_locations(app, ui),
+            Panel::Groups => crate::panels::groups_only(app, ui), // SCULPT_CORE22_GROUP_RENDER
             Panel::History => crate::panels::undo_history(app, ui),
         },
     );
@@ -468,8 +522,21 @@ fn panel_limits(panel: &Panel) -> PanelLimits {
         Panel::Tracks => (egui::vec2(140.0, 120.0), 520.0),
         Panel::Clips => (egui::vec2(180.0, 120.0), 720.0),
         Panel::Midi => (egui::vec2(420.0, 260.0), 1_000_000.0),
-        Panel::Memory => (egui::vec2(260.0, 160.0), 1_000_000.0),
+        Panel::Memory => (egui::vec2(220.0, 130.0), 470.0),
+        Panel::Groups => (egui::vec2(220.0, 130.0), 470.0), // SCULPT_CORE22_GROUP_LIMIT
         Panel::History => (egui::vec2(200.0, 160.0), 720.0),
     };
     PanelLimits { min, max: egui::vec2(max_width, 1_000_000.0) }
+}
+
+#[cfg(test)]
+mod sculpt_core18_tests {
+    use super::*;
+    #[test]
+    fn sculpt_core18_memory_is_right_docked_by_default() {
+        let mut w = Workspace::default();
+        w.set_visible(Panel::Memory, true).unwrap();
+        assert!(w.layout.contains(&Panel::Memory));
+        assert!(!w.layout.floating.iter().any(|f| f.panels.contains(&Panel::Memory)));
+    }
 }

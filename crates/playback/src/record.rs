@@ -93,7 +93,19 @@ impl Recorder {
     pub fn open() -> Result<Recorder, String> {
         use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
         let host = cpal::default_host();
-        let device = host.default_input_device().ok_or("no audio input device")?;
+        // SCULPT_CORE22_INPUT_DEVICE: explicit input choice from shared audio settings.
+        let configured = crate::sculpt_audio_settings::AudioSettings::read();
+        let device = if configured.input_name.trim().is_empty() {
+            host.default_input_device().ok_or("no audio input device")?
+        } else {
+            #[allow(deprecated)]
+            let mut matches = host.input_devices().map_err(|e| e.to_string())?.filter(|d| d.name().is_ok_and(|name| name == configured.input_name));
+            let selected = matches.next().ok_or_else(|| format!("Input interface disconnected: {}", configured.input_name))?;
+            if matches.next().is_some() {
+                return Err("Ambiguous input interface name".into());
+            }
+            selected
+        };
         #[allow(deprecated)]
         let name = device.name().unwrap_or_else(|_| "Input".into());
         let cfg = device.default_input_config().map_err(|e| e.to_string())?;
