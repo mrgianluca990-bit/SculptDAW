@@ -46,7 +46,7 @@ fn process(e: &mut Engine, p: &Value) -> Result<Value> {
         if !clip.is_audio() {
             continue;
         }
-        let mut audio = soundcraft_mix::render_clips(e.session(), track, clip.range());
+        let mut audio = soundcraft_mix::render_clips_checked(e.session(), track, clip.range()).map_err(EngineError::Io)?;
         // Render without the clip's own fades: re-render a copy without fades so they stay editable.
         let mut tmp = e.session().clone();
         if let Some(c) = tmp.find_clip_mut(id) {
@@ -57,7 +57,7 @@ fn process(e: &mut Engine, p: &Value) -> Result<Value> {
         }
         if let Some(pl) = tmp.track_mut(track).and_then(|t| t.playlist_mut()) {
             pl.clips.retain(|c| c.id == id);
-            audio = soundcraft_mix::render_clips(&tmp, track, clip.range());
+            audio = soundcraft_mix::render_clips_checked(&tmp, track, clip.range()).map_err(EngineError::Io)?;
         }
         let srf = sr.as_f64() as f32;
         let out: Vec<Vec<f32>> = match name.as_str() {

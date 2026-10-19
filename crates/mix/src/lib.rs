@@ -1946,7 +1946,8 @@ fn apply_matrix(src: &[Vec<f32>], frames: usize, dst: &mut [Vec<f32>], m: &Matri
 }
 
 /// Ceiling on one offline render (samples summed over channels): 2^29 f32 = 2 GiB, about 93
-/// minutes of stereo at 48 kHz. Longer requests are truncated rather than exhausting memory.
+/// minutes of stereo at 48 kHz. Checked entry points reject larger requests before allocation;
+/// the legacy unchecked main renderer caps its range for compatibility.
 pub const MAX_RENDER_SAMPLES: usize = 1 << 29;
 
 /// Offline render of the main mix over `range` (planar, [`main_channels`] channels in SMPTE/WAV
@@ -1985,6 +1986,10 @@ fn check_render_plugins(eng: &MixEngine, s: &Session) -> Result<(), String> {
 
 fn render_range_impl(s: &Session, range: Range, block: usize, checked: bool) -> Result<Vec<Vec<f32>>, String> {
     let nch = main_channels(s);
+    if checked {
+        checked_render_len(range, nch)?;
+        check_offline_sources(s, range)?;
+    }
     let len = usize::try_from(range.len().max(0)).unwrap_or(0).min(MAX_RENDER_SAMPLES / nch.max(1));
     #[cfg(not(target_arch = "wasm32"))]
     let media = Arc::new(media::PreparedMedia::new(s).map_err(|e| format!("Media preparation: {e}"))?);
@@ -2011,6 +2016,9 @@ fn render_range_impl(s: &Session, range: Range, block: usize, checked: bool) -> 
         probe.latency
     };
     let total = len.saturating_add(latency);
+    if total.checked_mul(nch).is_none_or(|n| n > MAX_RENDER_SAMPLES) {
+        return Err("render plus latency exceeds the offline sample budget".into());
+    }
     let mut out = vec![vec![0.0f32; total]; nch];
     let mut eng = MixEngine::new(s.sample_rate.as_f64() as f32, block);
     #[cfg(not(target_arch = "wasm32"))]
@@ -2047,30 +2055,97 @@ fn render_range_impl(s: &Session, range: Range, block: usize, checked: bool) -> 
     Ok(out)
 }
 
+fn check_audio_payload(audio: &SourceAudio, rate: u32) -> Result<(), String> {
+    if audio.channels() == 0 || audio.frames() == 0 {
+        return Err("source audio is empty".into());
+    }
+    if audio.sample_rate() != rate {
+        return Err("source sample rate differs from the session; convert the media offline".into());
+    }
+    if !audio.has_uniform_channels() {
+        return Err("source audio channels have different lengths".into());
+    }
+    Ok(())
+}
+
+fn check_offline_sources(s: &Session, range: Range) -> Result<(), String> {
+    for track in s.tracks.iter().filter(|t| !t.inactive && t.kind == TrackKind::Audio) {
+        for clip in track.clips().iter().filter(|clip| !clip.muted && clip.range().overlaps(&range)) {
+            if let ClipContent::Audio { source, .. } = clip.content {
+                let audio = s.pool.get(source).ok_or_else(|| format!("{}: source audio is unavailable", clip.name))?;
+                check_audio_payload(audio, s.sample_rate.hz()).map_err(|error| format!("{}: {error}", clip.name))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn checked_render_len(range: Range, channels: usize) -> Result<usize, String> {
+    let len = usize::try_from(range.len().max(0)).map_err(|_| "render duration exceeds host range".to_string())?;
+    if channels == 0 || len.checked_mul(channels).is_none_or(|n| n > MAX_RENDER_SAMPLES) {
+        return Err("render exceeds the offline sample budget".into());
+    }
+    Ok(len)
+}
+
 /// Offline render of one bus over `range` (planar, the bus format's channel count).
 /// Track-insert compensation is removed, so a bus fed by tracks lines up with the timeline.
 /// An unknown bus is silent.
 pub fn render_bus(s: &Session, bus: BusId, range: Range, block: usize) -> Vec<Vec<f32>> {
+    render_bus_checked(s, bus, range, block).unwrap_or_else(|error| {
+        log::warn!("Bus render failed: {error}");
+        Vec::new()
+    })
+}
+
+pub fn render_bus_checked(s: &Session, bus: BusId, range: Range, block: usize) -> Result<Vec<Vec<f32>>, String> {
     let nch = s.bus(bus).map(|b| b.format.channels()).unwrap_or(0);
     if nch == 0 {
-        return Vec::new();
+        return Err("unknown or empty bus".into());
     }
-    let len = usize::try_from(range.len().max(0)).unwrap_or(0).min(MAX_RENDER_SAMPLES / nch);
+    let len = checked_render_len(range, nch)?;
+    check_offline_sources(s, range)?;
+    #[cfg(not(target_arch = "wasm32"))]
+    let media = Arc::new(media::PreparedMedia::new(s).map_err(|e| e.to_string())?);
     let latency = {
         let mut probe = MixEngine::new(s.sample_rate.as_f64() as f32, block);
         let b = probe.max_block();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            probe.set_media(Arc::clone(&media));
+            media.prepare_exact(range.start, b.min(len.max(1)), None, std::time::Duration::from_secs(3)).map_err(|e| e.to_string())?;
+        }
         probe.render(s, range.start, b.min(len.max(1)), &mut []);
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(error) = probe.take_media_error() {
+            return Err(error.to_string());
+        }
+        check_render_plugins(&probe, s)?;
         probe.track_latency
     };
     let total = len.saturating_add(latency);
+    if total.checked_mul(nch).is_none_or(|n| n > MAX_RENDER_SAMPLES) {
+        return Err("render plus latency exceeds the offline sample budget".into());
+    }
     let mut out = vec![vec![0.0f32; total]; nch];
     let mut eng = MixEngine::new(s.sample_rate.as_f64() as f32, block);
+    #[cfg(not(target_arch = "wasm32"))]
+    eng.set_media(Arc::clone(&media));
     let b = eng.max_block();
     let mut tmp = vec![vec![0.0f32; b]; nch];
     let mut done = 0usize;
     while done < total {
         let n = (total - done).min(b);
-        eng.render(s, range.start + done as i64, n, &mut []);
+        #[cfg(not(target_arch = "wasm32"))]
+        media.prepare_exact(range.start.saturating_add(done as i64), n, None, std::time::Duration::from_secs(3)).map_err(|e| e.to_string())?;
+        eng.render(s, range.start.saturating_add(done as i64), n, &mut []);
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(error) = eng.take_media_error() {
+            return Err(error.to_string());
+        }
+        if done == 0 {
+            check_render_plugins(&eng, s)?;
+        }
         eng.copy_bus(bus, n, &mut tmp);
         for (o, t) in out.iter_mut().zip(tmp.iter()) {
             if let (Some(d), Some(sr)) = (o.get_mut(done..done + n), t.get(..n)) {
@@ -2084,7 +2159,7 @@ pub fn render_bus(s: &Session, bus: BusId, range: Range, block: usize) -> Vec<Ve
             c.drain(..latency.min(c.len()));
         }
     }
-    out
+    Ok(out)
 }
 
 /// ITU-R BS.775 stereo fold-down of planar audio in `fmt` (C and surrounds at -3 dB, LFE dropped;
@@ -2119,8 +2194,24 @@ pub fn fold_down_stereo(fmt: ChannelFormat, ch: &[Vec<f32>]) -> Vec<Vec<f32>> {
 
 /// Render only one track's clips (no mixer processing) — Consolidate.
 pub fn render_clips(s: &Session, track: TrackId, range: Range) -> Vec<Vec<f32>> {
-    let Some(t) = s.track(track) else { return Vec::new() };
-    let len = usize::try_from(range.len().max(0)).unwrap_or(0).min(MAX_RENDER_SAMPLES / t.channels().max(1));
+    render_clips_checked(s, track, range).unwrap_or_else(|error| {
+        log::warn!("Clip render failed: {error}");
+        Vec::new()
+    })
+}
+
+pub fn render_clips_checked(s: &Session, track: TrackId, range: Range) -> Result<Vec<Vec<f32>>, String> {
+    let t = s.track(track).ok_or_else(|| "unknown track".to_string())?;
+    let len = checked_render_len(range, t.channels().max(1))?;
+    #[cfg(not(target_arch = "wasm32"))]
+    let media = {
+        let mut isolated = s.clone();
+        isolated.tracks.retain(|t| t.id == track);
+        for track in &mut isolated.tracks {
+            track.inactive = false;
+        }
+        media::PreparedMedia::new(&isolated).map_err(|e| e.to_string())?
+    };
     let mut out = vec![vec![0.0f32; len]; t.channels().max(1)];
     let mut scratch = Vec::new();
     for c in t.clips() {
@@ -2128,7 +2219,7 @@ pub fn render_clips(s: &Session, track: TrackId, range: Range) -> Vec<Vec<f32>> 
             continue;
         }
         match clip_fx_params(s, c.id.0) {
-            None => render_clip(
+            None => render_clip_offline(
                 s,
                 c,
                 range.start,
@@ -2136,11 +2227,11 @@ pub fn render_clips(s: &Session, track: TrackId, range: Range) -> Vec<Vec<f32>> 
                 &mut out,
                 &mut scratch,
                 #[cfg(not(target_arch = "wasm32"))]
-                None,
-            ),
+                &media,
+            )?,
             Some(params) => {
                 let mut tmp = vec![vec![0.0f32; len]; out.len()];
-                render_clip(
+                render_clip_offline(
                     s,
                     c,
                     range.start,
@@ -2148,8 +2239,8 @@ pub fn render_clips(s: &Session, track: TrackId, range: Range) -> Vec<Vec<f32>> 
                     &mut tmp,
                     &mut scratch,
                     #[cfg(not(target_arch = "wasm32"))]
-                    None,
-                );
+                    &media,
+                )?;
                 let mut fx = ClipFx::new(s.sample_rate.as_f64() as f32, tmp.len());
                 fx.configure(&params);
                 let mut done = 0;
@@ -2169,11 +2260,77 @@ pub fn render_clips(s: &Session, track: TrackId, range: Range) -> Vec<Vec<f32>> 
             }
         }
     }
-    out
+    Ok(out)
+}
+
+/// Render one clip without materializing its source. Chunks begin at the first overlap so
+/// 32-sample gain interpolation keeps the phase of the original whole-range resident path.
+fn render_clip_offline(
+    s: &Session,
+    clip: &Clip,
+    pos: Samples,
+    frames: usize,
+    out: &mut [Vec<f32>],
+    scratch: &mut [f32],
+    #[cfg(not(target_arch = "wasm32"))] media: &media::PreparedMedia,
+) -> Result<(), String> {
+    let block = Range { start: pos, end: pos.saturating_add(i64::try_from(frames).unwrap_or(i64::MAX)) };
+    let Some(overlap) = clip.range().intersect(&block) else { return Ok(()) };
+    let ClipContent::Audio { source, .. } = clip.content else { return Ok(()) };
+    let audio = s.pool.get(source).ok_or_else(|| format!("{}: source audio is unavailable", clip.name))?;
+    check_audio_payload(audio, s.sample_rate.hz()).map_err(|error| format!("{}: {error}", clip.name))?;
+    #[cfg(not(target_arch = "wasm32"))]
+    if !audio.is_resident() {
+        let mut tmp = vec![vec![0.0f32; 512]; out.len()];
+        let mut at = overlap.start;
+        while at < overlap.end {
+            let n = usize::try_from(overlap.end.saturating_sub(at)).unwrap_or(512).min(512);
+            media.prepare_exact(at, n, None, std::time::Duration::from_secs(3)).map_err(|e| e.to_string())?;
+            for channel in &mut tmp {
+                channel.fill(0.0);
+            }
+            render_clip(s, clip, at, n, &mut tmp, scratch, Some(media));
+            if let Some(error) = media.take_error() {
+                return Err(error.to_string());
+            }
+            let dest = usize::try_from(at.saturating_sub(pos)).map_err(|_| "clip output offset overflow".to_string())?;
+            for (dst, src) in out.iter_mut().zip(&tmp) {
+                if let Some(dst) = dst.get_mut(dest..dest.saturating_add(n)) {
+                    for (d, &x) in dst.iter_mut().zip(src) {
+                        *d += x;
+                    }
+                }
+            }
+            at = at.saturating_add(n as i64);
+        }
+        return Ok(());
+    }
+    let _ = audio;
+    render_clip(
+        s,
+        clip,
+        pos,
+        frames,
+        out,
+        scratch,
+        #[cfg(not(target_arch = "wasm32"))]
+        Some(media),
+    );
+    Ok(())
 }
 
 /// Render one track through its inserts (pre-fader) — Commit / Freeze.
 pub fn render_track_pre_fader(s: &Session, track: TrackId, range: Range) -> Vec<Vec<f32>> {
+    render_track_pre_fader_checked(s, track, range).unwrap_or_else(|error| {
+        log::warn!("Track render failed: {error}");
+        Vec::new()
+    })
+}
+
+pub fn render_track_pre_fader_checked(s: &Session, track: TrackId, range: Range) -> Result<Vec<Vec<f32>>, String> {
+    if s.track(track).is_none() {
+        return Err("unknown track".into());
+    }
     let mut solo = s.clone();
     // Multichannel tracks render into a main mix of their own format (straight through).
     let fmt = s.track(track).map_or(ChannelFormat::Stereo, |t| if t.channels() > 2 { t.format } else { ChannelFormat::Stereo });
@@ -2196,7 +2353,7 @@ pub fn render_track_pre_fader(s: &Session, track: TrackId, range: Range) -> Vec<
             t.inactive = true;
         }
     }
-    let mut out = render_range(&solo, range, 1024);
+    let mut out = render_range_checked(&solo, range, 1024)?;
     // Mono tracks: fold back to one channel (undo the centre pan law).
     if s.track(track).is_some_and(|t| t.channels() == 1)
         && let Some(l) = out.first().cloned()
@@ -2204,7 +2361,7 @@ pub fn render_track_pre_fader(s: &Session, track: TrackId, range: Range) -> Vec<
         let g = std::f32::consts::SQRT_2;
         out = vec![l.iter().map(|x| x * g).collect()];
     }
-    out
+    Ok(out)
 }
 
 /// A built-in plugin, else a hosted CLAP plugin (`clap:<id>`).

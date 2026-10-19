@@ -44,3 +44,21 @@ fn cmd_equals_toggles_mix_and_edit_without_zooming() {
         assert_eq!(ctx.zoom_factor(), 1.25, "{os:?}");
     }
 }
+
+#[test]
+fn tab_to_transient_reports_unavailable_audio_without_moving_selection() {
+    let mut app = SoundApp::new(soundcraft_engine::demo::demo_engine(), None, Services::default());
+    let track = app.engine.session().track_by_name("Kick").unwrap().id;
+    let source = app.engine.session().track(track).unwrap().clips()[0].source().unwrap();
+    let s = app.engine.session_mut();
+    s.edit.tab_to_transient = true;
+    s.edit.selected_tracks = vec![track];
+    s.edit.selection = soundcraft_time::Range::new(1, 1);
+    s.pool.remove(source);
+    let before = app.engine.session().edit.selection;
+    let position = app.engine.transport.position;
+    press(&egui::Context::default(), &mut app, Key::Tab, Modifiers::NONE);
+    assert_eq!(app.engine.session().edit.selection, before);
+    assert_eq!(app.engine.transport.position, position);
+    assert!(app.engine.messages.iter().any(|message| message.contains("Transient detection failed") && message.contains("unavailable")));
+}

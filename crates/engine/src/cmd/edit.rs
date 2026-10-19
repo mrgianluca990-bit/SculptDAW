@@ -554,7 +554,7 @@ fn separate_at_transients(e: &mut Engine, p: &Value) -> Result<Value> {
     let s = e.session_mut();
     let mut n = 0;
     for t in &tracks {
-        let hits = crate::io::transients_in(s, *t, r, sens);
+        let hits = crate::io::transients_in(s, *t, r, sens)?;
         for at in hits {
             n += ops::separate_at(s, *t, at);
         }
@@ -668,7 +668,7 @@ fn strip_silence(e: &mut Engine, p: &Value) -> Result<Value> {
     let s = e.session_mut();
     let mut kept = 0;
     for t in &tracks {
-        kept += crate::io::strip_silence(s, *t, r, thr, min_len, pre, post);
+        kept += crate::io::strip_silence(s, *t, r, thr, min_len, pre, post)?;
     }
     Ok(json!({"clips": kept}))
 }
