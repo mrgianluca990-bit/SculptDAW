@@ -33,3 +33,7 @@ QA: PR #3 `feature/qa-native-checks`, commit `04be12c`: gate nativo unico e pack
 Core29: lettore a blocchi implementato con 7 regressioni e gate completo locale da 720 test passati, secondo `QA/CORE29_STREAM_READER.md`. PR #4, commit `23d556e`. Core30 introduce la cache condivisa; integrazione ancora da fare: nessuna chiusura della fase streaming dichiarata e nessuna nuova app ancora consegnata.
 
 Core30: pool PCM condiviso con budget configurabile (32 MiB di default, massimo 256 MiB), un worker disco, pagine protette da lettori, richieste atomiche, prefetch e destinazione loop. Errori di capienza/media/lettura espliciti e permanenti per la singola view; retry mediante nuova view. Sette regressioni nuove e gate completo locale superati (727 test numerici più harness UI), secondo `QA/CORE30_STREAM_CACHE.md`. Componente non ancora usato dal playback.
+
+Core31: sei regressioni e gate locale completo passati (733 test numerici più harness UI), secondo `QA/CORE31_BOUNDED_OVERVIEWS.md`. waveform progressive con budget condiviso fra canali e risoluzione adattata alla durata; cancellazione e rifiuto di input incompleti. La preparazione legge a blocchi fuori callback, non memorizza tutto il PCM. Il collegamento a SourceAudio/player resta successivo; nessuna attivazione parziale che comprometta il bridge. Core30 pubblicato in PR #5, commit `46b1266`; CI remota da verificare.
+
+CI Core29 verificata: run `39253262657`, conclusa con successo sul commit `23d556e`.

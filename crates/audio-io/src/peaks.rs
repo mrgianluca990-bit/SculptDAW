@@ -1,6 +1,6 @@
 //! Multi-resolution min/max overview for waveform drawing.
 //!
-//! Level 0 holds the (min, max) of each block of [`BLOCK`] samples; each following level merges
+//! Level 0 holds the (min, max) of each base block (normally [`BLOCK`] samples); each following level merges
 //! [`FANOUT`] blocks of the level below, until a level has a single block. Range queries combine
 //! the coarsest whole blocks that fit inside the range, so a query costs O(log n) regardless of
 //! zoom.
@@ -12,11 +12,18 @@ pub const FANOUT: usize = 4;
 /// Upper bound on the number of columns [`Peaks::columns`] will produce.
 pub const MAX_COLUMNS: usize = 1 << 20;
 
-/// Multi-resolution min/max overview for waveform drawing. Level 0 = blocks of 32 samples; each next level merges 4.
+/// Multi-resolution min/max overview. Resident builds use blocks of 32 samples; bounded builds
+/// may use larger blocks. Each parent level merges four blocks.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Peaks {
     len: usize,
+    #[serde(default = "default_block")]
+    block: usize,
     levels: Vec<Vec<(f32, f32)>>,
+}
+
+const fn default_block() -> usize {
+    BLOCK
 }
 
 const EMPTY: (f32, f32) = (f32::INFINITY, f32::NEG_INFINITY);
@@ -35,7 +42,7 @@ impl Peaks {
         let mut levels = Vec::new();
         let level0: Vec<(f32, f32)> = samples.chunks(BLOCK).map(|c| finish(c.iter().fold(EMPTY, |acc, &s| merge(acc, (s, s))))).collect();
         if level0.is_empty() {
-            return Peaks { len: 0, levels };
+            return Peaks { len: 0, block: BLOCK, levels };
         }
         levels.push(level0);
         while let Some(last) = levels.last() {
@@ -45,12 +52,17 @@ impl Peaks {
             let next: Vec<(f32, f32)> = last.chunks(FANOUT).map(|c| c.iter().fold(EMPTY, |acc, &b| merge(acc, b))).collect();
             levels.push(next);
         }
-        Peaks { len: samples.len(), levels }
+        Peaks { len: samples.len(), block: BLOCK, levels }
     }
 
     /// Number of samples the overview was built from.
     pub fn len_samples(&self) -> usize {
         self.len
+    }
+
+    /// Finest overview resolution; bounded disk overviews may be coarser than resident ones.
+    pub fn resolution_samples(&self) -> usize {
+        self.block.max(1)
     }
 
     /// Number of resolution levels (0 for an empty overview).
@@ -59,7 +71,7 @@ impl Peaks {
     }
 
     /// (min, max) over the sample range `[start, end)`, clamped to the data. Exact when both ends
-    /// are multiples of 32 (or `end` is the data length); otherwise the partial blocks at the edges
+    /// are multiples of `resolution_samples()` (or `end` is the data length); otherwise partial edge blocks
     /// contribute their whole block's extremes, so the result always contains the true range.
     /// Returns `(0.0, 0.0)` for an empty range.
     pub fn minmax(&self, start: usize, end: usize) -> (f32, f32) {
@@ -67,8 +79,9 @@ impl Peaks {
         if start >= end {
             return (0.0, 0.0);
         }
-        let mut lo = start / BLOCK;
-        let mut hi = end.div_ceil(BLOCK);
+        let block = self.block.max(1);
+        let mut lo = start / block;
+        let mut hi = end.div_ceil(block);
         let mut acc = EMPTY;
         let mut lvl = 0usize;
         while lo < hi {
@@ -117,6 +130,65 @@ impl Peaks {
             *slot = self.minmax(si as usize, ei as usize);
         }
         out
+    }
+}
+
+/// Incremental overview builder with an explicit level-zero block budget. Its resolution is
+/// chosen before reading, so neither PCM nor overview storage grows with file duration.
+pub struct PeaksBuilder {
+    expected: usize,
+    received: usize,
+    block: usize,
+    partial: usize,
+    extrema: (f32, f32),
+    blocks: Vec<(f32, f32)>,
+}
+impl PeaksBuilder {
+    /// At most 1,048,576 base blocks (8 MiB); parent levels add less than one third.
+    pub fn new(frames: usize, max_blocks: usize) -> crate::Result<Self> {
+        if !(1..=MAX_COLUMNS).contains(&max_blocks) {
+            return Err(crate::AudioError::TooLarge("invalid waveform block budget".into()));
+        }
+        let needed = frames.div_ceil(max_blocks).max(BLOCK);
+        let block = needed.checked_next_power_of_two().ok_or_else(|| crate::AudioError::TooLarge("waveform frame count overflow".into()))?;
+        let mut blocks = Vec::new();
+        blocks.try_reserve_exact(frames.div_ceil(block)).map_err(|e| crate::AudioError::TooLarge(e.to_string()))?;
+        Ok(Self { expected: frames, received: 0, block, partial: 0, extrema: EMPTY, blocks })
+    }
+    pub fn push(&mut self, samples: &[f32]) -> crate::Result<()> {
+        if samples.len() > self.expected.saturating_sub(self.received) {
+            return Err(crate::AudioError::Malformed("waveform input exceeds its declared length".into()));
+        }
+        self.received += samples.len();
+        for &sample in samples {
+            self.extrema = merge(self.extrema, (sample, sample));
+            self.partial += 1;
+            if self.partial == self.block {
+                self.blocks.push(finish(self.extrema));
+                self.partial = 0;
+                self.extrema = EMPTY;
+            }
+        }
+        Ok(())
+    }
+    pub fn finish(mut self) -> crate::Result<Peaks> {
+        if self.received != self.expected {
+            return Err(crate::AudioError::Malformed("waveform input ended before its declared length".into()));
+        }
+        if self.partial > 0 {
+            self.blocks.push(finish(self.extrema));
+        }
+        let mut levels = Vec::new();
+        if !self.blocks.is_empty() {
+            levels.push(self.blocks);
+        }
+        while let Some(last) = levels.last() {
+            if last.len() <= 1 {
+                break;
+            }
+            levels.push(last.chunks(FANOUT).map(|c| c.iter().fold(EMPTY, |acc, &b| merge(acc, b))).collect());
+        }
+        Ok(Peaks { len: self.expected, block: self.block, levels })
     }
 }
 
@@ -193,5 +265,58 @@ mod tests {
         assert_eq!(cols[1], (0.0, 0.0));
         // Zoomed in further than one sample per column.
         assert_eq!(p.columns(0.0, 4.0, 8).len(), 8);
+    }
+}
+
+#[cfg(test)]
+mod bounded_tests {
+    use super::*;
+    #[test]
+    fn incremental_chunks_match_existing_overview_exactly() {
+        let samples: Vec<_> = (0..4103).map(|f| (f as f32 * 0.017).sin()).collect();
+        let mut builder = PeaksBuilder::new(samples.len(), 200).unwrap();
+        for chunk in samples.chunks(13) {
+            builder.push(chunk).unwrap();
+        }
+        assert_eq!(builder.finish().unwrap(), Peaks::build(&samples));
+    }
+    #[test]
+    fn bounded_overview_contains_true_extrema_and_never_exceeds_budget() {
+        let samples: Vec<_> = (0..100_003).map(|f| (f as f32 * 0.17).sin()).collect();
+        let mut builder = PeaksBuilder::new(samples.len(), 64).unwrap();
+        for chunk in samples.chunks(777) {
+            builder.push(chunk).unwrap();
+        }
+        let peaks = builder.finish().unwrap();
+        assert!(peaks.levels[0].len() <= 64);
+        assert!(peaks.levels.iter().map(Vec::len).sum::<usize>() <= 90);
+        assert_eq!(peaks.len_samples(), samples.len());
+        for start in (0..samples.len()).step_by(1013) {
+            let end = (start + 701).min(samples.len());
+            let (lo, hi) = peaks.minmax(start, end);
+            assert!(samples[start..end].iter().all(|&x| x >= lo && x <= hi));
+        }
+        assert_eq!(peaks.columns(0.0, samples.len() as f64, 100).len(), 100);
+    }
+    #[test]
+    fn legacy_serialization_defaults_to_original_resolution() {
+        let peaks = Peaks::build(&[0.3, -0.7, 0.9]);
+        let mut serialized = serde_json::to_value(&peaks).unwrap();
+        serialized.as_object_mut().unwrap().remove("block");
+        let restored: Peaks = serde_json::from_value(serialized).unwrap();
+        assert_eq!(restored, peaks);
+    }
+    #[test]
+    fn incomplete_excessive_and_hostile_lengths_are_rejected() {
+        assert!(PeaksBuilder::new(100, 0).is_err());
+        assert!(PeaksBuilder::new(100, usize::MAX).is_err());
+        assert!(PeaksBuilder::new(usize::MAX, 1).is_err());
+        let mut builder = PeaksBuilder::new(5, 1).unwrap();
+        assert!(builder.push(&[1.0; 6]).is_err());
+        builder.push(&[1.0; 3]).unwrap();
+        assert!(builder.finish().is_err());
+        let empty = PeaksBuilder::new(0, 1).unwrap().finish().unwrap();
+        assert_eq!(empty.len_samples(), 0);
+        assert_eq!(empty.minmax(0, 100), (0.0, 0.0));
     }
 }
