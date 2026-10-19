@@ -1,10 +1,12 @@
+> Sculpt review — 2026-10-19: [audit of the actual Core27 code and scoped Core28 correction](../SCULPT_DAW_AUDIT.md). Recording already streams to disk; source playback and take import at stop still decode whole files into RAM (G-06 partially open). Reported input-stream errors now stop REC and require explicit reconnect. Clock drift, hardware latency calibration, output recovery and callback preparation remain open; no readiness percentage has been remeasured.
+
 > Sculpt update — 2026-10-19: Core26 device/buffer selection and Core27 named Input/Output/Bus setup supersede the historical missing-selection statements below for Sculpt. Hardware inserts, duplex clocking/latency calibration, bus recording and hierarchical subpaths remain open. See [Core27](../QA/CORE27_IO_SETUP.md).
 
 > Sculpt fork update — 2026-10-18: Core15–24 consolidated into source; development infrastructure and bidirectional bridge in feature verification. See [development status](SCULPT_DEVELOPMENT.md). Upstream assessments below are historical, not new test results.
 
 # Where SoundCraft falls short of Pro Tools
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-10 · **Change:** minor (alpha blockers marked after the core-workflow gate) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-10-19 · **Last updated:** 2026-10-19 · **Change:** minor (Sculpt audit; input failure handling, recording/streaming distinction) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 Every known shortfall, one entry each, ranked by how much it stops a Pro Tools user from doing
 real work in SoundCraft. This is the work list: pick from the top. Rows marked **alpha blocker**
@@ -200,5 +202,6 @@ missing. Out of scope unless the owner decides otherwise.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-19 | minor | Sculpt code audit and input-stream failure handling; G-06 disk recording already present, source streaming still missing; upstream rows kept as historical evidence |
 | 2026-10-10 | minor | Marked the alpha blockers (G-01, G-02, G-03; parts of G-05 and G-06) from the core-workflow gate |
 | 2026-10-10 | major | Created from the full re-measure against Pro Tools Ultimate 2026.4.1: 22 ranked gaps with evidence and estimates |

@@ -64,6 +64,17 @@ struct Shared {
     dropped: AtomicUsize,
 }
 
+/// The actual CPAL error callback, also exercised without an audio device by the regression test.
+#[cfg(not(target_os = "freebsd"))]
+fn input_error_callback(monitor: Arc<InputRing>) -> impl FnMut(cpal::StreamError) + Send + 'static {
+    move |error| {
+        // Possibly the audio thread: the logger must hand the record off rather than write it.
+        crate::mark_audio_thread();
+        monitor.fail_stream();
+        log::warn!("input stream error: {error}");
+    }
+}
+
 impl Shared {
     /// The input callback's work while armed. Samples that don't fit are owed (`owed`) and queued
     /// as silence before the next block, so the take keeps its timing.
@@ -85,6 +96,7 @@ pub struct Recorder {
     pub sample_rate: u32,
     pub channels: usize,
     writer: Option<std::thread::JoinHandle<Takes>>,
+    failure_reported: bool,
 }
 
 impl Recorder {
@@ -133,22 +145,27 @@ impl Recorder {
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
                     crate::mark_audio_thread();
                     mon.push(data);
-                    if sh.armed.load(Ordering::Acquire) {
+                    if sh.armed.load(Ordering::Acquire) && !mon.stream_failed() {
                         sh.capture(data, &mut owed);
                     } else {
                         owed = 0;
                     }
                 },
-                |e| {
-                    // Possibly the audio thread (see `crate::mark_audio_thread`).
-                    crate::mark_audio_thread();
-                    log::warn!("input stream error: {e}");
-                },
+                input_error_callback(Arc::clone(&monitor)),
                 None,
             )
             .map_err(|e| e.to_string())?;
         stream.play().map_err(|e| e.to_string())?;
-        Ok(Recorder { monitor, shared, _stream: Some(stream), device_name: name, sample_rate: config.sample_rate.0, channels, writer: None })
+        Ok(Recorder {
+            monitor,
+            shared,
+            _stream: Some(stream),
+            device_name: name,
+            sample_rate: config.sample_rate.0,
+            channels,
+            writer: None,
+            failure_reported: false,
+        })
     }
 
     #[cfg(target_os = "freebsd")]
@@ -163,6 +180,9 @@ impl Recorder {
 
     /// Create each take's file and start recording into them.
     pub fn arm(&mut self, takes: Vec<(TrackId, Vec<usize>, PathBuf)>) -> Result<(), String> {
+        if self.monitor.stream_failed() {
+            return Err("Audio input stream failed. Reopen the input in Playback Engine before recording.".into());
+        }
         if self.writer.is_some() {
             return Err("already recording".into());
         }
@@ -188,7 +208,25 @@ impl Recorder {
         let lost = self.shared.dropped.swap(0, Ordering::Relaxed) / self.channels.max(1);
         let slow =
             (lost > 0).then(|| format!("{} ms of input lost: the disk was too slow", lost.saturating_mul(1000) / self.sample_rate.max(1) as usize));
-        (takes, problem.or(slow))
+        let stream_problem =
+            self.monitor.stream_failed().then(|| "Audio input stream failed; the take contains only audio captured before the failure.".into());
+        let problems: Vec<String> = [problem, slow, stream_problem].into_iter().flatten().collect();
+        (takes, (!problems.is_empty()).then(|| problems.join("; ")))
+    }
+
+    /// Report a failed input once to the UI. The failure stays latched until the stream is reopened.
+    pub fn take_stream_failure(&mut self) -> bool {
+        if self.stream_failed() && !self.failure_reported {
+            self.failure_reported = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// A reported stream error remains latched until a new Recorder is opened.
+    pub fn stream_failed(&self) -> bool {
+        self.monitor.stream_failed()
     }
 }
 
@@ -329,6 +367,46 @@ mod tests {
         assert_eq!(decode(&done[1].1), vec![[vec![0.5; 100], vec![0.25; 50], channel(0)].concat()]);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    #[cfg(not(target_os = "freebsd"))]
+    fn failed_input_finalizes_captured_stereo_and_cannot_rearm() {
+        let dir = std::env::temp_dir().join(format!("sculpt-failed-input-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let shared = Arc::new(Shared { armed: AtomicBool::new(false), ring: CaptureRing::new(1024), dropped: AtomicUsize::new(0) });
+        let mut recorder = Recorder {
+            shared,
+            monitor: InputRing::new(2, 48_000),
+            #[cfg(not(target_os = "freebsd"))]
+            _stream: None,
+            device_name: "Synthetic input".into(),
+            sample_rate: 48_000,
+            channels: 2,
+            writer: None,
+            failure_reported: false,
+        };
+        assert!(!recorder.take_stream_failure());
+        let path = dir.join("take.wav");
+        recorder.arm(vec![(TrackId(1), vec![0, 1], path.clone())]).unwrap();
+        let input: Vec<f32> = (0..256).map(|i| i as f32 / 512.0).collect();
+        recorder.shared.capture(&input, &mut 0);
+        recorder.monitor.push(&input);
+        let mut on_error = input_error_callback(Arc::clone(&recorder.monitor));
+        std::thread::spawn(move || on_error(cpal::StreamError::DeviceNotAvailable)).join().unwrap();
+        assert!(recorder.take_stream_failure());
+        assert!(!recorder.take_stream_failure(), "one UI notification per stream");
+        let (takes, problem) = recorder.finish();
+        assert_eq!(takes, vec![(TrackId(1), path.clone())]);
+        assert!(problem.unwrap().contains("input stream failed"));
+        assert_eq!(decode(&path), vec![input.iter().step_by(2).copied().collect::<Vec<_>>(), input.iter().skip(1).step_by(2).copied().collect()]);
+        let mut monitor = vec![vec![1.0; 32]; 2];
+        recorder.monitor.pop_into(&mut monitor, 32, 48_000);
+        assert!(monitor.iter().flatten().all(|x| *x == 0.0), "never replay stale monitoring audio");
+        let next = dir.join("must-not-exist.wav");
+        assert!(recorder.arm(vec![(TrackId(1), vec![0, 1], next.clone())]).is_err());
+        assert!(!next.exists(), "reject before creating any take files");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 /// Ring state behind the lock: interleaved input frames at the input device's rate, plus the
@@ -343,6 +421,7 @@ struct RingState {
 /// The input device may run at a different rate than the session, so the reader converts
 /// rates with linear interpolation (cheap, allocation-free, fine for monitoring).
 pub struct InputRing {
+    stream_failed: AtomicBool,
     state: Mutex<RingState>,
     pub channels: std::sync::atomic::AtomicUsize,
     /// Input device sample rate in Hz (0 when unknown, which reads as "same as the session").
@@ -356,6 +435,7 @@ impl InputRing {
         let ch = channels.max(1);
         let frames = if rate == 0 { 24_000 } else { rate as usize / 2 };
         Arc::new(InputRing {
+            stream_failed: AtomicBool::new(false),
             state: Mutex::new(RingState { data: std::collections::VecDeque::with_capacity(rate.max(48_000) as usize * ch), phase: 0.0 }),
             channels: std::sync::atomic::AtomicUsize::new(ch),
             rate,
@@ -364,6 +444,9 @@ impl InputRing {
     }
 
     pub fn push(&self, samples: &[f32]) {
+        if self.stream_failed() {
+            return;
+        }
         if let Ok(mut s) = self.state.try_lock() {
             s.data.extend(samples.iter().copied());
             while s.data.len() > self.cap {
@@ -372,12 +455,24 @@ impl InputRing {
         }
     }
 
+    #[cfg(not(target_os = "freebsd"))]
+    fn fail_stream(&self) {
+        self.stream_failed.store(true, Ordering::Release);
+    }
+
+    fn stream_failed(&self) -> bool {
+        self.stream_failed.load(Ordering::Acquire)
+    }
+
     /// Fill `out` (planar, at `session_rate`) with up to `frames` frames, converting from the
     /// input rate. Missing frames are silence.
     pub fn pop_into(&self, out: &mut [Vec<f32>], frames: usize, session_rate: u32) {
         let ch = self.channels.load(Ordering::Relaxed).max(1);
         for c in out.iter_mut() {
             c.iter_mut().take(frames).for_each(|x| *x = 0.0);
+        }
+        if self.stream_failed() {
+            return;
         }
         let Ok(mut s) = self.state.try_lock() else { return };
         // Input frames consumed per output frame.
