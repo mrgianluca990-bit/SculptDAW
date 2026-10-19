@@ -492,6 +492,9 @@ pub fn playback_engine(app: &mut SoundApp, ctx: &egui::Context) {
         }
         if let Some(input) = &app.recorder {
             ui.label(format!("Input: {} · {} Hz · {} channels", input.device_name, input.sample_rate, input.channels));
+            if input.stream_failed() {
+                ui.colored_label(egui::Color32::YELLOW, "Input stream failed. Check the interface, then use Apply and reconnect audio.");
+            }
         } else {
             ui.label("Input opens when recording or monitoring is requested");
         }

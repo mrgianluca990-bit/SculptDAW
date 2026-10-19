@@ -1,3 +1,5 @@
+> Sculpt audit — 2026-10-19: [current code audit](SCULPT_DAW_AUDIT.md) distinguishes implemented disk recording from missing source streaming. Core28 handles reported input-stream failure, finalizes captured takes and blocks recording until explicit reconnect; see [scope and checks](QA/CORE28_INPUT_STREAM_FAILURE.md). Hardware acceptance remains required. Historical upstream readiness figures below are not current measurements of Sculpt.
+
 > Sculpt update — 2026-10-19: Core27 adds named input/output matrices and mapped output buses with atomic Apply/Undo. See [Core27 scope and validation](QA/CORE27_IO_SETUP.md); historical upstream parity figures below are unchanged.
 
 > Sculpt fork update — 2026-10-18: Core15–24 consolidated into source; development infrastructure and bidirectional bridge in feature verification. See [development status](docs/SCULPT_DEVELOPMENT.md). Upstream assessments below are historical, not new test results.
@@ -6,7 +8,7 @@
 
 **Stage: pre-alpha** · next: alpha, ~5% and ~110–180 h away (the alpha gate's three failing workflows)
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-10 · **Change:** minor (readiness by audience with hours to ~95 %) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-10-19 · **Last updated:** 2026-10-19 · **Change:** minor (Sculpt code audit and Core28 input failure; upstream estimates unchanged) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 SoundCraft is a clean-room, pure-Rust digital audio workstation that aims at full parity with
 Avid Pro Tools, and then beyond it: faster, open, scriptable and agent-controllable. This page is
@@ -147,6 +149,7 @@ mutated and truncated movies. Field reports from the first public week are track
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-19 | minor | Sculpt audit and scoped input-stream failure handling; historical upstream readiness estimates not remeasured |
 | 2026-10-10 | minor | Readiness-by-audience table with hours: full 950–1,450 h, mainstream 380–600 h, essentials 110–200 h |
 | 2026-10-10 | minor | Added mainstream practitioner ~36 % and essentials user ~57 % to the headline numbers |
 | 2026-10-10 | minor | Stage alpha → pre-alpha: the core-workflow gate fails on interface recording, MIDI recording and session interchange; alpha distance added |

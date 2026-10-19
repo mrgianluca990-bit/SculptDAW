@@ -1,4 +1,4 @@
-name: Sculpt DAW Core27 — I/O Setup and bridge checks
+name: Sculpt DAW Core28 — input failure, I/O and bridge checks
 on:
   push:
     branches: [main, develop, 'feature/**']
@@ -8,7 +8,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: sculpt-daw-${{ github.ref }}
+  group: sculpt-daw-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 jobs:
   macos:
@@ -18,6 +18,8 @@ jobs:
       SCULPT_BRIDGE_VALIDATOR: /tmp/sculpt-bridge-validator
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin,wasm32-unknown-unknown
@@ -46,6 +48,7 @@ jobs:
         run: |
           cargo test --locked -p soundcraft-playback --lib
           cargo test --locked -p soundcraft-ui-egui --lib sculpt_core26_audio_tests
+          cargo test --locked -p soundcraft-ui-egui --lib input_stream_failure
       - name: I/O identity, signal routing and UI transaction regressions
         run: |
           cargo test --locked -p soundcraft-model --lib io_paths

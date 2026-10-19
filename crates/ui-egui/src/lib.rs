@@ -675,6 +675,20 @@ impl SoundApp {
         }
     }
 
+    /// Keep captured takes, but never leave the record transport running on a failed input.
+    fn stop_for_input_failure(&mut self) {
+        if self.engine.transport.recording {
+            self.stop_play();
+            self.ui.status = format!(
+                "Recording stopped after an input stream failure. {} Reopen the input in Playback Engine before recording again.",
+                self.ui.status
+            );
+        } else {
+            self.ui.status = "Audio input stream failed. Reopen the input in Playback Engine to restore input monitoring and recording.".into();
+        }
+        self.recorder_failed = true;
+    }
+
     /// While playing, record volume automation from fader positions for tracks in Write mode, and
     /// for Touch/Latch tracks whose fader is (or, for Latch, was) being moved. One undo step per pass.
     fn write_automation(&mut self, ctx: &egui::Context) {
@@ -810,6 +824,9 @@ impl SoundApp {
                 TransportRequest::Scrub(at) => self.engine.transport.position = at,
                 TransportRequest::AllNotesOff => {}
             }
+        }
+        if self.recorder.as_mut().is_some_and(soundcraft_playback::record::Recorder::take_stream_failure) {
+            self.stop_for_input_failure();
         }
         // Read back the position.
         if let Some(p) = &self.player {
@@ -1036,6 +1053,29 @@ fn feed_meter(d: &mut MeterDisplay, peak: [f32; 2], gr: f32, dt: f32) {
 mod tests {
     use super::{Services, SoundApp, automation_step_due};
     use serde_json::json;
+
+    #[test]
+    fn input_stream_failure_stops_recording_and_blocks_automatic_reopen() {
+        let mut app = SoundApp::new(soundcraft_engine::demo::demo_engine(), None, Services::default());
+        app.play_from_selection();
+        app.engine.transport.recording = true;
+        app.stop_for_input_failure();
+        assert!(!app.is_playing());
+        assert!(!app.engine.transport.recording);
+        assert!(app.recorder_failed);
+        assert!(app.sim.is_none());
+        assert!(app.ui.status.contains("Playback Engine"));
+    }
+
+    #[test]
+    fn input_stream_failure_does_not_stop_playback_without_recording() {
+        let mut app = SoundApp::new(soundcraft_engine::demo::demo_engine(), None, Services::default());
+        app.play_from_selection();
+        app.stop_for_input_failure();
+        assert!(app.is_playing());
+        assert!(app.recorder_failed);
+        assert!(app.ui.status.contains("input monitoring"));
+    }
 
     #[test]
     fn new_session_stops_playback_and_the_old_clock() {
