@@ -190,6 +190,43 @@ impl<R: Read + Seek> WavReader<R> {
     }
 }
 
+/// Read every frame on a worker/control thread to build bounded waveform overviews. The
+/// total level-zero budget is shared across channels; PCM reads contain at most 65,536 samples.
+/// `progress` returns false to cancel before the next read. Partial results are never returned.
+pub fn build_overviews<R: Read + Seek>(
+    reader: &mut WavReader<R>,
+    total_blocks: usize,
+    mut progress: impl FnMut(u64, u64) -> bool,
+) -> Result<Vec<crate::peaks::Peaks>> {
+    use crate::peaks::{MAX_COLUMNS, PeaksBuilder};
+    let channels = usize::from(reader.info().channels);
+    if channels == 0 || total_blocks < channels || total_blocks > MAX_COLUMNS {
+        return Err(AudioError::TooLarge("invalid multichannel waveform budget".into()));
+    }
+    let total = reader.info().frames;
+    let frames = usize::try_from(total).map_err(|_| AudioError::TooLarge("waveform duration exceeds host address range".into()))?;
+    let mut builders = (0..channels).map(|_| PeaksBuilder::new(frames, total_blocks / channels)).collect::<Result<Vec<_>>>()?;
+    let chunk = MAX_READ_FRAMES / channels;
+    let mut position = 0u64;
+    while position < total {
+        if !progress(position, total) {
+            return Err(AudioError::Io("waveform preparation cancelled".into()));
+        }
+        let block = reader.read_frames(position, chunk)?;
+        if block.frames() == 0 {
+            return Err(AudioError::Malformed("waveform source ended unexpectedly".into()));
+        }
+        for (builder, samples) in builders.iter_mut().zip(&block.channels) {
+            builder.push(samples)?;
+        }
+        position += block.frames() as u64;
+    }
+    if !progress(total, total) {
+        return Err(AudioError::Io("waveform preparation cancelled".into()));
+    }
+    builders.into_iter().map(PeaksBuilder::finish).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,5 +412,42 @@ mod tests {
         assert!(matches!(reader.read_frames(0, 32), Err(AudioError::Io(_))));
         drop(reader);
         std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn streaming_overviews_match_resident_and_share_channel_budget() {
+        for channels in [1, 2, 7] {
+            let bytes = fixture(channels, BitDepth::Float32);
+            let (_, decoded) = crate::decode(&bytes, Some("wav")).unwrap();
+            let mut reader = WavReader::from_reader(Cursor::new(bytes)).unwrap();
+            let mut progress = Vec::new();
+            let full = build_overviews(&mut reader, channels * 200, |at, total| {
+                progress.push((at, total));
+                true
+            })
+            .unwrap();
+            assert_eq!(full, decoded.channels.iter().map(|ch| crate::peaks::Peaks::build(ch)).collect::<Vec<_>>());
+            assert_eq!(progress.last(), Some(&(4103, 4103)));
+            let small = build_overviews(&mut reader, channels * 4, |_, _| true).unwrap();
+            for (overview, samples) in small.iter().zip(decoded.channels) {
+                let (lo, hi) = overview.minmax(137, 2400);
+                assert!(samples[137..2400].iter().all(|&x| x >= lo && x <= hi));
+            }
+        }
+    }
+    #[test]
+    fn streaming_overview_cancellation_returns_no_partial_result() {
+        let bytes = fixture(7, BitDepth::Float32);
+        let mut reader = WavReader::from_reader(Cursor::new(bytes)).unwrap();
+        assert!(build_overviews(&mut reader, 6, |_, _| true).is_err());
+        assert!(matches!(build_overviews(&mut reader, 700, |_, _| false), Err(AudioError::Io(_))));
+        let mut calls = 0;
+        assert!(
+            build_overviews(&mut reader, 700, |_, _| {
+                calls += 1;
+                calls < 2
+            })
+            .is_err()
+        );
+        assert_eq!(calls, 2);
     }
 }

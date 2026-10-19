@@ -1,0 +1,11 @@
+# Core31 — waveform progressive e limitate
+
+19 ottobre 2026. Revisione iniziale. Il builder `peaks::PeaksBuilder` costruisce min/max progressivi senza conservare il PCM. Il budget riguarda i blocchi del livello base; i parent aggiungono circa un terzo, più l'arrotondamento dei livelli. La risoluzione viene scelta prima della lettura, in potenze di due e almeno 32 campioni, in base a durata e budget. I file brevi conservano l'overview esistente; sui file lunghi le richieste restituiscono estremi conservativi delle finestre più ampie. `resolution_samples()` espone la risoluzione effettiva, senza fingere dettaglio campione per campione.
+
+`stream::build_overviews` divide il budget totale fra i canali e legge al massimo 65.536 campioni complessivi per blocco. Richiede worker o thread di controllo; nessuna lettura nel callback audio. Il chiamante può annullare prima di ogni blocco e alla conclusione. Input incompleto, eccedente o annullato restituisce errore senza consegnare un risultato parziale. La preparazione deve comunque leggere tutto il file: la memoria è limitata, il tempo dipende dalla durata e dal disco.
+
+La serializzazione preesistente senza il nuovo campo `block` mantiene la risoluzione legacy di 32 campioni. Il normale `Peaks::build` conserva il comportamento precedente. Non cambia il formato sessione, che non serializza SourceAudio.
+
+Sei regressioni nuove: blocchi spezzati identici al builder precedente, limiti di memoria dell'overview e contenimento degli estremi, serializzazione legacy, conteggi ostili/incompleti, WAV mono/stereo/7ch identici al percorso residente e budget fra canali, cancellazione senza risultati parziali. Test del crate e Clippy mirati passati; gate completo locale superato con 733 test numerici, oltre al test harness UI, e fmt/Clippy/assets/layers/wasm. Rust 1.99.1 su macOS arm64; VST3 installati esclusi dalla lettura dei test, fixture attive. Regressioni bridge con validatore Swift della copia SHOW `9eb1a57`, senza modificarla. Warning wasm preesistente su CaptureStates. Nessun collaudo hardware o benchmark realtime dedotto dal gate.
+
+Questo componente è una fondazione per la nuova rappresentazione delle sorgenti. La DAW non usa ancora le waveform da disco; non si dichiara risolto il caricamento integrale né si produce una nuova app in questa tranche. SHOW e bridge invariati.
