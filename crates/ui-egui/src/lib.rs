@@ -438,8 +438,11 @@ impl SoundApp {
 
     fn start_play(&mut self, from: Samples, end: Option<Samples>, looped: Option<Range>) {
         if let Some(p) = &self.player {
-            p.update_session(self.engine.session_arc());
-            p.play(from, end, looped);
+            if let Err(error) = p.update_session(self.engine.session_arc()).and_then(|()| p.play(from, end, looped)) {
+                self.stop_play();
+                self.engine.message(format!("Playback could not start: {error}"));
+                return;
+            }
         } else {
             self.sim = Some((from, end, looped));
         }
@@ -828,6 +831,11 @@ impl SoundApp {
         if self.recorder.as_mut().is_some_and(soundcraft_playback::record::Recorder::take_stream_failure) {
             self.stop_for_input_failure();
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(error) = self.player.as_ref().and_then(Player::take_media_error) {
+            self.stop_play();
+            self.engine.message(format!("Playback stopped: {error}. Check the media and retry Play."));
+        }
         // Read back the position.
         if let Some(p) = &self.player {
             let playing = p.is_playing();
@@ -915,8 +923,11 @@ impl SoundApp {
         self.handle_transport(dt);
         if self.engine.revision != self.last_rev {
             self.last_rev = self.engine.revision;
-            if let Some(p) = &self.player {
-                p.update_session(self.engine.session_arc());
+            if let Some(p) = &self.player
+                && let Err(error) = p.update_session(self.engine.session_arc())
+            {
+                self.stop_play();
+                self.engine.message(format!("Playback stopped while updating media: {error}"));
             }
         }
         self.write_automation(ctx);

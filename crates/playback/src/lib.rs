@@ -25,11 +25,17 @@
 pub mod record;
 pub mod sculpt_audio_settings; // SCULPT_CORE22_AUDIO_MODULE
 
+#[cfg(not(target_arch = "wasm32"))]
+use soundcraft_audio_io::stream_cache::CacheError;
 use soundcraft_dsp::{Plugin, PluginEditor};
+#[cfg(not(target_arch = "wasm32"))]
+use soundcraft_mix::media::PreparedMedia;
 use soundcraft_mix::{MAX_CHANNELS, MixEngine, PreparedInstance, StripMeter, itu_stereo_fold, main_channels};
 use soundcraft_model::{Session, TrackId};
 use soundcraft_time::{Range, Samples};
 use std::collections::HashMap;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -55,19 +61,33 @@ pub type EditorEdit = (TrackId, usize, String, f32);
 
 enum Cmd {
     /// A new snapshot plus the third-party instances it needs (created on the UI thread).
+    #[cfg(any(test, target_arch = "wasm32"))]
     Session(Arc<Session>, Vec<PreparedInstance>),
+    #[cfg(not(target_arch = "wasm32"))]
+    PreparedSession(Arc<Session>, Vec<PreparedInstance>, Arc<PreparedMedia>),
+    #[cfg(not(target_arch = "wasm32"))]
+    PreparedPlay {
+        from: Samples,
+        end: Option<Samples>,
+        looped: Option<Range>,
+        media: Arc<PreparedMedia>,
+    },
+    #[cfg(not(target_arch = "wasm32"))]
+    PreparedLocate(Samples, Arc<PreparedMedia>),
     /// Read every plugin state and reply.
     CaptureStates(Sender<PluginStates>),
     /// Return every hosted plugin to the UI thread, then acknowledge cleanup.
     Shutdown(Sender<()>),
     Input(Arc<record::InputRing>),
     Recording(bool),
+    #[cfg(any(test, target_arch = "wasm32"))]
     Play {
         from: Samples,
         end: Option<Samples>,
         looped: Option<Range>,
     },
     Stop,
+    #[cfg(target_arch = "wasm32")]
     Locate(Samples),
 }
 
@@ -79,6 +99,8 @@ struct Shared {
     meters: Mutex<MeterSnapshot>,
     callback_frames: AtomicU32,
     stream_failed: AtomicBool,
+    #[cfg(not(target_arch = "wasm32"))]
+    media_error: AtomicU8,
 }
 
 /// State owned by the audio callback.
@@ -137,6 +159,35 @@ impl AudioState {
         }
     }
 
+    fn adopt_session(&mut self, s: Arc<Session>, instances: Vec<PreparedInstance>) {
+        if (s.sample_rate.as_f64() - self.session.sample_rate.as_f64()).abs() > 0.5 {
+            let mut old = std::mem::replace(&mut self.mix, new_engine(s.sample_rate.as_f64() as f32));
+            let _ = self.garbage.send(old.drain_plugins());
+        }
+        self.mix.adopt(instances);
+        // The main format changed (a document edit, not steady state): resize.
+        // SCULPT_CORE21_PLAY_RESIZE: preserve physical channels on
+        // a session swap (especially when Show opens a multistem cue).
+        let nch = main_channels(&s).max(self.device_output_channels);
+        if self.pending.len() != nch {
+            self.pending = vec![vec![0.0; BLOCK]; nch];
+            self.pending_len = 0;
+            self.read = 0.0;
+        }
+        self.fold = fold_gains(&s);
+        self.session = s;
+    }
+
+    fn begin_play(&mut self, from: Samples, end: Option<Samples>, looped: Option<Range>) {
+        self.pos = from;
+        self.end = end;
+        self.looped = looped.filter(|r| r.len() > 64);
+        self.playing = true;
+        self.pending_len = 0;
+        self.read = 0.0;
+        self.mix.reset();
+    }
+
     fn drain(&mut self) {
         let mut changed = false;
         while let Ok(c) = self.rx.try_recv() {
@@ -162,40 +213,44 @@ impl AudioState {
                     self.mix.ensure_synced(&self.session);
                     let _ = reply.send(self.mix.capture_states());
                 }
+                #[cfg(any(test, target_arch = "wasm32"))]
                 Cmd::Session(s, instances) => {
                     changed = true;
-                    if (s.sample_rate.as_f64() - self.session.sample_rate.as_f64()).abs() > 0.5 {
-                        let mut old = std::mem::replace(&mut self.mix, new_engine(s.sample_rate.as_f64() as f32));
-                        let _ = self.garbage.send(old.drain_plugins());
-                    }
-                    self.mix.adopt(instances);
-                    // The main format changed (a document edit, not steady state): resize.
-                    // SCULPT_CORE21_PLAY_RESIZE: preserve physical channels on
-                    // a session swap (especially when Show opens a multistem cue).
-                    let nch = main_channels(&s).max(self.device_output_channels);
-                    if self.pending.len() != nch {
-                        self.pending = vec![vec![0.0; BLOCK]; nch];
-                        self.pending_len = 0;
-                        self.read = 0.0;
-                    }
-                    self.fold = fold_gains(&s);
-                    self.session = s;
+                    self.adopt_session(s, instances);
                 }
-                Cmd::Play { from, end, looped } => {
-                    self.pos = from;
-                    self.end = end;
-                    self.looped = looped.filter(|r| r.len() > 64);
-                    self.playing = true;
+                #[cfg(not(target_arch = "wasm32"))]
+                Cmd::PreparedSession(s, instances, media) => {
+                    changed = true;
+                    self.adopt_session(s, instances);
+                    self.mix.set_media(media);
+                    self.mix.set_media_anchor(self.looped.map(|r| r.start));
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                Cmd::PreparedPlay { from, end, looped, media } => {
+                    self.mix.set_media(media);
+                    self.mix.set_media_anchor(looped.map(|r| r.start));
+                    self.begin_play(from, end, looped);
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                Cmd::PreparedLocate(at, media) => {
+                    self.mix.set_media(media);
+                    self.pos = at;
                     self.pending_len = 0;
                     self.read = 0.0;
-                    self.mix.reset();
+                }
+                #[cfg(any(test, target_arch = "wasm32"))]
+                Cmd::Play { from, end, looped } => {
+                    self.begin_play(from, end, looped);
                 }
                 Cmd::Stop => {
+                    self.pending_len = 0;
+                    self.read = 0.0;
                     self.playing = false;
                     self.end = None;
                     self.looped = None;
                     self.mix.reset();
                 }
+                #[cfg(target_arch = "wasm32")]
                 Cmd::Locate(at) => {
                     self.pos = at;
                     self.pending_len = 0;
@@ -257,6 +312,14 @@ impl AudioState {
         self.mix.recording = self.recording;
         self.mix.set_device_output_channels(self.device_output_channels); // SCULPT_CORE21_PLAY_ROUTE_DEVICE
         self.mix.render(&self.session, self.pos, n, &mut self.pending);
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(error) = self.mix.take_media_error() {
+            self.shared.media_error.store(media_error_code(error), Ordering::Release);
+            self.playing = false;
+            self.end = None;
+            self.looped = None;
+            self.shared.playing.store(false, Ordering::Release);
+        }
         self.send_garbage();
         self.pending_len = n;
         if let Ok(mut m) = self.shared.meters.try_lock() {
@@ -351,11 +414,76 @@ struct Side {
     /// Editor handles of the live instances.
     editors: HashMap<(TrackId, usize), Box<dyn PluginEditor>>,
     garbage: Receiver<Vec<Box<dyn Plugin>>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    media: Arc<PreparedMedia>,
+    #[cfg(not(target_arch = "wasm32"))]
+    session: Arc<Session>,
+    #[cfg(not(target_arch = "wasm32"))]
+    retired_media: Vec<Arc<PreparedMedia>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    retired_sessions: Vec<Arc<Session>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    media_problem: Option<CacheError>,
+    #[cfg(not(target_arch = "wasm32"))]
+    loop_anchor: Option<Samples>,
 }
 
 impl Side {
+    fn new(session: Arc<Session>, garbage: Receiver<Vec<Box<dyn Plugin>>>) -> Self {
+        #[cfg(not(target_arch = "wasm32"))]
+        let (media, media_problem) = match PreparedMedia::new(&session) {
+            Ok(media) => (Arc::new(media), None),
+            Err(error) => (Arc::new(PreparedMedia::default()), Some(error)),
+        };
+        Self {
+            shadow: HashMap::new(),
+            rate: session.sample_rate.as_f64() as f32,
+            editors: HashMap::new(),
+            garbage,
+            #[cfg(not(target_arch = "wasm32"))]
+            media,
+            #[cfg(not(target_arch = "wasm32"))]
+            session,
+            #[cfg(not(target_arch = "wasm32"))]
+            media_problem,
+            #[cfg(not(target_arch = "wasm32"))]
+            retired_media: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            retired_sessions: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            loop_anchor: None,
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    fn replace_media(&mut self, media: Arc<PreparedMedia>) {
+        if Arc::ptr_eq(&self.media, &media) {
+            return;
+        }
+        let old = std::mem::replace(&mut self.media, media);
+        self.retired_media.push(old);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    fn prepare_media(&mut self, at: Samples, anchor: Option<Samples>) -> Result<Arc<PreparedMedia>, CacheError> {
+        if self.media_problem.take().is_some() {
+            let media = Arc::new(PreparedMedia::new(&self.session)?);
+            self.replace_media(media);
+        }
+        match self.media.prepare(at, BLOCK, anchor, std::time::Duration::from_secs(3)) {
+            Ok(()) => Ok(Arc::clone(&self.media)),
+            Err(error) => {
+                self.media_problem = Some(error);
+                Err(error)
+            }
+        }
+    }
+
     /// Drops retired instances (closing their editors first, inside the plugin's drop).
     fn collect_garbage(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.retired_media.retain(|media| Arc::strong_count(media) > 1);
+            self.retired_sessions.retain(|session| Arc::strong_count(session) > 1);
+        }
         while let Ok(g) = self.garbage.try_recv() {
             drop(g);
         }
@@ -397,9 +525,11 @@ impl Player {
 
     /// Trial configuration does not change the shared profile.
     pub fn with_audio_settings(session: Arc<Session>, settings: &sculpt_audio_settings::AudioSettings) -> Player {
-        let p = Player::open(Arc::clone(&session), settings);
+        let mut p = Player::open(Arc::clone(&session), settings);
         // Hand the initial session's third-party plugins over.
-        p.update_session(session);
+        if let Err(error) = p.update_session(session) {
+            p.open_error = Some(error);
+        }
         p
     }
 
@@ -418,7 +548,7 @@ impl Player {
 
     fn open(session: Arc<Session>, settings: &sculpt_audio_settings::AudioSettings) -> Player {
         let (gtx, grx) = channel();
-        let side = Mutex::new(Side { shadow: HashMap::new(), rate: session.sample_rate.as_f64() as f32, editors: HashMap::new(), garbage: grx });
+        let side = Mutex::new(Side::new(Arc::clone(&session), grx));
         let shared = Arc::new(Shared {
             position: AtomicI64::new(0),
             playing: AtomicBool::new(false),
@@ -426,6 +556,8 @@ impl Player {
             meters: Mutex::new(MeterSnapshot::default()),
             callback_frames: AtomicU32::new(0),
             stream_failed: AtomicBool::new(false),
+            #[cfg(not(target_arch = "wasm32"))]
+            media_error: AtomicU8::new(0),
         });
         let (tx, rx) = channel();
         let want = session.sample_rate.hz();
@@ -437,6 +569,8 @@ impl Player {
                 let rate = config.sample_rate.0;
                 let channels = usize::from(config.channels);
                 let mut state = AudioState::new(rx, Arc::clone(&shared), session, f64::from(rate), gtx);
+                #[cfg(not(target_arch = "wasm32"))]
+                state.mix.set_media(Arc::clone(&side.lock().unwrap_or_else(PoisonError::into_inner).media));
                 state.device_output_channels = channels;
                 let render_channels = channels.max(main_channels(&state.session));
                 state.pending.resize_with(render_channels, || vec![0.0; BLOCK]); // SCULPT_CORE21_PLAY_64_BUFFER
@@ -517,6 +651,11 @@ impl Player {
         side: Mutex<Side>,
         gtx: Sender<Vec<Box<dyn Plugin>>>,
     ) -> Player {
+        #[cfg(not(target_arch = "wasm32"))]
+        let s = Arc::clone(&side.lock().unwrap_or_else(PoisonError::into_inner).session);
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = rate;
+        #[cfg(target_arch = "wasm32")]
         let s = Arc::new(Session::new("Untitled", soundcraft_time::SampleRate::new(rate).unwrap_or_default()));
         Player::silent_clock_with(shared, tx, rx, s, side, gtx)
     }
@@ -532,6 +671,8 @@ impl Player {
     ) -> Player {
         let rate = session.sample_rate.hz();
         let mut state = AudioState::new(rx, Arc::clone(&shared), session, f64::from(rate), gtx);
+        #[cfg(not(target_arch = "wasm32"))]
+        state.mix.set_media(Arc::clone(&side.lock().unwrap_or_else(PoisonError::into_inner).media));
         let spawn = std::thread::Builder::new().name("soundcraft-clock".into()).spawn(move || {
             let mut buf = vec![0.0f32; 4096];
             let mut last = std::time::Instant::now();
@@ -589,11 +730,64 @@ impl Player {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    fn fail_media(&self, error: CacheError) {
+        self.shared.media_error.store(media_error_code(error), Ordering::Release);
+        self.shared.playing.store(false, Ordering::Release);
+        let _ = self.tx.send(Cmd::Stop);
+    }
+    /// Control-thread error acknowledgement; retry rebuilds disk views before starting again.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn take_media_error(&self) -> Option<CacheError> {
+        let error = media_error_from_code(self.shared.media_error.swap(0, Ordering::AcqRel));
+        if let Some(error) = error {
+            self.side().media_problem = Some(error);
+        }
+        error
+    }
+
     /// Sends a new session snapshot to the audio thread, with freshly created (state-restored,
     /// prepared) instances of any third-party plugin it newly needs. Call on the UI thread.
-    pub fn update_session(&self, s: Arc<Session>) {
-        let instances = self.side().prepare(&s);
-        let _ = self.tx.send(Cmd::Session(s, instances));
+    pub fn update_session(&self, s: Arc<Session>) -> Result<(), String> {
+        let mut side = self.side();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let media = if side.media_problem.is_none() && side.media.matches(&s) {
+                Arc::clone(&side.media)
+            } else {
+                match PreparedMedia::new(&s) {
+                    Ok(media) => Arc::new(media),
+                    Err(error) => {
+                        side.media_problem = Some(error);
+                        self.fail_media(error);
+                        return Err(error.to_string());
+                    }
+                }
+            };
+            let at = self.position();
+            if self.is_playing()
+                && let Err(error) = media.prepare(at, BLOCK, side.loop_anchor, std::time::Duration::from_secs(3))
+            {
+                side.media_problem = Some(error);
+                self.fail_media(error);
+                return Err(error.to_string());
+            }
+            // Do not mark plugin instances as live until media preparation has succeeded.
+            let instances = side.prepare(&s);
+            side.replace_media(Arc::clone(&media));
+            if !Arc::ptr_eq(&side.session, &s) {
+                let old = std::mem::replace(&mut side.session, Arc::clone(&s));
+                side.retired_sessions.push(old);
+            }
+            side.media_problem = None;
+            self.tx.send(Cmd::PreparedSession(s, instances, media)).map_err(|_| "audio command receiver is stopped".to_string())?;
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let instances = side.prepare(&s);
+            self.tx.send(Cmd::Session(s, instances)).map_err(|_| "audio command receiver is stopped".to_string())?;
+        }
+        Ok(())
     }
 
     /// Reads the state of every live third-party plugin (for saving the session). Waits briefly
@@ -670,10 +864,36 @@ impl Player {
     }
 
     /// Start playback at `from`, stopping at `end`, or looping `looped`.
-    pub fn play(&self, from: Samples, end: Option<Samples>, looped: Option<Range>) {
+    pub fn play(&self, from: Samples, end: Option<Samples>, looped: Option<Range>) -> Result<(), String> {
+        #[cfg(not(target_arch = "wasm32"))]
+        let media = {
+            let mut side = self.side();
+            side.loop_anchor = looped.filter(|r| r.len() > 64).map(|r| r.start);
+            let anchor = side.loop_anchor;
+            match side.prepare_media(from, anchor) {
+                Ok(media) => media,
+                Err(error) => {
+                    self.fail_media(error);
+                    return Err(error.to_string());
+                }
+            }
+        };
         self.shared.position.store(from, Ordering::Relaxed);
         self.shared.playing.store(true, Ordering::Relaxed);
-        let _ = self.tx.send(Cmd::Play { from, end, looped });
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.shared.media_error.store(0, Ordering::Release);
+            self.tx.send(Cmd::PreparedPlay { from, end, looped, media }).map_err(|_| {
+                self.shared.playing.store(false, Ordering::Release);
+                "audio command receiver is stopped".to_string()
+            })?;
+        }
+        #[cfg(target_arch = "wasm32")]
+        self.tx.send(Cmd::Play { from, end, looped }).map_err(|_| {
+            self.shared.playing.store(false, Ordering::Release);
+            "audio command receiver is stopped".to_string()
+        })?;
+        Ok(())
     }
 
     /// Feed live input (from a `record::Recorder`) into the mix for input monitoring.
@@ -715,8 +935,29 @@ impl Player {
     }
 
     pub fn locate(&self, at: Samples) {
-        self.shared.position.store(at, Ordering::Relaxed);
-        let _ = self.tx.send(Cmd::Locate(at));
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let mut side = self.side();
+            let anchor = side.loop_anchor;
+            let media = if self.is_playing() {
+                match side.prepare_media(at, anchor) {
+                    Ok(media) => media,
+                    Err(error) => {
+                        self.fail_media(error);
+                        return;
+                    }
+                }
+            } else {
+                Arc::clone(&side.media)
+            };
+            self.shared.position.store(at, Ordering::Relaxed);
+            let _ = self.tx.send(Cmd::PreparedLocate(at, media));
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.shared.position.store(at, Ordering::Relaxed);
+            let _ = self.tx.send(Cmd::Locate(at));
+        }
     }
 
     pub fn set_speed(&self, speed: f32) {
@@ -746,6 +987,32 @@ impl Player {
     pub fn copy_meters(&self, out: &mut MeterSnapshot) {
         let source = self.shared.meters.lock().unwrap_or_else(PoisonError::into_inner);
         copy_meter_snapshot(&source, out);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn media_error_code(error: CacheError) -> u8 {
+    match error {
+        CacheError::NotReady => 1,
+        CacheError::ReadFailed => 2,
+        CacheError::MediaChanged => 3,
+        CacheError::Capacity => 4,
+        CacheError::Stopped => 5,
+        CacheError::InvalidRange => 6,
+        CacheError::Timeout => 7,
+    }
+}
+#[cfg(not(target_arch = "wasm32"))]
+fn media_error_from_code(code: u8) -> Option<CacheError> {
+    match code {
+        1 => Some(CacheError::NotReady),
+        2 => Some(CacheError::ReadFailed),
+        3 => Some(CacheError::MediaChanged),
+        4 => Some(CacheError::Capacity),
+        5 => Some(CacheError::Stopped),
+        6 => Some(CacheError::InvalidRange),
+        7 => Some(CacheError::Timeout),
+        _ => None,
     }
 }
 
@@ -890,6 +1157,8 @@ mod tests {
             meters: Mutex::new(MeterSnapshot::default()),
             callback_frames: AtomicU32::new(0),
             stream_failed: AtomicBool::new(false),
+            #[cfg(not(target_arch = "wasm32"))]
+            media_error: AtomicU8::new(0),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), s, 48_000.0, channel().0);
@@ -910,6 +1179,8 @@ mod tests {
             meters: Mutex::new(MeterSnapshot::default()),
             callback_frames: AtomicU32::new(0),
             stream_failed: AtomicBool::new(false),
+            #[cfg(not(target_arch = "wasm32"))]
+            media_error: AtomicU8::new(0),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), s, 48_000.0, channel().0);
@@ -937,6 +1208,8 @@ mod tests {
             meters: Mutex::new(MeterSnapshot::default()),
             callback_frames: AtomicU32::new(0),
             stream_failed: AtomicBool::new(false),
+            #[cfg(not(target_arch = "wasm32"))]
+            media_error: AtomicU8::new(0),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::clone(&s), 48_000.0, channel().0);
@@ -998,6 +1271,8 @@ mod tests {
             meters: Mutex::new(MeterSnapshot::default()),
             callback_frames: AtomicU32::new(0),
             stream_failed: AtomicBool::new(false),
+            #[cfg(not(target_arch = "wasm32"))]
+            media_error: AtomicU8::new(0),
         });
         let (tx, rx) = channel();
         let (gtx, grx) = channel();
@@ -1039,7 +1314,7 @@ mod tests {
     fn side_creates_each_missing_instance_once() {
         use soundcraft_model::{ChannelFormat, Insert, TrackKind};
         let (_gtx, grx) = channel();
-        let mut side = Side { shadow: HashMap::new(), rate: 48_000.0, editors: HashMap::new(), garbage: grx };
+        let mut side = Side::new(Arc::new(Session::default()), grx);
         let mut s = soundcraft_model::Session::default();
         let t = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
         s.track_mut(t).unwrap().mixer.inserts[0] = Some(Insert::new("clap:does.not.exist"));
@@ -1063,6 +1338,8 @@ mod tests {
             meters: Mutex::new(MeterSnapshot::default()),
             callback_frames: AtomicU32::new(0),
             stream_failed: AtomicBool::new(false),
+            #[cfg(not(target_arch = "wasm32"))]
+            media_error: AtomicU8::new(0),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), s, 48_000.0, channel().0);
@@ -1088,6 +1365,8 @@ mod tests {
             meters: Mutex::new(MeterSnapshot::default()),
             callback_frames: AtomicU32::new(0),
             stream_failed: AtomicBool::new(false),
+            #[cfg(not(target_arch = "wasm32"))]
+            media_error: AtomicU8::new(0),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(s), 48_000.0, channel().0);
@@ -1101,5 +1380,187 @@ mod tests {
         st.fill(&mut out, 2);
         assert!(out.iter().any(|x| x.abs() > 0.1), "the input is heard");
         assert!(shared.meters.lock().unwrap().tracks.get(&t).is_some_and(|m| m.peak[0] > 0.1), "and metered");
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[allow(clippy::unwrap_used)]
+mod media_tests {
+    use super::*;
+    use soundcraft_audio_io::{
+        AudioBuffer, BitDepth, EncodeOptions,
+        stream_cache::{CacheConfig, StreamCache},
+    };
+    use soundcraft_model::{ChannelFormat, Clip, SourceAudio, SourceId, TrackKind};
+    use std::{path::PathBuf, sync::atomic::AtomicU64, time::Duration};
+    static SERIAL: AtomicU64 = AtomicU64::new(0);
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("sculpt-player-media-{}-{}.wav", std::process::id(), SERIAL.fetch_add(1, Ordering::Relaxed)));
+            let bytes = soundcraft_audio_io::encode(
+                &AudioBuffer::new(48_000, 2, 30_000).with_constant(),
+                &EncodeOptions { bit_depth: BitDepth::Float32, dither: false, ..EncodeOptions::default() },
+            )
+            .unwrap();
+            std::fs::write(&path, bytes).unwrap();
+            Self(path)
+        }
+    }
+    // Keep synthetic fixtures entirely in the test module.
+    trait Constant {
+        fn with_constant(self) -> Self;
+    }
+    impl Constant for AudioBuffer {
+        fn with_constant(mut self) -> Self {
+            for ch in &mut self.channels {
+                ch.fill(0.25);
+            }
+            self
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    fn session(fixture: &Fixture, cache: &Arc<StreamCache>) -> Arc<Session> {
+        let mut s = Session::default();
+        let t = s.add_track(TrackKind::Audio, ChannelFormat::Stereo, None);
+        let source = cache.open_source(&fixture.0).unwrap();
+        s.pool.insert(SourceId(900), Arc::new(SourceAudio::from_stream(source, 200, |_, _| true).unwrap()));
+        let clip = Clip::audio(s.new_clip_id(), "disk", SourceId(900), 0, 0, 30_000);
+        s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(clip);
+        Arc::new(s)
+    }
+    fn host(s: Arc<Session>) -> (Player, AudioState) {
+        let (tx, rx) = channel();
+        let (gtx, grx) = channel();
+        let shared = Arc::new(Shared {
+            position: AtomicI64::new(0),
+            playing: AtomicBool::new(false),
+            speed: AtomicU32::new(1000),
+            meters: Mutex::new(MeterSnapshot::default()),
+            callback_frames: AtomicU32::new(0),
+            stream_failed: AtomicBool::new(false),
+            media_error: AtomicU8::new(0),
+        });
+        let side = Side::new(Arc::clone(&s), grx);
+        let mut state = AudioState::new(rx, Arc::clone(&shared), s, 48_000.0, gtx);
+        state.mix.set_media(Arc::clone(&side.media));
+        let player = Player {
+            shared,
+            tx,
+            side: Mutex::new(side),
+            _stream: None,
+            device_name: "test".into(),
+            device_rate: 48_000,
+            device_channels: 2,
+            device_buffer: Some(512),
+            open_error: None,
+            silent: false,
+        };
+        (player, state)
+    }
+    #[test]
+    fn player_prepares_play_loop_locate_and_reuses_media_for_mixer_edits() {
+        let fixture = Fixture::new();
+        let cache = StreamCache::new(CacheConfig::default()).unwrap();
+        let s = session(&fixture, &cache);
+        let (player, mut state) = host(Arc::clone(&s));
+        player.update_session(Arc::clone(&s)).unwrap();
+        let original_media = Arc::clone(&player.side().media);
+        player.play(0, None, Some(Range::new(0, 1024))).unwrap();
+        let mut out = vec![0.0; 8192];
+        state.fill(&mut out, 2);
+        assert!(out.iter().all(|&x| (x - 0.25).abs() < 1e-6));
+        assert!(state.pos <= 1024);
+        assert!(player.take_media_error().is_none());
+        let mut edit = (*s).clone();
+        edit.tracks[0].mixer.volume_db = -6.0;
+        player.update_session(Arc::new(edit)).unwrap();
+        assert!(Arc::ptr_eq(&original_media, &player.side().media));
+        state.drain();
+        player.play(20_000, None, None).unwrap();
+        state.fill(&mut out[..1024], 2);
+        assert!(state.pos >= 20_000);
+        assert!(out[..1024].iter().any(|&x| x > 0.0));
+        player.locate(1000);
+        state.fill(&mut out[..1024], 2);
+        assert!((1000..=2024).contains(&state.pos));
+        assert!(player.take_media_error().is_none());
+        player.stop();
+        state.fill(&mut out[..1024], 2);
+        assert!(out[..1024].iter().all(|&x| x == 0.0));
+        cache.shutdown(Duration::from_secs(1)).unwrap();
+    }
+    #[test]
+    fn callback_media_failure_stops_transport_and_reports_once() {
+        let fixture = Fixture::new();
+        let cache = StreamCache::new(CacheConfig::default()).unwrap();
+        let s = session(&fixture, &cache);
+        let (player, mut state) = host(s);
+        player.play(0, None, None).unwrap();
+        cache.shutdown(Duration::from_secs(1)).unwrap();
+        let mut out = vec![1.0; 1024];
+        state.fill(&mut out, 2);
+        assert!(out.iter().all(|&x| x == 0.0));
+        assert!(!player.is_playing());
+        assert_eq!(state.pos, 0);
+        assert_eq!(player.take_media_error(), Some(CacheError::Stopped));
+        assert_eq!(player.take_media_error(), None);
+        assert!(player.play(0, None, None).is_err());
+        assert!(!player.is_playing());
+    }
+    #[test]
+    fn failed_preflight_does_not_start_or_advance_and_retired_media_drop_on_control() {
+        let fixture = Fixture::new();
+        let cache = StreamCache::new(CacheConfig::default()).unwrap();
+        let s = session(&fixture, &cache);
+        let (player, mut state) = host(Arc::clone(&s));
+        let mut edit = (*s).clone();
+        edit.tracks[0].playlist_mut().unwrap().clips[0].start = 100;
+        player.update_session(Arc::new(edit)).unwrap();
+        assert_eq!(player.side().retired_media.len(), 1);
+        player.side().collect_garbage();
+        assert_eq!(player.side().retired_media.len(), 1);
+        state.drain();
+        player.side().collect_garbage();
+        assert!(player.side().retired_media.is_empty());
+        std::fs::OpenOptions::new().write(true).open(&fixture.0).unwrap().set_len(100).unwrap();
+        assert!(player.play(100, None, None).is_err());
+        assert!(!player.is_playing());
+        assert_eq!(player.position(), 0);
+        assert_eq!(player.take_media_error(), Some(CacheError::MediaChanged));
+        let mut out = vec![1.0; 1024];
+        state.fill(&mut out, 2);
+        assert!(out.iter().all(|&x| x == 0.0));
+        cache.shutdown(Duration::from_secs(1)).unwrap();
+    }
+    #[test]
+    fn stop_discards_pending_clip_samples_before_input_monitoring() {
+        let mut s = Session::default();
+        let t = s.add_track(TrackKind::Audio, ChannelFormat::Stereo, None);
+        s.pool.insert(SourceId(900), Arc::new(SourceAudio::new(AudioBuffer::new(48_000, 2, 2048).with_constant())));
+        let clip = Clip::audio(s.new_clip_id(), "resident", SourceId(900), 0, 0, 2048);
+        let track = s.track_mut(t).unwrap();
+        track.playlist_mut().unwrap().clips.push(clip);
+        track.mixer.record_arm = true;
+        track.mixer.input = soundcraft_model::Route::Hardware("Input 1-2".into());
+        let (player, mut state) = host(Arc::new(s));
+        state.input = Some(record::InputRing::new(2, 48_000));
+        player.play(0, None, None).unwrap();
+        state.drain();
+        state.render_next(BLOCK);
+        assert!(state.session.needs_hardware_input());
+        let mut first = [0.0; 2];
+        state.fill(&mut first, 2);
+        assert!(first.iter().any(|&x| x > 0.0));
+        assert!(state.pending_len > 1);
+        player.stop();
+        let mut stopped = [1.0; 32];
+        state.fill(&mut stopped, 2);
+        assert!(stopped.iter().all(|&x| x == 0.0));
     }
 }

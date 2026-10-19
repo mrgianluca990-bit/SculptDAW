@@ -88,6 +88,8 @@ struct Counters {
     ticks: AtomicU64,
     views: AtomicUsize,
     stop: AtomicBool,
+    request_updates: AtomicUsize,
+    request_epoch: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -222,6 +224,13 @@ impl StreamCache {
         Ok(StreamSource(Arc::new(SourceState { cache: Arc::clone(self), id, path, info, stamp })))
     }
 
+    /// Atomic-only scope for a related set of view requests. The worker defers capacity
+    /// decisions until the entire group is visible; nested/concurrent groups are supported.
+    pub fn begin_requests(&self) -> RequestBatch<'_> {
+        self.pool.counters.request_updates.fetch_add(1, Ordering::AcqRel);
+        RequestBatch(&self.pool.counters)
+    }
+
     pub fn stats(&self) -> CacheStats {
         let c = &self.pool.counters;
         CacheStats {
@@ -255,6 +264,14 @@ impl StreamCache {
     }
 }
 
+pub struct RequestBatch<'a>(&'a Counters);
+impl Drop for RequestBatch<'_> {
+    fn drop(&mut self) {
+        self.0.request_epoch.fetch_add(1, Ordering::Release);
+        self.0.request_updates.fetch_sub(1, Ordering::Release);
+    }
+}
+
 impl Drop for StreamCache {
     fn drop(&mut self) {
         self.pool.counters.stop.store(true, Ordering::Release);
@@ -283,12 +300,36 @@ struct SourceState {
 #[derive(Clone)]
 pub struct StreamSource(Arc<SourceState>);
 
+impl fmt::Debug for StreamSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StreamSource").field("id", &self.0.id).field("path", &self.0.path).field("info", &self.0.info).finish()
+    }
+}
+
 impl StreamSource {
     pub fn info(&self) -> &AudioInfo {
         &self.0.info
     }
     pub fn path(&self) -> &Path {
         &self.0.path
+    }
+
+    pub fn cache(&self) -> &Arc<StreamCache> {
+        &self.0.cache
+    }
+
+    /// Open a checked, blocking reader for offline/control operations. Never call from render.
+    pub fn open_reader(&self) -> Result<WavReader> {
+        let file = File::open(&self.0.path).map_err(|e| AudioError::Io(e.to_string()))?;
+        let stamp = Stamp::from(&file.metadata().map_err(|e| AudioError::Io(e.to_string()))?);
+        if stamp != self.0.stamp {
+            return Err(AudioError::Io("source media changed after registration".into()));
+        }
+        let reader = WavReader::from_reader(file)?;
+        if reader.info() != &self.0.info {
+            return Err(AudioError::Io("source header changed after registration".into()));
+        }
+        Ok(reader)
     }
 
     /// Independent playback position. Clones share requests; use distinct views for concurrent
@@ -556,13 +597,16 @@ struct ReadPlan {
     order: Vec<(u64, u64)>,
 }
 
-fn requests(active: &[ViewRequest], pool: &Pool) -> Option<ReadPlan> {
+fn requests(active: &[ViewRequest], pool: &Pool, epoch: u64) -> Option<ReadPlan> {
     let mut required = BTreeSet::new();
     for request in active.iter().filter(|r| r.view.failed().is_none()) {
         for page in request.pages() {
             required.insert((request.view.source.id, page));
             if required.len() > pool.pages.len() {
-                if active.iter().all(ViewRequest::current) {
+                if pool.counters.request_updates.load(Ordering::Acquire) == 0
+                    && pool.counters.request_epoch.load(Ordering::Acquire) == epoch
+                    && active.iter().all(ViewRequest::current)
+                {
                     for r in active {
                         r.view.fail(
                             CacheError::Capacity,
@@ -653,8 +697,10 @@ fn run_worker(pool: Arc<Pool>, rx: Receiver<Weak<ViewState>>) {
             views.push(view);
         }
         views.retain(|v| v.strong_count() > 0);
+        let epoch = pool.counters.request_epoch.load(Ordering::Acquire);
+        let updating = pool.counters.request_updates.load(Ordering::Acquire) != 0;
         let active: Vec<_> = views.iter().filter_map(Weak::upgrade).filter(|v| v.failed().is_none()).filter_map(ViewRequest::snapshot).collect();
-        if let Some(plan) = requests(&active, &pool) {
+        if let Some(plan) = (!updating).then(|| requests(&active, &pool, epoch)).flatten() {
             for key in &plan.order {
                 if pool.counters.stop.load(Ordering::Acquire) {
                     break;
@@ -835,6 +881,30 @@ mod tests {
             scope.spawn(move || run(&b, 16_000));
         });
         assert!(cache.stats().decoded_pages > 20);
+        cache.shutdown(Duration::from_secs(1)).unwrap();
+    }
+    #[test]
+    fn request_batches_do_not_latch_transient_capacity_errors() {
+        let fixture = Fixture::new(1);
+        let cache = cache(2);
+        let source = cache.open_source(&fixture.0).unwrap();
+        let a = source.view().unwrap();
+        let b = source.view().unwrap();
+        ready(&a, 0, 10);
+        ready(&b, 10_000, 10);
+        let outer = cache.begin_requests();
+        let inner = cache.begin_requests();
+        a.request(0, 2048).unwrap();
+        std::thread::sleep(Duration::from_millis(25));
+        assert!(a.0.failed().is_none());
+        assert!(b.0.failed().is_none());
+        drop(inner);
+        std::thread::sleep(Duration::from_millis(15));
+        assert!(a.0.failed().is_none());
+        b.deactivate();
+        drop(outer);
+        ready(&a, 0, 2048);
+        verify(&a.try_window(0, 2048).unwrap(), 1, 0);
         cache.shutdown(Duration::from_secs(1)).unwrap();
     }
     #[test]
