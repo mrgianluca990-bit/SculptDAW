@@ -26,8 +26,10 @@ Lavoro per piccoli interventi con test, commit e PR separati. Nessuna consegna i
 
 ## Stato di verifica
 
-Core28: 713 test locali riportati e gate completo passati; ZIP universal locale verificato e già consegnato nella tranche precedente. La CI remota `39245725212` era ancora in corso alla consegna precedente: ricontrollarne il risultato, non supporlo verde.
+Core28: 713 test locali riportati e gate completo passati; ZIP universal locale verificato e già consegnato nella tranche precedente. La CI remota `39245725212` è stata successivamente verificata: conclusa con successo.
 
-QA: PR #3 `feature/qa-native-checks`, commit `04be12c`: gate nativo unico e packaging soltanto esplicito/release; nessun sorgente del motore cambiato in quella PR. Esecuzione GitHub da verificare, non assumere il risultato.
+QA: PR #3 `feature/qa-native-checks`, commit `04be12c`: gate nativo unico e packaging soltanto esplicito/release; nessun sorgente del motore cambiato in quella PR. Run `39252075078` conclusa con successo su runner ARM64, incluso gate completo; risultato verificato tramite API GitHub.
 
-Core29: lettore a blocchi implementato con 7 regressioni e gate completo locale da 720 test passati, secondo `QA/CORE29_STREAM_READER.md`. Cache e integrazione ancora da fare: nessuna chiusura della fase streaming dichiarata e nessuna nuova app ancora consegnata.
+Core29: lettore a blocchi implementato con 7 regressioni e gate completo locale da 720 test passati, secondo `QA/CORE29_STREAM_READER.md`. PR #4, commit `23d556e`. Core30 introduce la cache condivisa; integrazione ancora da fare: nessuna chiusura della fase streaming dichiarata e nessuna nuova app ancora consegnata.
+
+Core30: pool PCM condiviso con budget configurabile (32 MiB di default, massimo 256 MiB), un worker disco, pagine protette da lettori, richieste atomiche, prefetch e destinazione loop. Errori di capienza/media/lettura espliciti e permanenti per la singola view; retry mediante nuova view. Sette regressioni nuove e gate completo locale superati (727 test numerici più harness UI), secondo `QA/CORE30_STREAM_CACHE.md`. Componente non ancora usato dal playback.

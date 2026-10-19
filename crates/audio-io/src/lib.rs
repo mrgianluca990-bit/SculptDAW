@@ -21,6 +21,8 @@ pub mod peaks;
 /// Bounded filesystem readers for native streaming; callers must keep disk I/O off the audio callback.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod stream;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod stream_cache;
 mod symph;
 mod wav;
 
