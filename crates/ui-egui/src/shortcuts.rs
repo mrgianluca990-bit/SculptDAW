@@ -185,7 +185,13 @@ fn fixed(app: &mut SoundApp, key: Key, m: Modifiers, mac: bool) -> bool {
                 let start = if back { 0 } else { at.saturating_add(1) };
                 let end = if back { at } else { s.content_end() };
                 let r = soundcraft_time::Range::new(start, end);
-                let points = soundcraft_engine::io::transients_in(s, t, r, 0.4);
+                let points = match soundcraft_engine::io::transients_in(s, t, r, 0.4) {
+                    Ok(points) => points,
+                    Err(error) => {
+                        app.engine.message(format!("Transient detection failed: {error}"));
+                        return true;
+                    }
+                };
                 let found =
                     if back { points.into_iter().rev().find(|x| *x < at.saturating_sub(64)) } else { points.into_iter().find(|x| *x > at + 64) };
                 if let Some(n) = found {

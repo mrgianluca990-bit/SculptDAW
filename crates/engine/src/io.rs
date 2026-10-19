@@ -267,7 +267,7 @@ pub fn bounce_source(
     if r.len() > s.sample_rate.samples(4.0 * 3600.0) {
         return Err(EngineError::BadParams("file.bounce_mix".into(), "bounces are limited to 4 hours".into()));
     }
-    let (mut ch, fmt) = render_bounce(s, r, fold_stereo, bus);
+    let (mut ch, fmt) = render_bounce(s, r, fold_stereo, bus)?;
     if normalize {
         soundcraft_dsp::offline::normalize(&mut ch, -0.1, false);
     }
@@ -283,21 +283,21 @@ pub fn bounce_source(
 }
 
 /// The main mix over `r` and its format (folded to stereo on request).
-fn render_main(s: &Session, r: Range, fold_stereo: bool) -> (Vec<Vec<f32>>, ChannelFormat) {
+fn render_main(s: &Session, r: Range, fold_stereo: bool) -> Result<(Vec<Vec<f32>>, ChannelFormat)> {
     render_bounce(s, r, fold_stereo, None)
 }
 
 /// The main mix, or one bus, over `r`.
-fn render_bounce(s: &Session, r: Range, fold_stereo: bool, bus: Option<BusId>) -> (Vec<Vec<f32>>, ChannelFormat) {
+fn render_bounce(s: &Session, r: Range, fold_stereo: bool, bus: Option<BusId>) -> Result<(Vec<Vec<f32>>, ChannelFormat)> {
     let (ch, fmt) = if let Some(id) = bus {
         let fmt = s.bus(id).map(|b| b.format).unwrap_or(ChannelFormat::Stereo);
-        (soundcraft_mix::render_bus(s, id, r, 1024), fmt)
+        (soundcraft_mix::render_bus_checked(s, id, r, 1024).map_err(EngineError::Io)?, fmt)
     } else {
-        let ch = soundcraft_mix::render_range(s, r, 1024);
+        let ch = soundcraft_mix::render_range_checked(s, r, 1024).map_err(EngineError::Io)?;
         let fmt = if ch.len() <= 2 { ChannelFormat::Stereo } else { s.main_format() };
         (ch, fmt)
     };
-    if fold_stereo && ch.len() > 2 { (soundcraft_mix::fold_down_stereo(fmt, &ch), ChannelFormat::Stereo) } else { (ch, fmt) }
+    Ok(if fold_stereo && ch.len() > 2 { (soundcraft_mix::fold_down_stereo(fmt, &ch), ChannelFormat::Stereo) } else { (ch, fmt) })
 }
 
 /// Bounce one file per audio/instrument track (each soloed, so its sends and auxes are included)
@@ -332,7 +332,7 @@ pub fn bounce_stems_with(e: &Engine, dir: &str, r: Range, opts: &EncodeOptions, 
                 t.mixer.output = soundcraft_model::Route::Main;
             }
         }
-        let (ch, fmt) = render_main(&solo, r, fold_stereo);
+        let (ch, fmt) = render_main(&solo, r, fold_stereo)?;
         let buf = AudioBuffer { sample_rate: s.sample_rate.hz(), channels: ch };
         let bytes = soundcraft_audio_io::encode_with_channel_mask(&buf, opts, fmt.channel_mask()).map_err(|err| EngineError::Io(err.to_string()))?;
         let path = Path::new(dir).join(format!("{} - {}.{ext}", sanitize_name(&s.name), sanitize_name(&name)));
@@ -352,17 +352,17 @@ pub fn bounded_to_track(s: &Session, t: TrackId, r: Range) -> Range {
 }
 
 /// Transient positions (absolute) in a track's clips within `r`.
-pub fn transients_in(s: &Session, t: TrackId, r: Range, sens: f32) -> Vec<Samples> {
+pub fn transients_in(s: &Session, t: TrackId, r: Range, sens: f32) -> Result<Vec<Samples>> {
     let r = if r.is_empty() { Range::new(0, s.content_end()) } else { r };
     let r = bounded_to_track(s, t, r);
-    let audio = soundcraft_mix::render_clips(s, t, r);
-    soundcraft_dsp::offline::detect_transients(&audio, s.sample_rate.as_f64() as f32, sens).into_iter().map(|i| r.start + i as i64).collect()
+    let audio = soundcraft_mix::render_clips_checked(s, t, r).map_err(EngineError::Io)?;
+    Ok(soundcraft_dsp::offline::detect_transients(&audio, s.sample_rate.as_f64() as f32, sens).into_iter().map(|i| r.start + i as i64).collect())
 }
 
 /// Strip Silence: keep only the non-silent ranges of clips inside `r`.
-pub fn strip_silence(s: &mut Session, t: TrackId, r: Range, thr: f32, min_len: Samples, pre: Samples, post: Samples) -> usize {
+pub fn strip_silence(s: &mut Session, t: TrackId, r: Range, thr: f32, min_len: Samples, pre: Samples, post: Samples) -> Result<usize> {
     let r = bounded_to_track(s, t, r);
-    let audio = soundcraft_mix::render_clips(s, t, r);
+    let audio = soundcraft_mix::render_clips_checked(s, t, r).map_err(EngineError::Io)?;
     let keep = soundcraft_dsp::offline::non_silent_ranges(
         &audio,
         thr,
@@ -395,7 +395,7 @@ pub fn strip_silence(s: &mut Session, t: TrackId, r: Range, thr: f32, min_len: S
     if let Some(pl) = s.track_mut(t).and_then(|x| x.playlist_mut()) {
         pl.clips.retain(|c| !gaps.iter().any(|g| c.start >= g.start && c.end() <= g.end));
     }
-    keep.len()
+    Ok(keep.len())
 }
 
 /// Consolidate the selection on a track into one new clip backed by a rendered source.
@@ -408,7 +408,7 @@ pub fn consolidate(e: &mut Engine, t: TrackId, r: Range) -> Result<bool> {
     if r.is_empty() {
         return Ok(false);
     }
-    let audio = soundcraft_mix::render_clips(s, t, r);
+    let audio = soundcraft_mix::render_clips_checked(s, t, r).map_err(EngineError::Io)?;
     let name = format!("{}_consolidated", s.track(t).map_or("Audio", |x| x.name.as_str()));
     let buf = AudioBuffer { sample_rate: s.sample_rate.hz(), channels: audio };
     let s = e.session_mut();
@@ -433,7 +433,7 @@ pub fn render_clip_gain(e: &mut Engine, id: soundcraft_model::ClipId) -> Result<
     if let Some(pl) = tmp.track_mut(t).and_then(|x| x.playlist_mut()) {
         pl.clips = vec![c2];
     }
-    let audio = soundcraft_mix::render_clips(&tmp, t, c.range());
+    let audio = soundcraft_mix::render_clips_checked(&tmp, t, c.range()).map_err(EngineError::Io)?;
     let buf = AudioBuffer { sample_rate: s.sample_rate.hz(), channels: audio };
     let s = e.session_mut();
     let src = add_source(s, &format!("{}_gain", c.name), buf, None, FileFormat::Wav);
@@ -460,9 +460,9 @@ pub fn commit_track(e: &mut Engine, t: TrackId) -> Result<Option<TrackId>> {
         return Ok(None);
     }
     let range = Range::new(0, end + s.sample_rate.samples(2.0));
-    let audio = soundcraft_mix::render_track_pre_fader(s, t, range);
+    let audio = soundcraft_mix::render_track_pre_fader_checked(s, t, range).map_err(EngineError::Io)?;
     let name = format!("{}.cm", tr.name);
-    let fmt = ChannelFormat::for_channels(audio.len().clamp(1, 2));
+    let fmt = ChannelFormat::for_channels(audio.len());
     let mixer = tr.mixer.clone();
     let buf = AudioBuffer { sample_rate: s.sample_rate.hz(), channels: audio };
     let s = e.session_mut();
@@ -494,7 +494,7 @@ pub fn export_clips(e: &Engine, ids: &[soundcraft_model::ClipId], dir: &str) -> 
     let mut n = 0;
     for id in ids {
         let Some((t, c)) = s.find_clip(*id) else { continue };
-        let audio = soundcraft_mix::render_clips(s, t, c.range());
+        let audio = soundcraft_mix::render_clips_checked(s, t, c.range()).map_err(EngineError::Io)?;
         let buf = AudioBuffer { sample_rate: s.sample_rate.hz(), channels: audio };
         let bytes = soundcraft_audio_io::encode(&buf, &EncodeOptions::default()).map_err(|err| EngineError::Io(err.to_string()))?;
         let stem = sanitize_name(&c.name);
@@ -1400,5 +1400,107 @@ mod sculpt_core16_file_type_tests {
         assert_eq!(session_file(root.join("Legacy").to_str().unwrap()), legacy);
         assert_eq!(session_file(root.join("New Project").to_str().unwrap()), root.join("New Project.scdaw"));
         let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[allow(clippy::unwrap_used)]
+mod offline_source_tests {
+    use super::*;
+    use soundcraft_audio_io::{
+        BitDepth,
+        stream_cache::{CacheConfig, StreamCache},
+    };
+    use std::{
+        sync::atomic::{AtomicU64, Ordering},
+        time::Duration,
+    };
+    static SERIAL: AtomicU64 = AtomicU64::new(0);
+    struct Fixture {
+        path: PathBuf,
+        audio: AudioBuffer,
+    }
+    impl Fixture {
+        fn new(channels: usize) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("sculpt-offline-command-{}-{}.wav", std::process::id(), SERIAL.fetch_add(1, Ordering::Relaxed)));
+            let audio = AudioBuffer {
+                sample_rate: 48_000,
+                channels: (0..channels).map(|ch| (0..6000).map(|f| (f as f32 * 0.017 + ch as f32).sin() * 0.3).collect()).collect(),
+            };
+            let bytes =
+                soundcraft_audio_io::encode(&audio, &EncodeOptions { bit_depth: BitDepth::Float32, dither: false, ..EncodeOptions::default() })
+                    .unwrap();
+            std::fs::write(&path, bytes).unwrap();
+            Self { path, audio }
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+    fn engine(fixture: &Fixture, cache: Option<&Arc<StreamCache>>) -> (Engine, TrackId) {
+        let mut s = Session::default();
+        let track = s.add_track(TrackKind::Audio, ChannelFormat::for_channels(fixture.audio.num_channels()), Some("Audio"));
+        let source = add_source(&mut s, "Audio", fixture.audio.clone(), None, FileFormat::Wav);
+        if let Some(cache) = cache {
+            let disk = SourceAudio::from_stream(cache.open_source(&fixture.path).unwrap(), 140, |_, _| true).unwrap();
+            s.pool.insert(source, Arc::new(disk));
+        }
+        let clip = Clip::audio(s.new_clip_id(), "Audio", source, 0, 0, 6000);
+        s.track_mut(track).unwrap().playlist_mut().unwrap().clips.push(clip);
+        (Engine::new(s), track)
+    }
+    #[test]
+    fn offline_edit_failures_leave_document_and_undo_unchanged() {
+        let fixture = Fixture::new(2);
+        let cache = StreamCache::new(CacheConfig::default()).unwrap();
+        let (mut e, track) = engine(&fixture, Some(&cache));
+        let before = e.session().to_json().unwrap();
+        std::fs::OpenOptions::new().write(true).open(&fixture.path).unwrap().set_len(100).unwrap();
+        for missing in [false, true] {
+            if missing {
+                let source = e.session().sources[0].id;
+                e.session_mut().pool.remove(source);
+                e.mark_clean();
+            }
+            for command in ["edit.strip_silence", "edit.consolidate", "edit.separate_at_transients", "track.commit", "edit.copy_audio_as_midi"] {
+                let error = e.execute(command, &json!({"tracks":[track.0],"start":0,"end":6000})).unwrap_err();
+                assert!(matches!(error, EngineError::Io(_)), "{command}: {error}");
+                assert_eq!(e.session().to_json().unwrap(), before, "{command} changed the document");
+                assert!(!e.can_undo());
+                assert!(!e.is_dirty());
+            }
+        }
+        cache.shutdown(Duration::from_secs(1)).unwrap();
+    }
+    #[test]
+    fn consolidate_and_commit_from_disk_match_resident_and_preserve_multichannel_width() {
+        for channels in [1, 2, 7] {
+            let fixture = Fixture::new(channels);
+            let cache = StreamCache::new(CacheConfig::default()).unwrap();
+            for command in ["edit.consolidate", "track.commit"] {
+                let (mut streamed, track) = engine(&fixture, Some(&cache));
+                let (mut resident, _) = engine(&fixture, None);
+                let source = streamed.session().sources[0].id;
+                let params = json!({"tracks":[track.0],"start":0,"end":6000});
+                let a = streamed.execute(command, &params).unwrap();
+                let b = resident.execute(command, &params).unwrap();
+                assert_eq!(a, b);
+                assert_eq!(streamed.session().to_json().unwrap(), resident.session().to_json().unwrap());
+                let result = streamed.session().sources.last().unwrap().id;
+                assert_eq!(streamed.session().pool.get(result).unwrap().buffer, resident.session().pool.get(result).unwrap().buffer);
+                assert_eq!(streamed.session().pool.get(result).unwrap().channels(), channels);
+                assert!(!streamed.session().pool.get(source).unwrap().is_resident());
+                if command == "track.commit" {
+                    assert_eq!(streamed.session().tracks.last().unwrap().channels(), channels);
+                }
+                assert!(streamed.undo());
+                assert_eq!(streamed.session().sources.len(), 1);
+                assert!(!streamed.session().pool.get(source).unwrap().is_resident());
+            }
+            cache.shutdown(Duration::from_secs(1)).unwrap();
+        }
     }
 }

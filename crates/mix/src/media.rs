@@ -321,6 +321,86 @@ mod tests {
         cache.shutdown(Duration::from_secs(1)).unwrap();
     }
     #[test]
+    fn offline_consumers_match_resident_audio_with_unaligned_fades_and_clip_fx() {
+        use crate::{render_bus_checked, render_clips_checked, render_track_pre_fader_checked};
+        use soundcraft_model::{Insert, Route};
+        for channels in [1, 2, 7] {
+            let fixture = Fixture::new(channels);
+            let cache = StreamCache::new(CacheConfig::default()).unwrap();
+            let mut resident = session(Arc::new(SourceAudio::new(fixture.audio.clone())), true);
+            for t in &mut resident.tracks {
+                let clip = &mut t.playlist_mut().unwrap().clips[0];
+                clip.gain_env = vec![(0, -2.0), (1137, -11.0), (5749, 0.0)];
+            }
+            let clip_id = resident.tracks[1].clips()[0].id.0;
+            resident.edit.values.insert(format!("clip_fx.{clip_id}.gain"), -4.0);
+            resident.edit.values.insert(format!("clip_fx.{clip_id}.comp.threshold"), -20.0);
+            let mut streamed = resident.clone();
+            streamed.pool.insert(SourceId(900), disk(&fixture, &cache));
+            let range = Range::new(17, 15_000);
+            for track in &resident.tracks {
+                let expected = render_clips_checked(&resident, track.id, range).unwrap();
+                let actual = render_clips_checked(&streamed, track.id, range).unwrap();
+                assert_eq!(actual, expected, "consolidate {channels}ch");
+                assert_eq!(
+                    render_track_pre_fader_checked(&streamed, track.id, range).unwrap(),
+                    render_track_pre_fader_checked(&resident, track.id, range).unwrap()
+                );
+            }
+            let bus = resident.add_bus("Stem", ChannelFormat::for_channels(channels));
+            for track in &mut resident.tracks {
+                track.mixer.output = Route::Bus(bus);
+                track.mixer.inserts[0] = Some(Insert::new("gain"));
+            }
+            let mut streamed = resident.clone();
+            streamed.pool.insert(SourceId(900), disk(&fixture, &cache));
+            assert_eq!(render_bus_checked(&streamed, bus, range, 512).unwrap(), render_bus_checked(&resident, bus, range, 512).unwrap());
+            assert!(!streamed.pool.get(SourceId(900)).unwrap().is_resident());
+            cache.shutdown(Duration::from_secs(1)).unwrap();
+        }
+    }
+    #[test]
+    fn checked_offline_consumers_reject_incoherent_pcm_instead_of_baking_silence_or_wrong_rate() {
+        use crate::{render_bus_checked, render_clips_checked, render_track_pre_fader_checked};
+        for audio in [
+            AudioBuffer { sample_rate: 44_100, channels: vec![vec![0.2; 1024]; 2] },
+            AudioBuffer { sample_rate: 48_000, channels: vec![vec![0.2; 1024], vec![0.2; 512]] },
+            AudioBuffer { sample_rate: 48_000, channels: vec![Vec::new(); 2] },
+        ] {
+            let mut s = session(Arc::new(SourceAudio::new(audio)), false);
+            let track = s.tracks[0].id;
+            let bus = s.add_bus("Bus", ChannelFormat::Stereo);
+            s.tracks[0].mixer.output = soundcraft_model::Route::Bus(bus);
+            let range = Range::new(0, 512);
+            assert!(render_range_checked(&s, range, 512).is_err());
+            assert!(render_clips_checked(&s, track, range).is_err());
+            assert!(render_track_pre_fader_checked(&s, track, range).is_err());
+            assert!(render_bus_checked(&s, bus, range, 512).is_err());
+        }
+    }
+    #[test]
+    fn checked_offline_consumers_reject_media_errors_and_oversize_without_partial_audio() {
+        use crate::{MAX_RENDER_SAMPLES, render_bus_checked, render_clips_checked, render_track_pre_fader_checked};
+        let fixture = Fixture::new(2);
+        let cache = StreamCache::new(CacheConfig::default()).unwrap();
+        let mut s = session(disk(&fixture, &cache), false);
+        let track = s.tracks[0].id;
+        let bus = s.add_bus("Stem", ChannelFormat::Stereo);
+        s.tracks[0].mixer.output = soundcraft_model::Route::Bus(bus);
+        let excessive = Range::new(0, (MAX_RENDER_SAMPLES / 2 + 1) as i64);
+        assert!(render_clips_checked(&s, track, excessive).is_err());
+        assert!(render_track_pre_fader_checked(&s, track, excessive).is_err());
+        assert!(render_bus_checked(&s, bus, excessive, 512).is_err());
+        assert!(render_range_checked(&s, excessive, 512).is_err());
+        assert_eq!(cache.stats().read_bytes, 0);
+        std::fs::OpenOptions::new().write(true).open(&fixture.path).unwrap().set_len(100).unwrap();
+        let range = Range::new(0, 512);
+        assert!(render_clips_checked(&s, track, range).is_err());
+        assert!(render_track_pre_fader_checked(&s, track, range).is_err());
+        assert!(render_bus_checked(&s, bus, range, 512).is_err());
+        cache.shutdown(Duration::from_secs(1)).unwrap();
+    }
+    #[test]
     fn changed_media_is_rejected_during_offline_preparation() {
         let fixture = Fixture::new(2);
         let cache = StreamCache::new(CacheConfig::default()).unwrap();
