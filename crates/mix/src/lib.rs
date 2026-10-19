@@ -51,6 +51,9 @@
 //! [`Insert::sample`]: soundcraft_model::Insert::sample
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+#[cfg(not(target_arch = "wasm32"))]
+pub mod media;
+
 use soundcraft_dsp::pan::{PanLaw, SpeakerPos, SurroundParams, gains};
 use soundcraft_dsp::{Plugin, SampleSource, db_to_gain};
 use soundcraft_model::{
@@ -330,6 +333,10 @@ pub struct MixEngine {
     retired: Vec<Box<dyn Plugin>>,
     /// Ownership workspace reused for parallel strip processing.
     work: Vec<(usize, Strip)>,
+    #[cfg(not(target_arch = "wasm32"))]
+    media: Arc<media::PreparedMedia>,
+    #[cfg(not(target_arch = "wasm32"))]
+    media_anchor: Option<Samples>,
 }
 
 /// What `sync` needs to fill a slot.
@@ -396,6 +403,10 @@ impl MixEngine {
             adopt: HashMap::new(),
             retired: Vec::new(),
             work: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            media: Arc::new(media::PreparedMedia::default()),
+            #[cfg(not(target_arch = "wasm32"))]
+            media_anchor: None,
         }
     }
 
@@ -578,9 +589,33 @@ impl MixEngine {
         }
     }
 
+    /// Adopt prepared media. Keep the returned owner until the control thread can drop it;
+    /// destroying disk views/session sources must not run in the device callback.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn set_media(&mut self, media: Arc<media::PreparedMedia>) -> Arc<media::PreparedMedia> {
+        std::mem::replace(&mut self.media, media)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn set_media_anchor(&mut self, anchor: Option<Samples>) {
+        self.media_anchor = anchor;
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn take_media_error(&self) -> Option<soundcraft_audio_io::stream_cache::CacheError> {
+        self.media.take_error()
+    }
+
     /// Render `frames` (≤ max_block) samples starting at `pos` into `out` (≥ 2 channels).
     pub fn render(&mut self, s: &Session, pos: Samples, frames: usize, out: &mut [Vec<f32>]) {
         let frames = frames.min(self.max_block);
+        #[cfg(not(target_arch = "wasm32"))]
+        let media = Arc::clone(&self.media);
+        #[cfg(not(target_arch = "wasm32"))]
+        if !self.monitor_only
+            && let Err(error) =
+                if self.external { media.request(pos, frames, self.media_anchor) } else { media.request_exact(pos, frames, self.media_anchor) }
+        {
+            media.fail(error);
+        }
         if pos != self.last_end {
             // Seek: silence held notes and ringing plugins.
             for st in self.strips.values_mut() {
@@ -623,7 +658,13 @@ impl MixEngine {
             }
         }
         let busses = std::mem::take(&mut self.busses);
-        let live_in = LiveInput { input: &self.input, monitor_only: self.monitor_only, recording: self.recording };
+        let live_in = LiveInput {
+            input: &self.input,
+            monitor_only: self.monitor_only,
+            recording: self.recording,
+            #[cfg(not(target_arch = "wasm32"))]
+            media: &media,
+        };
         run_strips(&mut work, |(i, st)| {
             if let Some(t) = s.tracks.get(*i) {
                 process_strip(s, t, st, &busses, &live_in, pos, frames, any_solo);
@@ -685,7 +726,13 @@ impl MixEngine {
             if st.scratch.len() < self.max_block {
                 st.scratch.resize(self.max_block, 0.0);
             }
-            let live_in = LiveInput { input: &self.input, monitor_only: self.monitor_only, recording: self.recording };
+            let live_in = LiveInput {
+                input: &self.input,
+                monitor_only: self.monitor_only,
+                recording: self.recording,
+                #[cfg(not(target_arch = "wasm32"))]
+                media: &media,
+            };
             process_strip(s, t, &mut st, &self.busses, &live_in, pos, frames, any_solo);
             let ch = st.buf.len();
             st.align.set(if pdc { lmax_a.saturating_sub(st.latency) } else { 0 }, ch);
@@ -766,6 +813,14 @@ impl MixEngine {
         // start of the same beat would repeat every block as a buzz.
         if self.metronome && !self.monitor_only && s.edit.click && (!s.edit.flag("click.only_during_record") || self.recording) {
             click::render(s, pos, frames, &mut self.main);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if media.failed() {
+            // No partial mix reaches the device when any in-file PCM window is unavailable.
+            // The host must observe take_media_error and stop/report before another block.
+            for channel in self.main.iter_mut().chain(self.hardware.iter_mut()) {
+                channel.iter_mut().take(frames).for_each(|x| *x = 0.0);
+            }
         }
         // Output: min(out.len(), main channels) channels; any further output channels are silent.
         for (c, o) in out.iter_mut().enumerate() {
@@ -907,6 +962,8 @@ impl MixEngine {
 /// strips except that aux inputs read `busses`, so non-aux strips can run in parallel.
 /// Live input routed to monitored tracks.
 struct LiveInput<'a> {
+    #[cfg(not(target_arch = "wasm32"))]
+    media: &'a media::PreparedMedia,
     input: &'a [Vec<f32>],
     monitor_only: bool,
     recording: bool,
@@ -949,7 +1006,16 @@ fn process_strip(
                     continue;
                 }
                 match clip_fx_params(s, clip.id.0) {
-                    None => render_clip(s, clip, pos, frames, &mut strip.buf, &mut strip.scratch),
+                    None => render_clip(
+                        s,
+                        clip,
+                        pos,
+                        frames,
+                        &mut strip.buf,
+                        &mut strip.scratch,
+                        #[cfg(not(target_arch = "wasm32"))]
+                        Some(live.media),
+                    ),
                     Some(params) => {
                         let nch = strip.buf.len();
                         if strip.clipbuf.len() != nch || strip.clipbuf.first().map_or(0, Vec::len) < frames {
@@ -958,7 +1024,16 @@ fn process_strip(
                         for c in strip.clipbuf.iter_mut() {
                             c.iter_mut().take(frames).for_each(|x| *x = 0.0);
                         }
-                        render_clip(s, clip, pos, frames, &mut strip.clipbuf, &mut strip.scratch);
+                        render_clip(
+                            s,
+                            clip,
+                            pos,
+                            frames,
+                            &mut strip.clipbuf,
+                            &mut strip.scratch,
+                            #[cfg(not(target_arch = "wasm32"))]
+                            Some(live.media),
+                        );
                         let fx = strip.clip_fx.entry(clip.id.0).or_insert_with(|| ClipFx::new(s.sample_rate.as_f64() as f32, nch));
                         fx.configure(&params);
                         fx.process(&mut strip.clipbuf, frames);
@@ -1365,12 +1440,33 @@ mod click {
     }
 }
 
-fn render_clip(s: &Session, clip: &Clip, pos: Samples, frames: usize, buf: &mut [Vec<f32>], _scratch: &mut [f32]) {
+fn render_clip(
+    s: &Session,
+    clip: &Clip,
+    pos: Samples,
+    frames: usize,
+    buf: &mut [Vec<f32>],
+    _scratch: &mut [f32],
+    #[cfg(not(target_arch = "wasm32"))] media: Option<&media::PreparedMedia>,
+) {
     let ClipContent::Audio { source, offset } = clip.content else { return };
     let block = Range { start: pos, end: pos.saturating_add(frames as i64) };
     let Some(isect) = clip.range().intersect(&block) else { return };
     let Some(audio) = s.pool.get(source) else { return };
-    let nsrc = audio.buffer.channels.len();
+    let nsrc = audio.channels();
+    #[cfg(not(target_arch = "wasm32"))]
+    let window = if !audio.is_resident() {
+        let Some(media) = media else { return };
+        match media.window(clip, audio, pos, frames) {
+            Ok(window) => window,
+            Err(error) => {
+                media.fail(error);
+                return;
+            }
+        }
+    } else {
+        None
+    };
     if nsrc == 0 {
         return;
     }
@@ -1381,6 +1477,13 @@ fn render_clip(s: &Session, clip: &Clip, pos: Samples, frames: usize, buf: &mut 
     const STEP: usize = 32;
     for (ch, dst) in buf.iter_mut().enumerate() {
         let src = audio.buffer.channels.get(ch % nsrc).map(Vec::as_slice).unwrap_or(&[]);
+        let sample = |index: usize| {
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Some(window) = &window {
+                return window.sample(ch % nsrc, index as u64);
+            }
+            src.get(index).copied().unwrap_or(0.0)
+        };
         let mut i = i0;
         while i < i1 {
             let seg_end = (i + STEP).min(i1);
@@ -1394,13 +1497,13 @@ fn render_clip(s: &Session, clip: &Clip, pos: Samples, frames: usize, buf: &mut 
             for k in i..seg_end {
                 let rel = pos.saturating_add(k as i64).saturating_sub(clip.start);
                 let v = if (stretch - 1.0).abs() < 1e-9 {
-                    usize::try_from(offset.saturating_add(rel)).ok().and_then(|x| src.get(x)).copied().unwrap_or(0.0)
+                    usize::try_from(offset.saturating_add(rel)).ok().map(sample).unwrap_or(0.0)
                 } else {
                     let f = offset as f64 + rel as f64 / stretch;
                     let x0 = f.floor();
                     let fr = (f - x0) as f32;
-                    let a = if x0 >= 0.0 { src.get(x0 as usize).copied().unwrap_or(0.0) } else { 0.0 };
-                    let b = if x0 + 1.0 >= 0.0 { src.get((x0 as usize).saturating_add(1)).copied().unwrap_or(0.0) } else { 0.0 };
+                    let a = if x0 >= 0.0 { sample(x0 as usize) } else { 0.0 };
+                    let b = if x0 + 1.0 >= 0.0 { sample((x0 as usize).saturating_add(1)) } else { 0.0 };
                     a + (b - a) * fr
                 };
                 let t = (k - i) as f32 / n;
@@ -1883,12 +1986,25 @@ fn check_render_plugins(eng: &MixEngine, s: &Session) -> Result<(), String> {
 fn render_range_impl(s: &Session, range: Range, block: usize, checked: bool) -> Result<Vec<Vec<f32>>, String> {
     let nch = main_channels(s);
     let len = usize::try_from(range.len().max(0)).unwrap_or(0).min(MAX_RENDER_SAMPLES / nch.max(1));
+    #[cfg(not(target_arch = "wasm32"))]
+    let media = Arc::new(media::PreparedMedia::new(s).map_err(|e| format!("Media preparation: {e}"))?);
     // Probe the latency with one block, then render `len + latency` and drop the head.
     let latency = {
         let mut probe = MixEngine::new(s.sample_rate.as_f64() as f32, block);
         let b = probe.max_block();
         let mut tmp = vec![vec![0.0f32; b]; nch];
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            probe.set_media(Arc::clone(&media));
+            media
+                .prepare_exact(range.start, b.min(len.max(1)), None, std::time::Duration::from_secs(3))
+                .map_err(|e| format!("Media prefetch: {e}"))?;
+        }
         probe.render(s, range.start, b.min(len.max(1)), &mut tmp);
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(error) = probe.take_media_error() {
+            return Err(format!("Media read: {error}"));
+        }
         if checked {
             check_render_plugins(&probe, s)?;
         }
@@ -1897,12 +2013,22 @@ fn render_range_impl(s: &Session, range: Range, block: usize, checked: bool) -> 
     let total = len.saturating_add(latency);
     let mut out = vec![vec![0.0f32; total]; nch];
     let mut eng = MixEngine::new(s.sample_rate.as_f64() as f32, block);
+    #[cfg(not(target_arch = "wasm32"))]
+    eng.set_media(Arc::clone(&media));
     let b = eng.max_block();
     let mut tmp = vec![vec![0.0f32; b]; nch];
     let mut done = 0usize;
     while done < total {
         let n = (total - done).min(b);
+        #[cfg(not(target_arch = "wasm32"))]
+        media
+            .prepare_exact(range.start.saturating_add(done as i64), n, None, std::time::Duration::from_secs(3))
+            .map_err(|e| format!("Media prefetch: {e}"))?;
         eng.render(s, range.start + done as i64, n, &mut tmp);
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(error) = eng.take_media_error() {
+            return Err(format!("Media read: {error}"));
+        }
         if checked && done == 0 {
             check_render_plugins(&eng, s)?;
         }
@@ -2002,10 +2128,28 @@ pub fn render_clips(s: &Session, track: TrackId, range: Range) -> Vec<Vec<f32>> 
             continue;
         }
         match clip_fx_params(s, c.id.0) {
-            None => render_clip(s, c, range.start, len, &mut out, &mut scratch),
+            None => render_clip(
+                s,
+                c,
+                range.start,
+                len,
+                &mut out,
+                &mut scratch,
+                #[cfg(not(target_arch = "wasm32"))]
+                None,
+            ),
             Some(params) => {
                 let mut tmp = vec![vec![0.0f32; len]; out.len()];
-                render_clip(s, c, range.start, len, &mut tmp, &mut scratch);
+                render_clip(
+                    s,
+                    c,
+                    range.start,
+                    len,
+                    &mut tmp,
+                    &mut scratch,
+                    #[cfg(not(target_arch = "wasm32"))]
+                    None,
+                );
                 let mut fx = ClipFx::new(s.sample_rate.as_f64() as f32, tmp.len());
                 fx.configure(&params);
                 let mut done = 0;

@@ -37,3 +37,9 @@ Core30: pool PCM condiviso con budget configurabile (32 MiB di default, massimo 
 Core31: sei regressioni e gate locale completo passati (733 test numerici più harness UI), secondo `QA/CORE31_BOUNDED_OVERVIEWS.md`. waveform progressive con budget condiviso fra canali e risoluzione adattata alla durata; cancellazione e rifiuto di input incompleti. La preparazione legge a blocchi fuori callback, non memorizza tutto il PCM. Il collegamento a SourceAudio/player resta successivo; nessuna attivazione parziale che comprometta il bridge. Core30 pubblicato in PR #5, commit `46b1266`; CI remota da verificare.
 
 CI Core29 verificata: run `39253262657`, conclusa con successo sul commit `23d556e`.
+
+Core31 pubblicato in PR #6, commit `b96d798`. Core32 in lavorazione su `feature/core32-source-backends`: nuova rappresentazione sorgenti e snapshot offline con budget, tre test mirati passati; integrazione/attivazione nel player ancora da eseguire. Stato e vincoli dettagliati in `QA/CORE32_SOURCE_BACKENDS.md`. Nessuna distribuzione parziale abilitata.
+
+Core32 prosegue: mixer e Player collegati alle view preparate, preflight/loop/locate/errori e UI verificati con test mirati; batch atomici per richieste multi-clip. Riuso delle mappe su edit mixer, arresto su media non pronti, correzione pending al passaggio a monitoring. 13 nuove regressioni mirate e gate completo locale passati (746 test numerici più harness UI, fmt/Clippy/assets/layers/wasm). Non attivare ancora import/open/take disco: consumatori offline/bridge e gestione file pendenti, elencati in QA/CORE32_SOURCE_BACKENDS.md.
+
+CI Core30 verificata: run `39255955793`, conclusa con successo sul commit `46b1266`. CI Core31 `39256616337` ancora in corso all’ultima verifica; non assumere il risultato.
