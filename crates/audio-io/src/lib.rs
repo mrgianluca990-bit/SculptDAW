@@ -1,6 +1,7 @@
 //! SoundCraft audio file I/O.
 //!
-//! Bytes in, bytes out (no filesystem access, so the crate also builds for `wasm32`):
+//! Core codecs take bytes in and out, so they also build for `wasm32`. Native hosts additionally
+//! have `stream` for bounded filesystem reads on worker/offline threads:
 //!
 //! * [`detect_format`] / [`probe`] / [`decode`] read WAV (PCM 8/16/24/32, float 32/64,
 //!   `WAVE_FORMAT_EXTENSIBLE`, RF64/BW64, BWF `bext`) and AIFF/AIFF-C (big-endian, `sowt`,
@@ -17,6 +18,9 @@ mod buffer;
 mod flac;
 mod pcm;
 pub mod peaks;
+/// Bounded filesystem readers for native streaming; callers must keep disk I/O off the audio callback.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod stream;
 mod symph;
 mod wav;
 
@@ -25,6 +29,9 @@ pub use buffer::AudioBuffer;
 /// Errors from probing, decoding and encoding.
 #[derive(Debug, thiserror::Error)]
 pub enum AudioError {
+    /// Filesystem or stream operation failed.
+    #[error("audio I/O failed: {0}")]
+    Io(String),
     /// The format, codec or option is valid but not supported.
     #[error("unsupported audio: {0}")]
     Unsupported(String),
