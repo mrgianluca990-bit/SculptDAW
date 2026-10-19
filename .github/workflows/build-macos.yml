@@ -1,10 +1,15 @@
-name: Sculpt DAW Core28 — input failure, I/O and bridge checks
+name: Sculpt DAW — native checks and explicit packaging
 on:
   push:
-    branches: [main, develop, 'feature/**']
+    branches: [main, develop, 'release/**']
   pull_request:
     branches: [main, develop, 'feature/**']
   workflow_dispatch:
+    inputs:
+      package_archive:
+        description: Build and verify the complete universal app after the quality gate
+        type: boolean
+        default: true
 permissions:
   contents: read
 concurrency:
@@ -12,22 +17,31 @@ concurrency:
   cancel-in-progress: true
 jobs:
   macos:
-    runs-on: macos-15-intel
+    runs-on: macos-15
     timeout-minutes: 120
     env:
       SCULPT_BRIDGE_VALIDATOR: /tmp/sculpt-bridge-validator
+      CARGO_BUILD_JOBS: 2
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin,wasm32-unknown-unknown
+          components: rustfmt,clippy
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
-          key: bridge-full-ci-v1
+          key: sculpt-native-arm64-gate-v2
           cache-on-failure: "true"
-      - name: Check out matching Show receiver for contract test
+      - name: Record and check native build environment
+        run: |
+          mkdir -p dist/qa
+          uname -a | tee dist/qa/environment.log
+          sw_vers | tee -a dist/qa/environment.log
+          rustc -Vv | tee -a dist/qa/environment.log
+          test "$RUNNER_ARCH" = ARM64
+      - name: Check out pinned Show receiver for contract tests
         uses: actions/checkout@v4
         with:
           repository: mrgianluca990-bit/Sculpt-Show
@@ -38,53 +52,39 @@ jobs:
         run: swiftc .bridge-show/Sources/SculptShowCore/*.swift bridge/tests/main.swift -o "$SCULPT_BRIDGE_VALIDATOR"
       - name: Format integrated sources
         run: cargo fmt --all
-      - name: Check exact committed sources
-        run: cargo check --locked -p sculpt-daw -p soundcraft-cli
-      - name: DAW to Show audio and contract regression tests
+      - name: Full repository quality gate, including audio, I/O, plugin and bridge tests
+        shell: bash
         run: |
-          cargo test --locked -p soundcraft-engine --lib sculpt_bridge
-          cargo test --locked -p soundcraft-ui-egui --lib sculpt_bridge
-      - name: Playback Engine capability and transaction regressions
-        run: |
-          cargo test --locked -p soundcraft-playback --lib
-          cargo test --locked -p soundcraft-ui-egui --lib sculpt_core26_audio_tests
-          cargo test --locked -p soundcraft-ui-egui --lib input_stream_failure
-      - name: I/O identity, signal routing and UI transaction regressions
-        run: |
-          cargo test --locked -p soundcraft-model --lib io_paths
-          cargo test --locked -p soundcraft-engine --lib cmd::io_setup
-          cargo test --locked -p soundcraft-mix --lib core27
-          cargo test --locked -p soundcraft-ui-egui --lib io_setup::tests
-      - name: Workspace and upstream regressions
-        run: |
-          cargo test --locked -p sculpt-daw single_instance
-          cargo test --locked -p soundcraft-ui-egui --test sculpt_strip_height
-          cargo test --locked -p soundcraft-mix --test master_insert_latency
-          cargo test --locked -p soundcraft-vst3-host --test fixture_e2e host_set_controller_param_survives_state_round_trip
-      - name: Full repository quality gate
-        run: cargo xtask ci
-      - name: Render Edit selected channel
-        run: |
+          set -o pipefail
           mkdir -p dist/qa
+          cargo xtask ci 2>&1 | tee dist/qa/quality-gate.log
+      - name: Render release previews
+        if: startsWith(github.ref, 'refs/heads/release/') || (github.event_name == 'workflow_dispatch' && inputs.package_archive)
+        run: |
           cargo run --locked -p soundcraft-ui-egui --example ui_shot -- dist/qa/edit.png QA/edit-strip.jsonl --size 1400x900
-      - name: Render Playback Engine
-        run: cargo run --locked -p soundcraft-ui-egui --example ui_shot -- dist/qa/playback-engine.png QA/playback-engine.jsonl --size 1400x1000
-      - name: Render Input, Output and Bus matrices
-        run: cargo run --locked -p soundcraft-ui-egui --example ui_shot -- dist/qa/io-bus.png QA/io-setup.jsonl --size 1400x1000
-      - uses: actions/upload-artifact@v4
-        with:
-          name: Sculpt-DAW-Core27-previews
-          path: dist/qa/*.png
-          if-no-files-found: error
+          cargo run --locked -p soundcraft-ui-egui --example ui_shot -- dist/qa/playback-engine.png QA/playback-engine.jsonl --size 1400x1000
+          cargo run --locked -p soundcraft-ui-egui --example ui_shot -- dist/qa/io-bus.png QA/io-setup.jsonl --size 1400x1000
       - name: Build universal app with embedded CLI
+        if: startsWith(github.ref, 'refs/heads/release/') || (github.event_name == 'workflow_dispatch' && inputs.package_archive)
         run: bash sculpt/build-macos.sh
       - name: Verify archive
+        if: startsWith(github.ref, 'refs/heads/release/') || (github.event_name == 'workflow_dispatch' && inputs.package_archive)
         run: |
           shasum -a 256 -c dist/sculpt/Sculpt_DAW_0.4.0_Mac_Universal.zip.sha256
           unzip -t dist/sculpt/Sculpt_DAW_0.4.0_Mac_Universal.zip
-      - uses: actions/upload-artifact@v4
+      - name: Upload complete app
+        if: startsWith(github.ref, 'refs/heads/release/') || (github.event_name == 'workflow_dispatch' && inputs.package_archive)
+        uses: actions/upload-artifact@v4
         with:
-          name: Sculpt-DAW-Bridge-${{ github.sha }}
+          name: Sculpt-DAW-${{ github.event.pull_request.head.sha || github.sha }}
           path: dist/sculpt/Sculpt_DAW_0.4.0_Mac_Universal.zip*
           if-no-files-found: error
+          retention-days: 14
+      - name: Retain quality gate log and available previews
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sculpt-DAW-checks-${{ github.event.pull_request.head.sha || github.sha }}
+          path: dist/qa/
+          if-no-files-found: warn
           retention-days: 14
