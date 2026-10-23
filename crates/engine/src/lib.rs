@@ -15,6 +15,10 @@ pub mod inspect;
 pub mod io;
 pub mod score;
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[allow(clippy::unwrap_used)]
+mod offline_query_tests;
+
 use serde_json::{Value, json};
 use soundcraft_model::{Clip, Session, TrackId, ZoomState};
 use soundcraft_time::Samples;
@@ -266,6 +270,31 @@ impl Engine {
         if spec.view {
             return self.execute_view(spec, params);
         }
+        // The existing offline renderer requires resident PCM. Adapt the DAW's newer source
+        // backend at the query boundary, without changing that renderer or its protocol.
+        #[cfg(not(target_arch = "wasm32"))]
+        if id == "bridge.render_stems" {
+            let mut sources = std::collections::BTreeSet::new();
+            for track in
+                self.doc.tracks.iter().filter(|t| matches!(t.kind, model::TrackKind::Audio | model::TrackKind::Instrument | model::TrackKind::Midi))
+            {
+                for clip in track.clips() {
+                    if let model::ClipContent::Audio { source, .. } = clip.content
+                        && self.doc.pool.get(source).is_some()
+                    {
+                        sources.insert(source);
+                    }
+                }
+                if let Some(source) = track.instrument.as_ref().and_then(|i| i.sample)
+                    && self.doc.pool.get(source).is_some()
+                {
+                    sources.insert(source);
+                }
+            }
+            if sources.iter().any(|id| self.doc.pool.get(*id).is_some_and(|audio| !audio.is_resident())) {
+                return self.execute_resident_query(spec, params, sources, soundcraft_mix::MAX_RENDER_SAMPLES);
+            }
+        }
         self.merge_key = None;
         let before = Arc::clone(&self.doc);
         let rev = self.revision;
@@ -299,6 +328,32 @@ impl Engine {
                 }
                 Err(e)
             }
+        }
+    }
+
+    /// An isolated query engine owns temporary PCM. Neither success, ordinary error nor an
+    /// escaped plugin panic can replace the original document or its history/state.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn execute_resident_query(
+        &self,
+        spec: &CommandSpec,
+        params: &Value,
+        sources: impl IntoIterator<Item = model::SourceId>,
+        max_samples: usize,
+    ) -> Result<Value> {
+        if spec.journal || spec.undoable || spec.view {
+            return Err(EngineError::Internal(spec.id.into(), "offline snapshot requires a read-only query".into()));
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut snapshot = (*self.doc).clone();
+            snapshot.pool = self.doc.pool.resident_snapshot_for(sources, max_samples).map_err(|e| EngineError::Io(format!("offline media: {e}")))?;
+            let mut temporary = Engine::new(snapshot);
+            temporary.path = self.path.clone();
+            (spec.run)(&mut temporary, params)
+        }));
+        match result {
+            Ok(result) => result,
+            Err(panic) => Err(EngineError::Internal(spec.id.into(), panic_message(&*panic))),
         }
     }
 

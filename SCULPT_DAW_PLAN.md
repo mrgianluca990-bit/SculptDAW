@@ -83,3 +83,9 @@ Core40: gate completo locale passato (786 test numerici più harness UI, fmt/Cli
 Core40 pubblicato in PR #16, commit 57c7324, gate locale 786 test numerici più harness UI. Core41 in corso: preparazione PCM degli strumenti fuori callback con budget 64 MiB delle sorgenti disco, riuso e errori; tre test mix mirati passati, test retry player e gate in verifica. Adattatore bridge e loader restano aperti.
 
 Core41: gate completo locale passato (791 test numerici più harness UI, fmt/Clippy/assets/layers/wasm), ricevitore SHOW 82355f8. Cinque regressioni nuove mix/player e aspettativa sampler missing aggiornata al rifiuto nativo esplicito. Un aggiornamento sessione rifiutato impedisce PLAY sulla snapshot precedente finché non arriva un aggiornamento valido. Nessuna modifica SHOW/bridge; piano completo ancora aperto.
+
+Core41 pubblicato in PR #17, commit 7589b39, gate locale 791 test numerici più harness UI. Core42 in corso: snapshot selettiva e motore query temporaneo per compatibilità del renderer bridge invariato con sorgenti disco. Prime tre regressioni passate; estensione marker/media change e gate in verifica. Budget offline esplicito, non renderer bridge streaming.
+
+Audit consumatori prima dei loader: clip_group_file::export codifica ancora buf.buffer e l’import determina formato da buffer.num_channels, poi limita a mono/stereo. Adattare export a write_wave/salvataggio esclusivo, formato backend-aware e conversione completa dei tempi fade/sync/envelope nel gruppo prima dell’attivazione loader. Percorsi save/bundle wasm restano intenzionalmente residenti; sampler nativo già preparato. Nessuna attivazione anticipata.
+
+Core42: gate completo locale passato (794 test numerici più harness UI, fmt/Clippy/assets/layers/wasm), ricevitore SHOW 82355f8. Renderer/publisher/schema bridge e SHOW invariati; snapshot temporanee con budget, ordine/ID/marker e documento verificati. Loader e fasi successive restano aperti.
