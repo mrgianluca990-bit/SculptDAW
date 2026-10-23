@@ -881,4 +881,24 @@ mod tests {
         assert_eq!(sl.target, soundcraft_model::Route::Bus(delay));
         assert_eq!((sl.level_db, sl.pan, sl.mute, sl.pre_fader), (-9.0, 0.5, true, true));
     }
+    #[test]
+    fn automation_range_preserves_the_next_breakpoint_through_undo_redo() {
+        let mut s = soundcraft_model::Session::default();
+        let track = s.add_track(soundcraft_model::TrackKind::Audio, soundcraft_model::ChannelFormat::Mono, None);
+        let lane = s.track_mut(track).unwrap().lane_mut(&AutoParam::Volume);
+        lane.set_point(0, 0.0);
+        lane.set_point(401, -12.0);
+        lane.set_point(1000, -24.0);
+        let before = lane.points.clone();
+        let mut e = Engine::new(s);
+        e.execute("automation.write_range", &json!({"track":track.0, "param":"volume", "start":200, "end":400, "value":-6.0})).unwrap();
+        let points = e.session().track(track).unwrap().automation[0].points.clone();
+        assert_eq!(points.iter().find(|point| point.at == 401).unwrap().value, -12.0);
+        assert_eq!(points.iter().find(|point| point.at == 400).unwrap().value, -6.0);
+        assert!(e.undo());
+        assert_eq!(e.session().track(track).unwrap().automation[0].points, before);
+        assert!(!e.is_dirty());
+        assert!(e.redo());
+        assert_eq!(e.session().track(track).unwrap().automation[0].points, points);
+    }
 }

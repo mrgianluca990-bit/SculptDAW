@@ -57,3 +57,7 @@ Core34 pubblicato in PR #10, commit `6daa92a`, gate locale 756 test numerici pi�
 Nota per QA audio successiva: verificare esplicitamente headroom float32 >1 e round-trip codec. Il `pcm::clamp_float` corrente applica [-1,1] anche nell’encoder WAV float, mentre il decoder preserva valori finiti fuori scala; non dichiarare round-trip headroom verificato e non cambiare globalmente questo comportamento senza regressioni di export/bridge. Gli altri backport candidati di #9 (automation end+1, backup, mono hardware, gruppi/send, clip-group/PDC) rimangono da verificare e integrare per argomento.
 
 Core35: gate locale completo passato (760 test numerici più harness UI, fmt/Clippy/assets/layers/wasm), con ricevitore SHOW della consegna `82355f8`. Normalizzazione ordinaria f32 invariata; fallback f64 solo per fattori estremi, incluse regressioni AudioSuite/WAV/Undo. Nessun cambiamento SHOW/bridge e nessuna consegna finale.
+
+Core35 pubblicato in PR #11, commit `7d1a3a6`, gate locale 760 test numerici più harness UI. Core36 in corso: conservazione breakpoint end+1 e protezione endpoint i64::MAX, entrambi riprodotti; tre nuove regressioni model/comando/Undo superate. Gate completo avviato con ricevitore SHOW `82355f8`. Dettagli `QA/CORE36_AUTOMATION_BOUNDARIES.md`.
+
+Core36: gate completo locale passato (763 test numerici più harness UI, fmt/Clippy/assets/layers/wasm), ricevitore SHOW `82355f8`. Salvataggi, streaming attivato nei loader e tutte le altre fasi restano da concludere; nessuna app finale prodotta.
