@@ -199,7 +199,11 @@ impl AutomationLane {
         }
         self.set_point(start, value);
         self.set_point(end, value);
-        self.set_point(end.saturating_add(1), after);
+        if let Some(return_at) = end.checked_add(1)
+            && self.points.binary_search_by_key(&return_at, |point| point.at).is_err()
+        {
+            self.set_point(return_at, after);
+        }
     }
 
     /// Thin: remove points whose removal changes the curve by less than `tolerance`.
@@ -294,5 +298,30 @@ mod tests {
         l.set_point(1, 5.0);
         assert_eq!(l.points[0].value, 0.0);
         assert_eq!(l.points[1].value, 1.0);
+    }
+    #[test]
+    fn write_range_keeps_an_existing_breakpoint_immediately_after_the_range() {
+        let mut lane = AutomationLane::new(AutoParam::Volume);
+        lane.set_point(0, 0.0);
+        lane.set_point(401, -12.0);
+        lane.set_point(1000, -24.0);
+        let outside = lane.value_at(800, 0.0);
+        lane.write_range(200, 400, -6.0, 0.0);
+        assert_eq!(lane.value_at(200, 0.0), -6.0);
+        assert_eq!(lane.value_at(400, 0.0), -6.0);
+        assert_eq!(lane.value_at(401, 0.0), -12.0);
+        assert_eq!(lane.value_at(800, 0.0), outside);
+        assert_eq!(lane.points.iter().filter(|p| p.at == 401).count(), 1);
+    }
+    #[test]
+    fn write_range_at_maximum_sample_does_not_overwrite_the_written_endpoint() {
+        let mut lane = AutomationLane::new(AutoParam::Volume);
+        lane.set_point(0, 0.0);
+        lane.set_point(i64::MAX, -12.0);
+        lane.write_range(i64::MAX - 2, i64::MAX, -6.0, 0.0);
+        assert_eq!(lane.value_at(i64::MAX, 0.0), -6.0);
+        let before = lane.points.clone();
+        lane.write_range(i64::MAX, i64::MAX, 0.0, 0.0);
+        assert_eq!(lane.points, before);
     }
 }
