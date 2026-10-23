@@ -980,11 +980,33 @@ pub fn write_file(path: &str, bytes: &[u8]) -> Result<()> {
 /// `Audio Files/` (stored, not compressed: audio barely compresses). Returns the bytes and the
 /// session with its source paths pointing into the bundle.
 pub fn session_bundle(session: &Session) -> Result<(Vec<u8>, Session)> {
+    let (cursor, session) = write_session_bundle(session, std::io::Cursor::new(Vec::new()))?;
+    Ok((cursor.into_inner(), session))
+}
+
+/// Stream a bundle to a seekable destination. Native callers can use a file rather than a
+/// whole archive allocation. Publish the destination only after success; errors may leave a
+/// partial archive. The byte-returning browser adapter remains `session_bundle`.
+pub fn write_session_bundle<W: std::io::Write + std::io::Seek>(session: &Session, destination: W) -> Result<(W, Session)> {
     use std::io::Write as _;
     let zerr = |err: zip::result::ZipError| EngineError::Io(format!("bundle: {err}"));
     let ioerr = |err: std::io::Error| EngineError::Io(format!("bundle: {err}"));
     let mut s = session.clone();
-    let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    // The current reader has explicit entry/expanded-byte limits. Do not produce an archive
+    // this application cannot reopen. Folder-based native projects have no bundle limit.
+    if s.sources.len().saturating_add(1) > MAX_BUNDLE_ENTRIES {
+        return Err(EngineError::Io("bundle: too many files".into()));
+    }
+    let mut expanded = 0u64;
+    for source in &s.sources {
+        if let Some(audio) = s.pool.get(source.id) {
+            let frames = u64::try_from(audio.frames()).map_err(|_| EngineError::Io("bundle: source duration overflow".into()))?;
+            let header = soundcraft_audio_io::wav_float_header(audio.channels(), audio.sample_rate(), frames)
+                .map_err(|e| EngineError::Io(format!("bundle: {e}")))?;
+            expanded = bundle_size_with_audio(expanded, frames, audio.channels(), header.len())?;
+        }
+    }
+    let mut w = zip::ZipWriter::new(destination);
     let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored).large_file(true);
     let mut taken = std::collections::HashSet::new();
     for src in &mut s.sources {
@@ -996,20 +1018,38 @@ pub fn session_bundle(session: &Session) -> Result<(Vec<u8>, Session)> {
             target = format!("Audio Files/{base}_{k:02}.wav");
             k += 1;
         }
-        let opts_wav = EncodeOptions { format: FileFormat::Wav, bit_depth: soundcraft_audio_io::BitDepth::Float32, dither: false, bwf: None };
-        let bytes = soundcraft_audio_io::encode(&audio.buffer, &opts_wav).map_err(|err| EngineError::Io(err.to_string()))?;
         w.start_file(target.as_str(), opts).map_err(zerr)?;
-        w.write_all(&bytes).map_err(ioerr)?;
+        #[cfg(not(target_arch = "wasm32"))]
+        audio.write_wave(&mut w, |_, _| true).map_err(|err| EngineError::Io(format!("bundle source {}: {err}", src.name)))?;
+        #[cfg(target_arch = "wasm32")]
+        {
+            let opts_wav = EncodeOptions { format: FileFormat::Wav, bit_depth: soundcraft_audio_io::BitDepth::Float32, dither: false, bwf: None };
+            let bytes = soundcraft_audio_io::encode(&audio.buffer, &opts_wav).map_err(|err| EngineError::Io(err.to_string()))?;
+            w.write_all(&bytes).map_err(ioerr)?;
+        }
         taken.insert(target.clone());
         src.path = target;
         src.unsaved = false;
         src.format = FileFormat::Wav;
     }
     let text = s.to_json().map_err(|err| EngineError::Io(err.to_string()))?;
+    if expanded.checked_add(text.len() as u64).is_none_or(|n| n > MAX_BUNDLE_BYTES) {
+        return Err(EngineError::Io("bundle: too large".into()));
+    }
     w.start_file(format!("{}.{}", sanitize_name(&s.name), soundcraft_model::SESSION_EXTENSION), opts).map_err(zerr)?;
     w.write_all(text.as_bytes()).map_err(ioerr)?;
-    let bytes = w.finish().map_err(zerr)?.into_inner();
-    Ok((bytes, s))
+    let destination = w.finish().map_err(zerr)?;
+    Ok((destination, s))
+}
+
+fn bundle_size_with_audio(total: u64, frames: u64, channels: usize, header: usize) -> Result<u64> {
+    frames
+        .checked_mul(channels as u64)
+        .and_then(|n| n.checked_mul(4))
+        .and_then(|n| n.checked_add(header as u64))
+        .and_then(|n| n.checked_add(total))
+        .filter(|n| *n <= MAX_BUNDLE_BYTES)
+        .ok_or_else(|| EngineError::Io("bundle: too large".into()))
 }
 
 /// Save as a bundle named after `path`'s file name, delivered through the host ([`write_file`]).
@@ -1471,6 +1511,15 @@ mod bundle_tests {
     use super::*;
 
     #[test]
+    fn bundle_size_limits_include_headers_and_reject_overflow() {
+        assert_eq!(bundle_size_with_audio(4, 10, 7, 100).unwrap(), 384);
+        assert!(bundle_size_with_audio(0, u64::MAX, 64, 100).is_err());
+        assert!(bundle_size_with_audio(MAX_BUNDLE_BYTES, 0, 1, 100).is_err());
+        assert!(bundle_size_with_audio(0, MAX_BUNDLE_BYTES / 4, 1, 100).is_err());
+        assert_eq!(bundle_size_with_audio(0, (MAX_BUNDLE_BYTES - 100) / 4, 1, 100).unwrap(), MAX_BUNDLE_BYTES);
+    }
+
+    #[test]
     fn bundle_round_trips_session_and_audio() {
         let mut e = crate::demo::demo_engine();
         e.execute("mix.volume", &serde_json::json!({"track": "Kick", "db": -7.0})).unwrap();
@@ -1651,6 +1700,70 @@ mod offline_source_tests {
         let clip = Clip::audio(s.new_clip_id(), "Audio", source, 0, 0, 6000);
         s.track_mut(track).unwrap().playlist_mut().unwrap().clips.push(clip);
         (Engine::new(s), track)
+    }
+    #[test]
+    fn disk_sources_stream_to_bundle_file_and_reopen_without_document_changes() {
+        let fixture = Fixture::new(7);
+        let cache = StreamCache::new(CacheConfig::default()).unwrap();
+        let (e, _) = engine(&fixture, Some(&cache));
+        let before = e.session().to_json().unwrap();
+        let path = fixture.path.with_extension("scraftz");
+        let destination = std::fs::OpenOptions::new().write(true).create_new(true).open(&path).unwrap();
+        let (destination, fresh) = write_session_bundle(e.session(), destination).unwrap();
+        destination.sync_all().unwrap();
+        drop(destination);
+        let mut restored = Engine::default();
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(open_session_bytes(&mut restored, "Disk.scraftz", &bytes).unwrap().is_empty());
+        let source = e.session().sources[0].id;
+        assert_eq!(restored.session().pool.get(source).unwrap().buffer, fixture.audio);
+        assert_eq!(e.session().to_json().unwrap(), before);
+        assert!(!e.session().pool.get(source).unwrap().is_resident());
+        assert!(!fresh.pool.get(source).unwrap().is_resident());
+        std::fs::OpenOptions::new().write(true).open(&fixture.path).unwrap().set_len(100).unwrap();
+        assert!(write_session_bundle(e.session(), std::io::Cursor::new(Vec::new())).is_err());
+        assert_eq!(e.session().to_json().unwrap(), before);
+        cache.shutdown(Duration::from_secs(1)).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn bundle_destination_failure_does_not_modify_source_document() {
+        use std::io::{self, Seek, SeekFrom, Write};
+        struct FailingDestination {
+            cursor: io::Cursor<Vec<u8>>,
+            budget: usize,
+        }
+        impl Write for FailingDestination {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.budget == 0 {
+                    return Err(io::Error::other("injected bundle disk failure"));
+                }
+                let count = self.budget.min(bytes.len());
+                self.budget -= count;
+                self.cursor.write(bytes.get(..count).unwrap()).inspect(|&n| {
+                    assert!(n <= 262_144);
+                })
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl Seek for FailingDestination {
+            fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+                self.cursor.seek(from)
+            }
+        }
+        let fixture = Fixture::new(7);
+        let cache = StreamCache::new(CacheConfig::default()).unwrap();
+        let (e, _) = engine(&fixture, Some(&cache));
+        let before = e.session().to_json().unwrap();
+        for budget in [0, 256, 4096] {
+            let destination = FailingDestination { cursor: io::Cursor::new(Vec::new()), budget };
+            assert!(write_session_bundle(e.session(), destination).is_err());
+            assert_eq!(e.session().to_json().unwrap(), before);
+            assert!(!e.session().pool.get(e.session().sources[0].id).unwrap().is_resident());
+        }
+        cache.shutdown(Duration::from_secs(1)).unwrap();
     }
     #[test]
     fn disk_source_save_copy_reuse_and_failure_preserve_audio_and_document() {
