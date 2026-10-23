@@ -611,8 +611,11 @@ fn write_session(session: &Session, path: &str, overwrite: bool) -> Result<(Sess
     std::fs::create_dir_all(&dir).map_err(|err| EngineError::Io(format!("{}: {err}", dir.display())))?;
     // Atomic-ish write: temp file then rename.
     let tmp = p.with_extension("scraft.tmp");
-    if !overwrite && std::fs::read(&p).is_ok_and(|old| old != text.as_bytes()) {
-        back_up(&p);
+    if !overwrite
+        && p.try_exists().map_err(|error| EngineError::Io(format!("{}: {error}", p.display())))?
+        && !file_matches_bytes(&p, text.as_bytes()).map_err(|error| EngineError::Io(format!("{}: {error}", p.display())))?
+    {
+        back_up(&p)?;
     }
     replace_file(&tmp, &p, text.as_bytes())?;
     Ok((s, written, p))
@@ -643,29 +646,105 @@ fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 /// Copy the session file about to be replaced to `Backups/<name> backup <n>.<ext>`, keeping the
 /// newest ten.
-fn back_up(file: &Path) {
-    let (Some(dir), Some(stem), Some(ext)) = (file.parent(), file.file_stem().and_then(|x| x.to_str()), file.extension().and_then(|x| x.to_str()))
-    else {
-        return;
-    };
+/// Compare without retaining a second whole project JSON in RAM.
+fn file_matches_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<bool> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    if file.metadata()?.len() != bytes.len() as u64 {
+        return Ok(false);
+    }
+    let mut buffer = [0u8; 8192];
+    for expected in bytes.chunks(buffer.len()) {
+        let actual = buffer.get_mut(..expected.len()).ok_or_else(|| std::io::Error::other("project comparison buffer bounds"))?;
+        file.read_exact(actual)?;
+        if actual != expected {
+            return Ok(false);
+        }
+    }
+    let mut extra = [0u8; 1];
+    Ok(file.read(&mut extra)? == 0)
+}
+
+/// Atomically reserve a free name, never following or replacing an existing destination.
+/// Source copying and sync finish before the caller can replace the current session file.
+fn copy_exclusive_backup(file: &Path, dir: &Path, prefix: &str, suffix: &str, mut next: u64) -> Result<(u64, PathBuf)> {
+    let mut source = std::fs::File::open(file).map_err(|error| EngineError::Io(format!("backup {}: {error}", file.display())))?;
+    let before = source.metadata().map_err(|error| EngineError::Io(error.to_string()))?;
+    for _ in 0..1024 {
+        let destination = dir.join(format!("{prefix}{next}{suffix}"));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&destination) {
+            Ok(mut target) => {
+                let result = (|| -> std::io::Result<()> {
+                    let copied = std::io::copy(&mut source, &mut target)?;
+                    let after = source.metadata()?;
+                    if copied != before.len() || after.len() != before.len() || before.modified().ok() != after.modified().ok() {
+                        return Err(std::io::Error::other("project changed during backup"));
+                    }
+                    target.set_permissions(before.permissions())?;
+                    target.sync_all()
+                })();
+                drop(target);
+                if let Err(error) = result {
+                    if let Err(cleanup) = std::fs::remove_file(&destination) {
+                        log::warn!("could not remove incomplete backup {}: {cleanup}", destination.display());
+                    }
+                    return Err(EngineError::Io(format!("backup {}: {error}", destination.display())));
+                }
+                sync_dir(dir);
+                return Ok((next, destination));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                next = next.checked_add(1).ok_or_else(|| EngineError::Io("backup counter exhausted; existing backups were preserved".into()))?;
+            }
+            Err(error) => return Err(EngineError::Io(format!("backup {}: {error}", destination.display()))),
+        }
+    }
+    Err(EngineError::Io("too many concurrent backup name collisions; existing backups were preserved".into()))
+}
+
+fn back_up(file: &Path) -> Result<PathBuf> {
+    let dir = file.parent().ok_or_else(|| EngineError::Io("backup needs a project directory".into()))?;
+    let stem = file.file_stem().and_then(|name| name.to_str()).ok_or_else(|| EngineError::Io("invalid backup project name".into()))?;
     let backups = dir.join("Backups");
+    std::fs::create_dir_all(&backups).map_err(|error| EngineError::Io(format!("{}: {error}", backups.display())))?;
     let prefix = format!("{stem} backup ");
-    let suffix = format!(".{ext}");
-    let numbers: Vec<u32> = std::fs::read_dir(&backups)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|f| f.file_name().to_str()?.strip_prefix(&prefix)?.strip_suffix(&suffix)?.parse().ok())
-        .collect();
-    let next = numbers.iter().max().map_or(1, |n| n.saturating_add(1));
-    let copied = std::fs::create_dir_all(&backups).and_then(|()| std::fs::copy(file, backups.join(format!("{prefix}{next}{suffix}"))));
-    if let Err(err) = copied {
-        log::warn!("no backup of {}: {err}", file.display());
-        return;
+    let suffix = file.extension().and_then(|extension| extension.to_str()).map_or_else(String::new, |extension| format!(".{extension}"));
+    let mut numbers = Vec::<u64>::new();
+    for entry in std::fs::read_dir(&backups).map_err(|error| EngineError::Io(error.to_string()))? {
+        let entry = entry.map_err(|error| EngineError::Io(error.to_string()))?;
+        let name = entry.file_name();
+        let Some(number) = name.to_str().and_then(|name| name.strip_prefix(&prefix)).and_then(|name| name.strip_suffix(&suffix)) else { continue };
+        let Ok(value) = number.parse::<u64>() else { continue };
+        if number != value.to_string() || !entry.file_type().map_err(|error| EngineError::Io(error.to_string()))?.is_file() {
+            continue;
+        }
+        if numbers.len() >= 10_000 {
+            return Err(EngineError::Io("too many numbered project backups".into()));
+        }
+        numbers.push(value);
     }
-    for n in numbers.into_iter().filter(|n| n.saturating_add(10) <= next) {
-        let _ = std::fs::remove_file(backups.join(format!("{prefix}{n}{suffix}")));
+    let next = match numbers.iter().max() {
+        Some(number) => number.checked_add(1).ok_or_else(|| EngineError::Io("backup counter exhausted; existing backups were preserved".into()))?,
+        None => 1,
+    };
+    let (number, destination) = copy_exclusive_backup(file, &backups, &prefix, &suffix, next)?;
+    numbers.push(number);
+    numbers.sort_unstable();
+    numbers.dedup();
+    for number in numbers.iter().take(numbers.len().saturating_sub(10)) {
+        let old = backups.join(format!("{prefix}{number}{suffix}"));
+        if let Err(error) = std::fs::remove_file(&old) {
+            log::warn!("could not prune backup {}: {error}", old.display());
+        }
     }
+    Ok(destination)
 }
 
 /// The file a session saved to `path` goes to: `path`, with `.scraft` added when it has no
@@ -1502,5 +1581,173 @@ mod offline_source_tests {
             }
             cache.shutdown(Duration::from_secs(1)).unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod exclusive_backup_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SERIAL: AtomicU64 = AtomicU64::new(0);
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let path = std::env::temp_dir().join(format!("sculpt-backup-{}-{}-{stamp}", std::process::id(), SERIAL.fetch_add(1, Ordering::Relaxed)));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    #[test]
+    fn backup_beyond_u32_max_preserves_old_bytes() {
+        let fixture = Fixture::new();
+        let file = fixture.0.join("Song.scdaw");
+        std::fs::write(&file, b"current").unwrap();
+        let dir = fixture.0.join("Backups");
+        std::fs::create_dir(&dir).unwrap();
+        let existing = dir.join(format!("Song backup {}.scdaw", u32::MAX));
+        std::fs::write(&existing, b"older snapshot").unwrap();
+        back_up(&file).unwrap();
+        assert_eq!(std::fs::read(&existing).unwrap(), b"older snapshot");
+        assert_eq!(std::fs::read(dir.join(format!("Song backup {}.scdaw", u64::from(u32::MAX) + 1))).unwrap(), b"current");
+    }
+    #[test]
+    fn exhausted_counter_preserves_every_existing_file() {
+        let fixture = Fixture::new();
+        let file = fixture.0.join("Song.scdaw");
+        std::fs::write(&file, b"current").unwrap();
+        let dir = fixture.0.join("Backups");
+        std::fs::create_dir(&dir).unwrap();
+        let old = dir.join(format!("Song backup {}.scdaw", u64::MAX));
+        std::fs::write(&old, b"original backup").unwrap();
+        assert!(back_up(&file).unwrap_err().to_string().contains("counter exhausted"));
+        assert_eq!(std::fs::read(&old).unwrap(), b"original backup");
+        assert_eq!(std::fs::read(&file).unwrap(), b"current");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+    }
+    #[test]
+    fn occupied_candidate_file_and_directory_are_never_replaced() {
+        let fixture = Fixture::new();
+        let file = fixture.0.join("Song.scdaw");
+        std::fs::write(&file, b"current").unwrap();
+        let dir = fixture.0.join("Backups");
+        std::fs::create_dir(&dir).unwrap();
+        let first = dir.join("Song backup 1.scdaw");
+        std::fs::write(&first, b"older").unwrap();
+        let second = dir.join("Song backup 2.scdaw");
+        std::fs::create_dir(&second).unwrap();
+        let (number, destination) = copy_exclusive_backup(&file, &dir, "Song backup ", ".scdaw", 1).unwrap();
+        assert_eq!(number, 3);
+        assert_eq!(std::fs::read(destination).unwrap(), b"current");
+        assert_eq!(std::fs::read(first).unwrap(), b"older");
+        assert!(second.is_dir());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_are_not_followed_and_private_permissions_are_preserved() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let fixture = Fixture::new();
+        let file = fixture.0.join("Song.scdaw");
+        std::fs::write(&file, b"current").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let dir = fixture.0.join("Backups");
+        std::fs::create_dir(&dir).unwrap();
+        let unrelated = fixture.0.join("other-data");
+        std::fs::write(&unrelated, b"leave intact").unwrap();
+        symlink(&unrelated, dir.join("Song backup 1.scdaw")).unwrap();
+        let (number, destination) = copy_exclusive_backup(&file, &dir, "Song backup ", ".scdaw", 1).unwrap();
+        assert_eq!(number, 2);
+        assert_eq!(std::fs::read(unrelated).unwrap(), b"leave intact");
+        assert!(std::fs::symlink_metadata(dir.join("Song backup 1.scdaw")).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::metadata(destination).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+    #[test]
+    fn retention_keeps_ten_snapshots_even_when_numbers_have_gaps() {
+        let fixture = Fixture::new();
+        let file = fixture.0.join("Song.scraft");
+        std::fs::write(&file, b"current").unwrap();
+        let dir = fixture.0.join("Backups");
+        std::fs::create_dir(&dir).unwrap();
+        for number in [1, 2, 3, 4, 5, 6, 7, 8, 9, 100] {
+            std::fs::write(dir.join(format!("Song backup {number}.scraft")), number.to_string()).unwrap();
+        }
+        std::fs::write(dir.join("notes.txt"), b"unrelated").unwrap();
+        let destination = back_up(&file).unwrap();
+        assert_eq!(destination.file_name().unwrap(), "Song backup 101.scraft");
+        assert!(!dir.join("Song backup 1.scraft").exists());
+        assert_eq!(std::fs::read(dir.join("Song backup 2.scraft")).unwrap(), b"2");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 11);
+        assert_eq!(std::fs::read(dir.join("notes.txt")).unwrap(), b"unrelated");
+    }
+    #[test]
+    fn copy_failure_removes_its_incomplete_destination() {
+        let fixture = Fixture::new();
+        let directory_source = fixture.0.join("source-dir");
+        std::fs::create_dir(&directory_source).unwrap();
+        let dir = fixture.0.join("Backups");
+        std::fs::create_dir(&dir).unwrap();
+        assert!(copy_exclusive_backup(&directory_source, &dir, "Song backup ", ".scdaw", 1).is_err());
+        assert!(!dir.join("Song backup 1.scdaw").exists());
+        assert!(directory_source.is_dir());
+    }
+    #[test]
+    fn failed_backup_preserves_project_and_unsaved_document_in_native_legacy_and_bare_paths() {
+        for name in ["Song.scdaw", "Song.scraft", "Song"] {
+            let fixture = Fixture::new();
+            let path = fixture.0.join(name);
+            let mut e = Engine::new(Session::new("Song", Default::default()));
+            if name == "Song" {
+                std::fs::write(&path, e.session().to_json().unwrap()).unwrap();
+            }
+            save_session(&mut e, &path.to_string_lossy()).unwrap();
+            let saved = std::fs::read(&path).unwrap();
+            e.execute("track.new", &json!({"name":"Unsaved"})).unwrap();
+            let pending = e.session().to_json().unwrap();
+            let history = e.undo_history();
+            std::fs::write(fixture.0.join("Backups"), b"not a directory").unwrap();
+            assert!(e.execute("session.save", &json!({})).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), saved);
+            assert_eq!(e.session().to_json().unwrap(), pending);
+            assert_eq!(e.undo_history(), history);
+            assert!(e.is_dirty());
+        }
+    }
+    #[test]
+    fn project_comparison_streams_exact_bytes_and_detects_content_or_length_changes() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("project");
+        let mut bytes = vec![b'x'; 30_000];
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(file_matches_bytes(&path, &bytes).unwrap());
+        bytes[15_000] = b'y';
+        assert!(!file_matches_bytes(&path, &bytes).unwrap());
+        bytes.push(b'z');
+        assert!(!file_matches_bytes(&path, &bytes).unwrap());
+        assert!(!file_matches_bytes(&path, b"").unwrap());
+    }
+    #[test]
+    fn concurrent_backup_reservations_have_unique_names_and_complete_bytes() {
+        let fixture = Fixture::new();
+        let file = fixture.0.join("Song.scdaw");
+        std::fs::write(&file, b"current snapshot").unwrap();
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let file = file.clone();
+                std::thread::spawn(move || back_up(&file))
+            })
+            .collect();
+        let paths: std::collections::BTreeSet<_> = workers.into_iter().map(|worker| worker.join().unwrap().unwrap()).collect();
+        assert_eq!(paths.len(), 8);
+        for path in paths {
+            assert_eq!(std::fs::read(path).unwrap(), b"current snapshot");
+        }
+        assert_eq!(std::fs::read(&file).unwrap(), b"current snapshot");
+        assert_eq!(std::fs::read_dir(fixture.0.join("Backups")).unwrap().count(), 8);
     }
 }
