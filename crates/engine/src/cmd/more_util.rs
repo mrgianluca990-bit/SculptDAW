@@ -138,10 +138,10 @@ fn max_render(s: &Session) -> Samples {
 }
 
 /// Render the audio a clip plays, time-stretched (pitch preserved) to `out_len` samples, into a new
-/// source. Returns `Ok(None)` for MIDI clips or missing audio.
+/// source. Returns `Ok(None)` for MIDI clips; unavailable audio is an explicit error.
 pub fn render_stretched(s: &mut Session, cmd: &str, c: &Clip, out_len: Samples) -> Result<Option<SourceId>> {
     let ClipContent::Audio { source, offset } = c.content else { return Ok(None) };
-    let Some(audio) = s.pool.get(source).cloned() else { return Ok(None) };
+    let audio = s.pool.get(source).cloned().ok_or_else(|| EngineError::Io(format!("{}: source audio is unavailable", c.name)))?;
     if out_len <= 0 || out_len > max_render(s) {
         return Err(bad(cmd, "the target length must be between 1 sample and one hour"));
     }
@@ -153,21 +153,20 @@ pub fn render_stretched(s: &mut Session, cmd: &str, c: &Clip, out_len: Samples) 
     }
     let a = usize::try_from(offset.max(0)).unwrap_or(0);
     let n = src_len as usize;
-    let ch: Vec<Vec<f32>> = audio
-        .buffer
-        .channels
-        .iter()
-        .map(|x| {
-            let mut v: Vec<f32> = x.iter().skip(a).take(n).copied().collect();
-            v.resize(n, 0.0);
-            v
-        })
-        .collect();
+    let want = usize::try_from(out_len).map_err(|_| bad(cmd, "target frame count exceeds host range"))?;
+    if want > soundcraft_dsp::offline::MAX_OFFLINE_SAMPLES
+        || want.checked_mul(audio.channels()).is_none_or(|n| n > soundcraft_mix::MAX_RENDER_SAMPLES)
+    {
+        return Err(bad(cmd, "time-stretch output exceeds the offline sample budget"));
+    }
+    if audio.sample_rate() != s.sample_rate.hz() {
+        return Err(bad(cmd, "convert the source to the session sample rate before time-stretch"));
+    }
+    let ch = audio.read_region(a, n, soundcraft_mix::MAX_RENDER_SAMPLES).map_err(|error| EngineError::Io(error.to_string()))?.channels;
     let sr = s.sample_rate;
-    let mut out = soundcraft_dsp::offline::time_stretch(&ch, ratio, sr.as_f64() as f32);
-    let want = usize::try_from(out_len).unwrap_or(0);
-    for o in &mut out {
-        o.resize(want, 0.0);
+    let out = soundcraft_dsp::offline::time_stretch(&ch, ratio, sr.as_f64() as f32);
+    if out.len() != audio.channels() || out.iter().any(|channel| channel.len() != want) {
+        return Err(EngineError::Io("time-stretch returned an incomplete result".into()));
     }
     let buf = AudioBuffer { sample_rate: sr.hz(), channels: out };
     Ok(Some(crate::io::add_source(s, &format!("{}-TCE", c.name), buf, None, FileFormat::Wav)))
@@ -201,5 +200,92 @@ mod tests {
         assert!((env_db(&env, 50) + 5.0).abs() < 1e-6);
         assert_eq!(env_db(&[], 50), 0.0);
         assert_eq!(env_db(&env, 500), -10.0);
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[allow(clippy::unwrap_used)]
+mod disk_stretch_tests {
+    use super::*;
+    use soundcraft_audio_io::{
+        BitDepth, EncodeOptions,
+        stream_cache::{CacheConfig, StreamCache},
+    };
+    use soundcraft_model::{ChannelFormat, SourceAudio, TrackKind};
+    use std::{
+        path::PathBuf,
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
+        time::Duration,
+    };
+    static SERIAL: AtomicU64 = AtomicU64::new(0);
+    struct Fixture(PathBuf);
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    fn prepare(channels: usize) -> (Fixture, Arc<StreamCache>, Session, Session, Clip) {
+        let path = std::env::temp_dir().join(format!("sculpt-stretch-{}-{}.wav", std::process::id(), SERIAL.fetch_add(1, Ordering::Relaxed)));
+        let audio = AudioBuffer {
+            sample_rate: 48_000,
+            channels: (0..channels).map(|c| (0..6000).map(|f| (f as f32 * 0.017 + c as f32).sin() * 0.3).collect()).collect(),
+        };
+        std::fs::write(
+            &path,
+            soundcraft_audio_io::encode(&audio, &EncodeOptions { bit_depth: BitDepth::Float32, dither: false, ..EncodeOptions::default() }).unwrap(),
+        )
+        .unwrap();
+        let mut resident = Session::default();
+        let t = resident.add_track(TrackKind::Audio, ChannelFormat::for_channels(channels), None);
+        let source = crate::io::add_source(&mut resident, "fixture", audio, None, FileFormat::Wav);
+        let clip = Clip::audio(resident.new_clip_id(), "region", source, 503, 0, 4096);
+        resident.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(clip.clone());
+        let cache = StreamCache::new(CacheConfig::default()).unwrap();
+        let mut disk = resident.clone();
+        disk.pool.insert(source, Arc::new(SourceAudio::from_stream(cache.open_source(&path).unwrap(), 140, |_, _| true).unwrap()));
+        (Fixture(path), cache, disk, resident, clip)
+    }
+    #[test]
+    fn stretch_reads_selected_region_and_matches_resident_for_all_channels() {
+        for channels in [1, 2, 7] {
+            let (_fixture, cache, mut disk, mut resident, clip) = prepare(channels);
+            let a = render_stretched(&mut disk, "test", &clip, 5000).unwrap().unwrap();
+            let b = render_stretched(&mut resident, "test", &clip, 5000).unwrap().unwrap();
+            assert_eq!(disk.pool.get(a).unwrap().buffer, resident.pool.get(b).unwrap().buffer);
+            assert_eq!(disk.pool.get(a).unwrap().frames(), 5000);
+            assert_eq!(disk.pool.get(a).unwrap().channels(), channels);
+            assert!(!disk.pool.get(clip.source().unwrap()).unwrap().is_resident());
+            let mut engine = Engine::new(disk);
+            let before = engine.session_arc();
+            let revision = engine.revision;
+            assert_eq!(engine.execute("session.audio_health", &json!({})).unwrap()["healthy"], true);
+            assert!(Arc::ptr_eq(&before, &engine.session_arc()));
+            assert_eq!(engine.revision, revision);
+            assert!(!engine.is_dirty());
+            assert!(!engine.can_undo());
+            cache.shutdown(Duration::from_secs(1)).unwrap();
+        }
+    }
+    #[test]
+    fn stretch_rejects_media_changes_missing_sources_and_dsp_truncation_before_editing() {
+        let (fixture, cache, mut disk, _resident, clip) = prepare(2);
+        let before = disk.to_json().unwrap();
+        std::fs::OpenOptions::new().write(true).open(&fixture.0).unwrap().set_len(100).unwrap();
+        assert!(render_stretched(&mut disk, "test", &clip, 5000).is_err());
+        assert_eq!(disk.to_json().unwrap(), before);
+        disk.pool.remove(clip.source().unwrap());
+        assert!(render_stretched(&mut disk, "test", &clip, 5000).is_err());
+        assert_eq!(disk.to_json().unwrap(), before);
+        cache.shutdown(Duration::from_secs(1)).unwrap();
+        let (_fixture, cache, mut disk, _resident, mut clip) = prepare(1);
+        disk.sample_rate = soundcraft_time::SampleRate::new(192_000).unwrap();
+        let want = soundcraft_dsp::offline::MAX_OFFLINE_SAMPLES as i64 + 1;
+        clip.length = want;
+        assert!(render_stretched(&mut disk, "test", &clip, want).unwrap_err().to_string().contains("budget"));
+        assert_eq!(cache.stats().read_bytes, 0);
+        cache.shutdown(Duration::from_secs(1)).unwrap();
     }
 }
