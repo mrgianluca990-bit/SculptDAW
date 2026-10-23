@@ -165,4 +165,32 @@ mod tests {
         let sample = e.session().pool.get(c.source().unwrap()).unwrap().buffer.channels[0][0];
         assert!((sample - 0.5).abs() < 1e-3, "duplicate keeps the file level and the clip gain, got {sample}");
     }
+    #[test]
+    fn normalization_of_subnormal_clip_is_finite_reversible_and_matches_wav_export() {
+        let mut s = Session::default();
+        let track = s.add_track(TrackKind::Audio, ChannelFormat::Mono, Some("Tiny"));
+        let tiny = f32::from_bits(1);
+        let original = vec![tiny, -tiny, 0.0, 0.0];
+        let source =
+            crate::io::add_source(&mut s, "tiny", AudioBuffer { sample_rate: 48_000, channels: vec![original.clone()] }, None, FileFormat::Wav);
+        let clip = s.new_clip_id();
+        s.track_mut(track).unwrap().playlist_mut().unwrap().clips.push(Clip::audio(clip, "tiny", source, 0, 0, 4));
+        let mut e = Engine::new(s);
+        e.execute("audiosuite.process", &json!({"process":"normalize", "clips":[clip.0], "params":{"target_db":0.0}})).unwrap();
+        let rendered = e.session().find_clip(clip).unwrap().1.source().unwrap();
+        let audio = &e.session().pool.get(rendered).unwrap().buffer;
+        assert_eq!(audio.channels, vec![vec![1.0, -1.0, 0.0, 0.0]]);
+        let encoded = soundcraft_audio_io::encode(
+            audio,
+            &soundcraft_audio_io::EncodeOptions { bit_depth: soundcraft_audio_io::BitDepth::Float32, dither: false, ..Default::default() },
+        )
+        .unwrap();
+        assert_eq!(soundcraft_audio_io::decode(&encoded, Some("wav")).unwrap().1, *audio);
+        assert_eq!(e.session().pool.get(source).unwrap().buffer.channels[0], original);
+        assert!(e.undo());
+        assert_eq!(e.session().find_clip(clip).unwrap().1.source(), Some(source));
+        assert!(!e.is_dirty());
+        assert!(e.redo());
+        assert_eq!(e.session().find_clip(clip).unwrap().1.source(), Some(rendered));
+    }
 }

@@ -64,16 +64,26 @@ pub fn normalize(ch: &mut [Vec<f32>], target_db: f32, per_channel: bool) {
         for c in ch.iter_mut() {
             let p = peak(std::slice::from_ref(c));
             if p > 0.0 {
-                let g = target / p;
-                c.iter_mut().for_each(|s| *s *= g);
+                normalize_scale(c.iter_mut(), target, p);
             }
         }
     } else {
         let p = peak(ch);
         if p > 0.0 {
-            let g = target / p;
-            ch.iter_mut().flatten().for_each(|s| *s *= g);
+            normalize_scale(ch.iter_mut().flatten(), target, p);
         }
+    }
+}
+
+/// Preserve ordinary f32 normalization exactly. Only gains that overflow or lose precision in
+/// the subnormal range need f64; a zero target is intentional silence at the dB floor.
+fn normalize_scale<'a>(samples: impl Iterator<Item = &'a mut f32>, target: f32, peak: f32) {
+    let gain = target / peak;
+    if gain.is_normal() || target == 0.0 {
+        samples.for_each(|sample| *sample *= gain);
+    } else {
+        let gain = f64::from(target) / f64::from(peak);
+        samples.for_each(|sample| *sample = (f64::from(*sample) * gain) as f32);
     }
 }
 
@@ -559,5 +569,60 @@ mod tests {
         assert_eq!(ch[0][99], 0.0);
         assert_eq!(ch[0][50], 1.0);
         fade(&mut ch, 1000, 1000, FadeShape::SCurve);
+    }
+    #[test]
+    fn normalize_subnormal_finite_pcm_never_generates_infinity_or_nan() {
+        let tiny = f32::from_bits(1);
+        for per_channel in [false, true] {
+            let mut audio = vec![vec![tiny, -tiny, 0.0, -0.0], vec![tiny * 2.0, -tiny, 0.0, 0.0]];
+            normalize(&mut audio, 0.0, per_channel);
+            assert!(audio.iter().flatten().all(|x| x.is_finite()));
+            let first = if per_channel { 1.0 } else { 0.5 };
+            assert_eq!(audio[0], vec![first, -first, 0.0, -0.0]);
+            assert_eq!(audio[1], vec![1.0, -0.5, 0.0, 0.0]);
+        }
+    }
+    #[test]
+    fn normalize_large_finite_peak_preserves_low_target_and_silence() {
+        for per_channel in [false, true] {
+            let mut audio = vec![vec![f32::MAX, -f32::MAX, 0.0], vec![0.0; 3]];
+            normalize(&mut audio, -140.0, per_channel);
+            let target = db_to_gain(-140.0);
+            assert!(target > 0.0);
+            assert_eq!(f32::MAX * (target / f32::MAX), 0.0, "the former f32 path underflows");
+            assert!(audio.iter().flatten().all(|x| x.is_finite()));
+            assert!((audio[0][0] - target).abs() < target * 1e-6);
+            assert!((audio[0][1] + target).abs() < target * 1e-6);
+            assert_eq!(audio[1], vec![0.0; 3]);
+        }
+    }
+
+    #[test]
+    fn normalize_keeps_normal_channel_relationships_and_zero_buffers() {
+        let mut ordinary = vec![vec![0.123, -0.33, 0.0]];
+        let gain = db_to_gain(-3.7) / 0.33;
+        let expected: Vec<f32> = ordinary[0].iter().map(|x| x * gain).collect();
+        normalize(&mut ordinary, -3.7, false);
+        assert_eq!(ordinary[0], expected);
+        let input = vec![vec![0.25, -0.5, 0.0], vec![1.0, -0.75, 0.0]];
+        let mut linked = input.clone();
+        normalize(&mut linked, 0.0, false);
+        assert_eq!(linked, input);
+        let mut independent = input;
+        normalize(&mut independent, 0.0, true);
+        assert_eq!(independent, vec![vec![0.5, -1.0, 0.0], vec![1.0, -0.75, 0.0]]);
+        for per_channel in [false, true] {
+            let mut silence = vec![vec![0.0, -0.0], Vec::new()];
+            normalize(&mut silence, -6.0, per_channel);
+            assert_eq!(silence[0][0].to_bits(), 0.0f32.to_bits());
+            assert_eq!(silence[0][1].to_bits(), (-0.0f32).to_bits());
+            assert!(silence[1].is_empty());
+            let mut floor = vec![vec![1.0, -1.0, 0.0]];
+            normalize(&mut floor, crate::MIN_DB, per_channel);
+            assert!(floor.iter().flatten().all(|&x| x == 0.0));
+            let mut empty = Vec::new();
+            normalize(&mut empty, 0.0, per_channel);
+            assert!(empty.is_empty());
+        }
     }
 }
