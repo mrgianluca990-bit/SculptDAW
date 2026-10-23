@@ -23,6 +23,8 @@ pub mod peaks;
 pub mod stream;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod stream_cache;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod stream_write;
 mod symph;
 mod wav;
 

@@ -592,9 +592,14 @@ fn write_session(session: &Session, path: &str, overwrite: bool) -> Result<(Sess
                 continue;
             }
         }
-        let opts = EncodeOptions { format: FileFormat::Wav, bit_depth: soundcraft_audio_io::BitDepth::Float32, dither: false, bwf: None };
-        let bytes = soundcraft_audio_io::encode(&audio.buffer, &opts).map_err(|err| EngineError::Io(err.to_string()))?;
-        let (name, new) = store_wav(&audio_dir, &stem, &bytes)?;
+        #[cfg(not(target_arch = "wasm32"))]
+        let (name, new) = store_source_wav(&audio_dir, &stem, audio)?;
+        #[cfg(target_arch = "wasm32")]
+        let (name, new) = {
+            let opts = EncodeOptions { format: FileFormat::Wav, bit_depth: soundcraft_audio_io::BitDepth::Float32, dither: false, bwf: None };
+            let bytes = soundcraft_audio_io::encode(&audio.buffer, &opts).map_err(|err| EngineError::Io(err.to_string()))?;
+            store_wav(&audio_dir, &stem, &bytes)?
+        };
         src.path = format!("Audio Files/{name}");
         src.unsaved = false;
         src.format = FileFormat::Wav;
@@ -801,6 +806,79 @@ fn same_path(a: &Path, b: &Path) -> bool {
 /// Store `bytes` as the first of `<stem>.wav`, `<stem>_01.wav`, … in `dir` that is free or already
 /// holds exactly these bytes, so saving never replaces audio; returns the name and whether it was
 /// written.
+/// Compare generated WAV chunks with an existing file without retaining either whole file.
+#[cfg(not(target_arch = "wasm32"))]
+struct AudioFileComparison {
+    file: std::fs::File,
+    matches: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl std::io::Write for AudioFileComparison {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        use std::io::Read;
+        if self.matches {
+            let mut scratch = [0u8; 8192];
+            for expected in bytes.chunks(scratch.len()) {
+                let actual = scratch.get_mut(..expected.len()).ok_or_else(|| std::io::Error::other("audio comparison bounds"))?;
+                match self.file.read_exact(actual) {
+                    Ok(()) => self.matches &= actual == expected,
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => self.matches = false,
+                    Err(e) => return Err(e),
+                }
+                if !self.matches {
+                    break;
+                }
+            }
+        }
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn store_source_wav(dir: &Path, stem: &str, audio: &SourceAudio) -> Result<(String, bool)> {
+    use std::io::Read;
+    for k in 0..10_000u32 {
+        let name = if k == 0 { format!("{stem}.wav") } else { format!("{stem}_{k:02}.wav") };
+        let path = dir.join(&name);
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                let result = audio
+                    .write_wave(&mut file, |_, _| true)
+                    .map(|_| ())
+                    .map_err(|e| EngineError::Io(format!("{}: {e}", path.display())))
+                    .and_then(|_| file.sync_all().map_err(|e| EngineError::Io(format!("{}: {e}", path.display()))));
+                if let Err(error) = result {
+                    drop(file);
+                    let _ = std::fs::remove_file(&path);
+                    return Err(error);
+                }
+                return Ok((name, true));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Directories and links are never reused as managed source files.
+                if !std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_file()) {
+                    continue;
+                }
+                let file = std::fs::File::open(&path).map_err(|e| EngineError::Io(format!("{}: {e}", path.display())))?;
+                let mut comparison = audio
+                    .write_wave(AudioFileComparison { file, matches: true }, |_, _| true)
+                    .map_err(|e| EngineError::Io(format!("{}: {e}", path.display())))?;
+                let mut extra = [0u8; 1];
+                if comparison.matches && comparison.file.read(&mut extra).map_err(|e| EngineError::Io(e.to_string()))? == 0 {
+                    return Ok((name, false));
+                }
+            }
+            Err(e) => return Err(EngineError::Io(format!("{}: {e}", path.display()))),
+        }
+    }
+    Err(EngineError::Io(format!("{}: no free file name for {stem}", dir.display())))
+}
+
+#[cfg(target_arch = "wasm32")]
 fn store_wav(dir: &Path, stem: &str, bytes: &[u8]) -> Result<(String, bool)> {
     use std::io::Write;
     for k in 0..10_000u32 {
@@ -1573,6 +1651,38 @@ mod offline_source_tests {
         let clip = Clip::audio(s.new_clip_id(), "Audio", source, 0, 0, 6000);
         s.track_mut(track).unwrap().playlist_mut().unwrap().clips.push(clip);
         (Engine::new(s), track)
+    }
+    #[test]
+    fn disk_source_save_copy_reuse_and_failure_preserve_audio_and_document() {
+        let fixture = Fixture::new(7);
+        let cache = StreamCache::new(CacheConfig::default()).unwrap();
+        let (mut e, _) = engine(&fixture, Some(&cache));
+        let dir = fixture.path.with_extension("project");
+        let path = dir.join("Main.scdaw").to_string_lossy().into_owned();
+        assert_eq!(save_session(&mut e, &path).unwrap(), 1);
+        let source = e.session().sources[0].id;
+        assert!(!e.session().pool.get(source).unwrap().is_resident());
+        let mut restored = Engine::default();
+        assert!(open_session(&mut restored, &path).unwrap().is_empty());
+        assert_eq!(restored.session().pool.get(source).unwrap().buffer, fixture.audio);
+        let copy = dir.join("Copy/Copy.scdaw").to_string_lossy().into_owned();
+        let before = e.session().to_json().unwrap();
+        assert_eq!(save_copy(&e, &copy).unwrap(), 1);
+        assert_eq!(save_copy(&e, &copy).unwrap(), 0);
+        assert_eq!(e.session().to_json().unwrap(), before);
+        let audio = e.session().pool.get(source).unwrap();
+        let target = dir.join("Copy/Audio Files");
+        std::fs::write(target.join("Collision.wav"), b"unrelated").unwrap();
+        assert_eq!(store_source_wav(&target, "Collision", audio).unwrap(), ("Collision_01.wav".into(), true));
+        assert_eq!(std::fs::read(target.join("Collision.wav")).unwrap(), b"unrelated");
+        std::fs::OpenOptions::new().write(true).open(&fixture.path).unwrap().set_len(100).unwrap();
+        let fail = dir.join("Failed/Failed.scdaw");
+        assert!(save_copy(&e, &fail.to_string_lossy()).is_err());
+        assert!(!fail.exists());
+        assert_eq!(std::fs::read_dir(dir.join("Failed/Audio Files")).unwrap().count(), 0);
+        assert_eq!(e.session().to_json().unwrap(), before);
+        cache.shutdown(Duration::from_secs(1)).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn offline_edit_failures_leave_document_and_undo_unchanged() {
