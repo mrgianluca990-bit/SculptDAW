@@ -304,16 +304,27 @@ impl SourcePool {
     /// Temporary offline compatibility snapshot, preserving every source id and sharing already
     /// resident sources. Validate the total new PCM allocation before reading any source.
     pub fn resident_snapshot(&self, max_samples: usize) -> soundcraft_audio_io::Result<Self> {
-        let needed = self
-            .map
-            .values()
+        self.resident_snapshot_for(self.ids(), max_samples)
+    }
+
+    /// Prepare only requested sources, preserving all other identities/backends. Duplicate
+    /// ids count once; missing ids and the full allocation budget are checked before reads.
+    pub fn resident_snapshot_for(&self, ids: impl IntoIterator<Item = SourceId>, max_samples: usize) -> soundcraft_audio_io::Result<Self> {
+        let ids: std::collections::BTreeSet<_> = ids.into_iter().collect();
+        if ids.iter().any(|id| !self.map.contains_key(id)) {
+            return Err(soundcraft_audio_io::AudioError::Malformed("offline snapshot source is missing".into()));
+        }
+        let needed = ids
+            .iter()
+            .filter_map(|id| self.map.get(id))
             .filter(|a| !a.is_resident())
             .try_fold(0usize, |total, audio| total.checked_add(audio.frames().checked_mul(audio.channels())?));
         if needed.is_none_or(|n| n > max_samples) {
             return Err(soundcraft_audio_io::AudioError::TooLarge("offline pool residency exceeds the PCM budget".into()));
         }
         let mut snapshot = self.clone();
-        for (&id, audio) in &self.map {
+        for id in ids {
+            let audio = self.map.get(&id).ok_or_else(|| soundcraft_audio_io::AudioError::Malformed("offline snapshot source is missing".into()))?;
             if !audio.is_resident() {
                 snapshot.map.insert(id, audio.resident_copy(max_samples)?);
             }
@@ -491,6 +502,22 @@ mod backend_tests {
             assert_eq!(snapshot.get(SourceId(id)).unwrap().buffer, audio());
             assert!(!pool.get(SourceId(id)).unwrap().is_resident());
         }
+        cache.shutdown(Duration::from_secs(1)).unwrap();
+    }
+    #[test]
+    fn selected_snapshot_counts_duplicate_ids_once_and_preserves_unrequested_backends() {
+        let fixture = Fixture::new();
+        let cache = StreamCache::new(CacheConfig::default()).unwrap();
+        let mut pool = SourcePool::default();
+        for id in [7, 19] {
+            pool.insert(SourceId(id), Arc::new(SourceAudio::from_stream(cache.open_source(&fixture.0).unwrap(), 70, |_, _| true).unwrap()));
+        }
+        let selected = pool.resident_snapshot_for([SourceId(7), SourceId(7)], 4103 * 7).unwrap();
+        assert_eq!(selected.get(SourceId(7)).unwrap().buffer, audio());
+        assert!(Arc::ptr_eq(selected.get(SourceId(19)).unwrap(), pool.get(SourceId(19)).unwrap()));
+        assert!(!pool.get(SourceId(7)).unwrap().is_resident());
+        assert!(pool.resident_snapshot_for([SourceId(7), SourceId(19)], 4103 * 7).is_err());
+        assert!(pool.resident_snapshot_for([SourceId(999)], usize::MAX).is_err());
         cache.shutdown(Duration::from_secs(1)).unwrap();
     }
     #[test]
