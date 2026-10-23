@@ -15,6 +15,8 @@
 
 mod aiff;
 mod buffer;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod decode_stream;
 mod flac;
 mod pcm;
 pub mod peaks;
