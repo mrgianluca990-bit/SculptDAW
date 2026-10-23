@@ -61,3 +61,7 @@ Core35: gate locale completo passato (760 test numerici più harness UI, fmt/Cli
 Core35 pubblicato in PR #11, commit `7d1a3a6`, gate locale 760 test numerici più harness UI. Core36 in corso: conservazione breakpoint end+1 e protezione endpoint i64::MAX, entrambi riprodotti; tre nuove regressioni model/comando/Undo superate. Gate completo avviato con ricevitore SHOW `82355f8`. Dettagli `QA/CORE36_AUTOMATION_BOUNDARIES.md`.
 
 Core36: gate completo locale passato (763 test numerici più harness UI, fmt/Clippy/assets/layers/wasm), ricevitore SHOW `82355f8`. Salvataggi, streaming attivato nei loader e tutte le altre fasi restano da concludere; nessuna app finale prodotta.
+
+Core36 pubblicato in PR #12, commit `0721f14`, gate locale 763 test numerici più harness UI. Core37 in corso: backup numerati esclusivi, errore prima di sostituire il progetto quando la copia fallisce, nove regressioni mirate passate. Gate completo avviato con ricevitore SHOW `82355f8`; restore/recovery con media rimane lavoro distinto.
+
+Core37: gate completo locale passato (772 test numerici più harness UI, fmt/Clippy/assets/layers/wasm), ricevitore SHOW 82355f8. Nessuna sostituzione del progetto su fallimento backup; restore/recovery e storage restano aperti. Nessuna consegna finale.
