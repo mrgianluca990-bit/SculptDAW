@@ -425,6 +425,8 @@ struct Side {
     #[cfg(not(target_arch = "wasm32"))]
     media_problem: Option<CacheError>,
     #[cfg(not(target_arch = "wasm32"))]
+    rejected_session: bool,
+    #[cfg(not(target_arch = "wasm32"))]
     loop_anchor: Option<Samples>,
 }
 
@@ -447,6 +449,8 @@ impl Side {
             #[cfg(not(target_arch = "wasm32"))]
             media_problem,
             #[cfg(not(target_arch = "wasm32"))]
+            rejected_session: false,
+            #[cfg(not(target_arch = "wasm32"))]
             retired_media: Vec::new(),
             #[cfg(not(target_arch = "wasm32"))]
             retired_sessions: Vec::new(),
@@ -464,9 +468,20 @@ impl Side {
     }
     #[cfg(not(target_arch = "wasm32"))]
     fn prepare_media(&mut self, at: Samples, anchor: Option<Samples>) -> Result<Arc<PreparedMedia>, CacheError> {
-        if self.media_problem.take().is_some() {
-            let media = Arc::new(PreparedMedia::new(&self.session)?);
-            self.replace_media(media);
+        if self.rejected_session {
+            return Err(self.media_problem.unwrap_or(CacheError::ReadFailed));
+        }
+        if self.media_problem.is_some() {
+            match PreparedMedia::with_previous(&self.session, Some(&self.media)) {
+                Ok(media) => {
+                    self.replace_media(Arc::new(media));
+                    self.media_problem = None;
+                }
+                Err(error) => {
+                    self.media_problem = Some(error);
+                    return Err(error);
+                }
+            }
         }
         match self.media.prepare(at, BLOCK, anchor, std::time::Duration::from_secs(3)) {
             Ok(()) => Ok(Arc::clone(&self.media)),
@@ -752,10 +767,11 @@ impl Player {
         let mut side = self.side();
         #[cfg(not(target_arch = "wasm32"))]
         {
+            side.rejected_session = true;
             let media = if side.media_problem.is_none() && side.media.matches(&s) {
                 Arc::clone(&side.media)
             } else {
-                match PreparedMedia::new(&s) {
+                match PreparedMedia::with_previous(&s, Some(&side.media)) {
                     Ok(media) => Arc::new(media),
                     Err(error) => {
                         side.media_problem = Some(error);
@@ -781,6 +797,7 @@ impl Player {
             }
             side.media_problem = None;
             self.tx.send(Cmd::PreparedSession(s, instances, media)).map_err(|_| "audio command receiver is stopped".to_string())?;
+            side.rejected_session = false;
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -1394,6 +1411,39 @@ mod media_tests {
     use soundcraft_model::{ChannelFormat, Clip, SourceAudio, SourceId, TrackKind};
     use std::{path::PathBuf, sync::atomic::AtomicU64, time::Duration};
     static SERIAL: AtomicU64 = AtomicU64::new(0);
+    #[test]
+    fn failed_instrument_preparation_stays_failed_on_repeated_play() {
+        let mut s = Session::default();
+        let track = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
+        let mut instrument = soundcraft_model::Insert::new("sampler");
+        instrument.sample = Some(SourceId(999));
+        s.track_mut(track).unwrap().instrument = Some(instrument);
+        let (player, _state) = host(Arc::new(s));
+        for _ in 0..3 {
+            assert!(player.play(0, None, None).is_err());
+            assert!(!player.is_playing());
+            assert_eq!(player.side().media_problem, Some(CacheError::ReadFailed));
+        }
+    }
+    #[test]
+    fn rejected_instrument_edit_cannot_restart_the_previous_session() {
+        let original = Arc::new(Session::default());
+        let (player, mut state) = host(Arc::clone(&original));
+        let mut invalid = (*original).clone();
+        let track = invalid.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
+        let mut instrument = soundcraft_model::Insert::new("sampler");
+        instrument.sample = Some(SourceId(999));
+        invalid.track_mut(track).unwrap().instrument = Some(instrument);
+        assert!(player.update_session(Arc::new(invalid)).is_err());
+        for _ in 0..3 {
+            assert!(player.play(0, None, None).is_err());
+            assert!(!player.is_playing());
+        }
+        state.drain();
+        player.update_session(original).unwrap();
+        player.play(0, None, None).unwrap();
+        assert!(player.is_playing());
+    }
     struct Fixture(PathBuf);
     impl Fixture {
         fn new() -> Self {

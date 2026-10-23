@@ -554,7 +554,13 @@ impl MixEngine {
                 strip.instrument = want.and_then(|i| cx.make(t.id, INSTRUMENT_SLOT, i, ich));
                 strip.sample = None;
             }
-            sync_sample(strip, want, s);
+            sync_sample(
+                strip,
+                if t.inactive { None } else { want },
+                s,
+                #[cfg(not(target_arch = "wasm32"))]
+                &self.media,
+            );
         }
         // Instances nobody claimed (the session changed again before they arrived).
         let leftovers: Vec<(TrackId, usize)> = cx.adopt.keys().copied().collect();
@@ -1583,8 +1589,24 @@ impl SampleSource for PoolSample {
 
 /// Hands a strip's instrument the audio of its insert's sample source when it changed (a new
 /// sample, a cleared one, or a new instance). Missing media plays nothing.
-fn sync_sample(strip: &mut Strip, want: Option<&soundcraft_model::Insert>, s: &Session) {
+fn sync_sample(
+    strip: &mut Strip,
+    want: Option<&soundcraft_model::Insert>,
+    s: &Session,
+    #[cfg(not(target_arch = "wasm32"))] media: &media::PreparedMedia,
+) {
     let audio = want.and_then(|i| i.sample).and_then(|id| s.pool.get(id));
+    #[cfg(not(target_arch = "wasm32"))]
+    let audio = audio.and_then(|audio| {
+        if audio.is_resident() {
+            return Some(audio);
+        }
+        let prepared = want.and_then(|i| i.sample).and_then(|id| media.instrument_sample(id, audio));
+        if prepared.is_none() {
+            media.fail(soundcraft_audio_io::stream_cache::CacheError::NotReady);
+        }
+        prepared
+    });
     let same = match (strip.sample.as_ref(), audio) {
         (Some(a), Some(b)) => Arc::ptr_eq(a, b),
         (None, None) => true,

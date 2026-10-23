@@ -1,7 +1,7 @@
 //! Prepared disk media for a mix snapshot. Construction and `prepare` are control-thread work;
 //! `request` and window acquisition only update atomics and pin existing PCM pages.
 use soundcraft_audio_io::stream_cache::{CacheError, CacheWindow, StreamCache, StreamView};
-use soundcraft_model::{Clip, ClipContent, ClipId, Session, SourceAudio};
+use soundcraft_model::{Clip, ClipContent, ClipId, Session, SourceAudio, SourceId};
 use soundcraft_time::{Range, Samples};
 use std::collections::HashMap;
 use std::sync::{
@@ -16,15 +16,23 @@ struct Entry {
     view: StreamView,
 }
 
+const MAX_PREPARED_SAMPLE_VALUES: usize = (64 * 1024 * 1024) / 4;
+
+struct InstrumentSample {
+    original: Arc<SourceAudio>,
+    resident: Arc<SourceAudio>,
+}
+
 pub struct PreparedMedia {
     entries: HashMap<ClipId, Entry>,
+    samples: HashMap<SourceId, InstrumentSample>,
     error: AtomicU8,
     caches: Vec<Arc<StreamCache>>,
 }
 
 impl Default for PreparedMedia {
     fn default() -> Self {
-        Self { entries: HashMap::new(), error: AtomicU8::new(0), caches: Vec::new() }
+        Self { entries: HashMap::new(), samples: HashMap::new(), error: AtomicU8::new(0), caches: Vec::new() }
     }
 }
 
@@ -32,8 +40,39 @@ impl PreparedMedia {
     /// Create independent positions for every disk-backed clip, outside the callback. Muted and
     /// inactive clips do not demand PCM; a changed document needs a newly prepared snapshot.
     pub fn new(s: &Session) -> Result<Self, CacheError> {
+        Self::with_previous(s, None)
+    }
+
+    /// Reuse instrument PCM when clip geometry changes. All reads/copies happen here on the
+    /// control thread, never when the instrument is synchronized in the render callback.
+    pub fn with_previous(s: &Session, previous: Option<&Self>) -> Result<Self, CacheError> {
+        Self::with_sample_budget(s, previous, MAX_PREPARED_SAMPLE_VALUES)
+    }
+
+    fn with_sample_budget(s: &Session, previous: Option<&Self>, sample_budget: usize) -> Result<Self, CacheError> {
         let mut result = Self::default();
+        let mut sample_values = 0usize;
         for track in s.tracks.iter().filter(|t| !t.inactive) {
+            if let Some(id) = track.instrument.as_ref().and_then(|i| i.sample)
+                && !result.samples.contains_key(&id)
+            {
+                let audio = s.pool.get(id).ok_or(CacheError::ReadFailed)?;
+                if !audio.has_uniform_channels() || audio.frames() == 0 {
+                    return Err(CacheError::ReadFailed);
+                }
+                let resident = if audio.is_resident() {
+                    Arc::clone(audio)
+                } else {
+                    let size = audio.frames().checked_mul(audio.channels()).ok_or(CacheError::Capacity)?;
+                    sample_values = sample_values.checked_add(size).filter(|n| *n <= sample_budget).ok_or(CacheError::Capacity)?;
+                    if let Some(prepared) = previous.and_then(|p| p.samples.get(&id)).filter(|p| Arc::ptr_eq(&p.original, audio)) {
+                        Arc::clone(&prepared.resident)
+                    } else {
+                        audio.resident_copy(size).map_err(|_| CacheError::ReadFailed)?
+                    }
+                };
+                result.samples.insert(id, InstrumentSample { original: Arc::clone(audio), resident });
+            }
             for clip in track.clips().iter().filter(|c| !c.muted) {
                 let ClipContent::Audio { source, .. } = clip.content else { continue };
                 let Some(audio) = s.pool.get(source) else { continue };
@@ -55,7 +94,14 @@ impl PreparedMedia {
     /// edits reuse prepared views rather than registering new positions every UI frame.
     pub fn matches(&self, s: &Session) -> bool {
         let mut count = 0usize;
+        let mut sample_ids = std::collections::HashSet::new();
         for track in s.tracks.iter().filter(|t| !t.inactive) {
+            if let Some(id) = track.instrument.as_ref().and_then(|i| i.sample) {
+                sample_ids.insert(id);
+                if !s.pool.get(id).is_some_and(|audio| self.samples.get(&id).is_some_and(|sample| Arc::ptr_eq(&sample.original, audio))) {
+                    return false;
+                }
+            }
             for clip in track.clips().iter().filter(|c| !c.muted) {
                 let ClipContent::Audio { source, .. } = clip.content else { continue };
                 let Some(audio) = s.pool.get(source) else { continue };
@@ -68,7 +114,11 @@ impl PreparedMedia {
                 }
             }
         }
-        count == self.entries.len()
+        count == self.entries.len() && sample_ids.len() == self.samples.len()
+    }
+
+    pub(crate) fn instrument_sample(&self, id: SourceId, original: &Arc<SourceAudio>) -> Option<&Arc<SourceAudio>> {
+        self.samples.get(&id).filter(|sample| Arc::ptr_eq(&sample.original, original)).map(|sample| &sample.resident)
     }
 
     /// Request current and approaching clips, and a loop destination. No waits, I/O or allocation.
@@ -239,6 +289,95 @@ mod tests {
     }
     fn disk(fixture: &Fixture, cache: &Arc<StreamCache>) -> Arc<SourceAudio> {
         Arc::new(SourceAudio::from_stream(cache.open_source(&fixture.path).unwrap(), 140, |_, _| true).unwrap())
+    }
+    fn instrument_session(audio: Arc<SourceAudio>) -> Session {
+        let mut s = Session::default();
+        s.pool.insert(SourceId(900), audio);
+        for _ in 0..2 {
+            let track = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
+            let mut instrument = soundcraft_model::Insert::new("sampler");
+            instrument.sample = Some(SourceId(900));
+            s.track_mut(track).unwrap().instrument = Some(instrument);
+        }
+        s
+    }
+
+    #[test]
+    fn disk_sampler_audio_matches_resident_and_unprepared_disk_is_an_error() {
+        let fixture = Fixture::new(2);
+        let cache = StreamCache::new(CacheConfig::default()).unwrap();
+        let mut disk_session = instrument_session(disk(&fixture, &cache));
+        let ids: Vec<_> = disk_session.tracks.iter().map(|t| t.id).collect();
+        for id in ids {
+            let sequence = soundcraft_midi::Sequence {
+                notes: vec![soundcraft_midi::Note { pitch: 60, velocity: 100, release_velocity: 64, channel: 0, start: 0, length: 960 }],
+                ctrls: Vec::new(),
+            };
+            let clip = Clip::midi(disk_session.new_clip_id(), "Sampler", 0, 4096, sequence);
+            disk_session.track_mut(id).unwrap().playlist_mut().unwrap().clips.push(clip);
+        }
+        let mut resident_session = disk_session.clone();
+        resident_session.pool.insert(SourceId(900), Arc::new(SourceAudio::new(fixture.audio.clone())));
+        let disk_audio = crate::render_range_checked(&disk_session, Range::new(0, 4096), 256).unwrap();
+        let resident_audio = crate::render_range_checked(&resident_session, Range::new(0, 4096), 256).unwrap();
+        assert_eq!(disk_audio, resident_audio);
+        assert!(disk_audio.iter().flatten().any(|v| v.abs() > 0.01));
+        let mut mix = crate::MixEngine::new(48_000.0, 256);
+        let mut output = vec![vec![1.0; 256]; 2];
+        mix.render(&disk_session, 0, 256, &mut output);
+        assert_eq!(mix.take_media_error(), Some(CacheError::NotReady));
+        assert!(output.iter().flatten().all(|v| *v == 0.0));
+        cache.shutdown(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn disk_instrument_samples_are_prepared_once_reused_and_handed_to_sampler() {
+        let fixture = Fixture::new(2);
+        let cache = StreamCache::new(CacheConfig::default()).unwrap();
+        let mut s = instrument_session(disk(&fixture, &cache));
+        let prepared = Arc::new(PreparedMedia::with_sample_budget(&s, None, 160_000).unwrap());
+        assert_eq!(prepared.samples.len(), 1);
+        let original = s.pool.get(SourceId(900)).unwrap();
+        let resident = prepared.instrument_sample(SourceId(900), original).unwrap();
+        assert_eq!(resident.buffer, fixture.audio);
+        assert!(!original.is_resident());
+        s.tracks[0].mixer.volume_db = -9.0;
+        assert!(prepared.matches(&s));
+        let next = PreparedMedia::with_previous(&s, Some(&prepared)).unwrap();
+        assert!(Arc::ptr_eq(resident, next.instrument_sample(SourceId(900), original).unwrap()));
+        let mut mix = crate::MixEngine::new(48_000.0, 512);
+        mix.set_media(Arc::clone(&prepared));
+        mix.sync(&s);
+        for track in &s.tracks {
+            let strip = mix.strips.get(&track.id).unwrap();
+            assert!(strip.instrument.is_some());
+            assert!(Arc::ptr_eq(strip.sample.as_ref().unwrap(), resident));
+        }
+        cache.shutdown(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn instrument_sample_budget_missing_changed_and_inactive_are_explicit() {
+        let fixture = Fixture::new(2);
+        let cache = StreamCache::new(CacheConfig::default()).unwrap();
+        let mut s = instrument_session(disk(&fixture, &cache));
+        assert!(matches!(PreparedMedia::with_sample_budget(&s, None, 159_999), Err(CacheError::Capacity)));
+        let prepared = PreparedMedia::new(&s).unwrap();
+        s.pool.remove(SourceId(900));
+        assert!(!prepared.matches(&s));
+        assert!(matches!(PreparedMedia::new(&s), Err(CacheError::ReadFailed)));
+        for track in &mut s.tracks {
+            track.inactive = true;
+        }
+        assert!(PreparedMedia::new(&s).unwrap().samples.is_empty());
+        s.pool.insert(SourceId(900), disk(&fixture, &cache));
+        for track in &mut s.tracks {
+            track.inactive = false;
+        }
+        assert!(!prepared.matches(&s));
+        std::fs::OpenOptions::new().write(true).open(&fixture.path).unwrap().set_len(100).unwrap();
+        assert!(matches!(PreparedMedia::new(&s), Err(CacheError::ReadFailed)));
+        cache.shutdown(Duration::from_secs(1)).unwrap();
     }
     #[test]
     fn disk_and_resident_bounces_match_exactly_with_overlaps_offsets_stretch_and_fades() {

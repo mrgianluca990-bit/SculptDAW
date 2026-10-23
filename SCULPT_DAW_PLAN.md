@@ -79,3 +79,7 @@ Core39 pubblicato in PR #15, commit c6ebb66, gate locale 783 test numerici più 
 Verifica prossima sampler: PoolSample legge soltanto buffer residente. Preparare fuori callback le sorgenti effettivamente assegnate a strumenti, con budget PCM cumulativo esplicito e riuso per identità Arc attraverso aggiornamenti clip/mixer; integrare nelle PreparedMedia e nel sync. Errori di preparazione devono bloccare il playback, senza silenzio implicito. Non attivato né implementato da questa nota.
 
 Core40: gate completo locale passato (786 test numerici più harness UI, fmt/Clippy/assets/layers/wasm), ricevitore SHOW 82355f8. CI Core37 40024235827, Core38 40024912976 e Core39 40025731269 ancora in corso all’ultima verifica.
+
+Core40 pubblicato in PR #16, commit 57c7324, gate locale 786 test numerici più harness UI. Core41 in corso: preparazione PCM degli strumenti fuori callback con budget 64 MiB delle sorgenti disco, riuso e errori; tre test mix mirati passati, test retry player e gate in verifica. Adattatore bridge e loader restano aperti.
+
+Core41: gate completo locale passato (791 test numerici più harness UI, fmt/Clippy/assets/layers/wasm), ricevitore SHOW 82355f8. Cinque regressioni nuove mix/player e aspettativa sampler missing aggiornata al rifiuto nativo esplicito. Un aggiornamento sessione rifiutato impedisce PLAY sulla snapshot precedente finché non arriva un aggiornamento valido. Nessuna modifica SHOW/bridge; piano completo ancora aperto.
