@@ -839,7 +839,7 @@ impl std::io::Write for AudioFileComparison {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn store_source_wav(dir: &Path, stem: &str, audio: &SourceAudio) -> Result<(String, bool)> {
+pub(crate) fn store_source_wav(dir: &Path, stem: &str, audio: &SourceAudio) -> Result<(String, bool)> {
     use std::io::Read;
     for k in 0..10_000u32 {
         let name = if k == 0 { format!("{stem}.wav") } else { format!("{stem}_{k:02}.wav") };

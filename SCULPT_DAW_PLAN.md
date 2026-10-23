@@ -89,3 +89,7 @@ Core41 pubblicato in PR #17, commit 7589b39, gate locale 791 test numerici più 
 Audit consumatori prima dei loader: clip_group_file::export codifica ancora buf.buffer e l’import determina formato da buffer.num_channels, poi limita a mono/stereo. Adattare export a write_wave/salvataggio esclusivo, formato backend-aware e conversione completa dei tempi fade/sync/envelope nel gruppo prima dell’attivazione loader. Percorsi save/bundle wasm restano intenzionalmente residenti; sampler nativo già preparato. Nessuna attivazione anticipata.
 
 Core42: gate completo locale passato (794 test numerici più harness UI, fmt/Clippy/assets/layers/wasm), ricevitore SHOW 82355f8. Renderer/publisher/schema bridge e SHOW invariati; snapshot temporanee con budget, ordine/ID/marker e documento verificati. Loader e fasi successive restano aperti.
+
+Core42 pubblicato in PR #18, commit 5ed6e38, gate locale 794 test numerici più harness UI. Core43 in corso: export gruppi di clip da sorgenti disco, formato multicanale, conversione completa tempi e preservazione overlap. Tre regressioni nuove/cinque test mirati passati; gate completo avviato. Decodifica import gruppi e loader generali restano residenti, da integrare.
+
+Core43: gate completo locale passato (797 test numerici più harness UI, fmt/Clippy/assets/layers/wasm), ricevitore SHOW 82355f8. CI Core37 40024235827 verificata success su 8fe62a3; Core41 40027730182 e Core42 40028485716 ancora in corso. Nessuna modifica SHOW/bridge o consegna finale.
