@@ -144,6 +144,43 @@ impl SourceAudio {
         Ok(AudioBuffer { sample_rate: self.sample_rate(), channels })
     }
 
+    /// Write canonical float WAV/RF64 without a whole-file PCM or encoded byte copy.
+    /// Blocking control/worker operation. Callers publish only after success and discard the
+    /// destination on failure/cancellation; this does not make destination files atomic.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn write_wave<W: std::io::Write>(&self, destination: W, mut progress: impl FnMut(u64, u64) -> bool) -> soundcraft_audio_io::Result<W> {
+        use soundcraft_audio_io::{AudioError, stream_write::FloatWavWriter};
+        if !self.has_uniform_channels() || !(1..=64).contains(&self.channels()) {
+            return Err(AudioError::Encode("invalid source for WAV transfer".into()));
+        }
+        let total = u64::try_from(self.frames()).map_err(|_| AudioError::TooLarge("source frame count overflow".into()))?;
+        if !progress(0, total) {
+            return Err(AudioError::Io("WAV transfer cancelled".into()));
+        }
+        let mut reader = self.stream.as_ref().map(|s| s.open_reader()).transpose()?;
+        let mut writer = FloatWavWriter::new(destination, self.channels(), self.sample_rate(), total)?;
+        let chunk = 65_536 / self.channels();
+        let mut offset = 0usize;
+        while offset < self.frames() {
+            let frames = chunk.min(self.frames() - offset);
+            let block = if let Some(reader) = &mut reader { reader.read_frames(offset as u64, frames)? } else { self.read_frames(offset, frames)? };
+            if block.frames() != frames {
+                return Err(AudioError::Io("incomplete source during WAV transfer".into()));
+            }
+            writer.write_frames(&block)?;
+            offset += frames;
+            if !progress(offset as u64, total) {
+                return Err(AudioError::Io("WAV transfer cancelled".into()));
+            }
+        }
+        // Revalidate media even if its final chunk was cached by the OS or a caller edited it
+        // from the progress hook. Never publish an apparently successful mixed-version copy.
+        if let Some(source) = &self.stream {
+            source.open_reader()?;
+        }
+        writer.finish()
+    }
+
     /// Blocking region preparation with an explicit total sample budget. Only samples beyond
     /// the known source end are padded; incomplete in-file reads fail without partial output.
     pub fn read_region(&self, start: usize, count: usize, max_samples: usize) -> soundcraft_audio_io::Result<AudioBuffer> {
@@ -327,6 +364,51 @@ mod backend_tests {
     }
     fn audio() -> AudioBuffer {
         AudioBuffer { sample_rate: 48_000, channels: (0..7).map(|ch| (0..4103).map(|f| (f as f32 * 0.017 + ch as f32).sin()).collect()).collect() }
+    }
+    #[test]
+    fn wave_transfer_matches_disk_and_resident_and_rejects_cancelled_or_changed_media() {
+        let fixture = Fixture::new();
+        let cache = StreamCache::new(CacheConfig::default()).unwrap();
+        let disk = SourceAudio::from_stream(cache.open_source(&fixture.0).unwrap(), 70, |_, _| true).unwrap();
+        let resident = SourceAudio::new(audio());
+        let expected = std::fs::read(&fixture.0).unwrap();
+        assert_eq!(disk.write_wave(Vec::new(), |_, _| true).unwrap(), expected);
+        assert_eq!(resident.write_wave(Vec::new(), |_, _| true).unwrap(), expected);
+        assert!(disk.buffer.channels.is_empty());
+        let mut cancelled = Vec::new();
+        assert!(disk.write_wave(&mut cancelled, |_, _| false).is_err());
+        assert!(cancelled.is_empty());
+        assert!(disk.write_wave(Vec::new(), |done, _| done == 0).is_err());
+        assert!(
+            disk.write_wave(Vec::new(), |done, total| {
+                if done == total {
+                    std::fs::OpenOptions::new().write(true).open(&fixture.0).unwrap().set_len(100).unwrap();
+                }
+                true
+            })
+            .is_err()
+        );
+        cache.shutdown(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn wave_transfer_is_chunked_and_rejects_ragged_sources() {
+        let resident = SourceAudio::new(AudioBuffer::new(48_000, 7, 30_000));
+        let mut calls = Vec::new();
+        let bytes = resident
+            .write_wave(Vec::new(), |done, total| {
+                calls.push((done, total));
+                true
+            })
+            .unwrap();
+        assert!(calls.len() > 3);
+        assert!(calls.windows(2).all(|w| w[1].0 - w[0].0 <= 65_536 / 7));
+        assert_eq!(calls.last(), Some(&(30_000, 30_000)));
+        assert_eq!(soundcraft_audio_io::decode(&bytes, None).unwrap().1, resident.buffer);
+        let ragged = SourceAudio::new(AudioBuffer { sample_rate: 48_000, channels: vec![vec![0.0; 2], vec![0.0]] });
+        let mut destination = Vec::new();
+        assert!(ragged.write_wave(&mut destination, |_, _| true).is_err());
+        assert!(destination.is_empty());
     }
     #[test]
     fn disk_source_metadata_ranges_and_residency_are_exact() {

@@ -69,3 +69,7 @@ Core37: gate completo locale passato (772 test numerici più harness UI, fmt/Cli
 Core37 pubblicato in PR #13, commit 8fe62a3. CI Core34 39942163391, Core35 39944262965 e Core36 39945823565 verificate success sui rispettivi commit. Core37 40024235827 ancora in corso all’ultima verifica. Core38: perdita headroom float riprodotta, codec WAV/AIFF corretto e prove codec/sessione passate; regressione render bridge e gate completo in verifica. Scrittura a blocchi e attivazione loader restano da completare.
 
 Core38: gate completo locale passato (776 test numerici più harness UI, fmt/Clippy/assets/layers/wasm). Regressione stem con headroom passata, mantenendo la legge pan esistente. Nessuna modifica bridge/SHOW.
+
+Core38 pubblicato in PR #14, commit 0dceb0c, gate locale 776 test numerici più harness UI. Core39 in corso: writer WAV/RF64 bounded, SourceAudio.write_wave e salvataggi nativi senza WAV completo in RAM; prove componenti passate, integrazione save e gate da verificare. Bundle/sampler/bridge adapter/loader restano aperti.
+
+Core39: gate completo locale passato (783 test numerici più harness UI, fmt/Clippy/assets/layers/wasm), con ricevitore SHOW 82355f8. Scrittura sorgenti disco attiva nei salvataggi nativi; caricamento disco nei loader ancora non attivo.
