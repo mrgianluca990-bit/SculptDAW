@@ -1186,6 +1186,49 @@ mod save_tests {
     }
 
     #[test]
+    fn bridge_stems_preserve_float_headroom_without_document_changes() {
+        let mut engine = with_take(0.75);
+        engine.session_mut().tracks[0].mixer.volume_db = 6.020_6;
+        let before = engine.session().to_json().unwrap();
+        let dirty = engine.is_dirty();
+        let dir = std::env::temp_dir().join(format!("sculpt-bridge-headroom-{}", std::process::id()));
+        let result = engine.execute("bridge.render_stems", &json!({"dir": dir})).unwrap();
+        let files = result["files"].as_array().unwrap();
+        assert_eq!(files.len(), 1);
+        let audio = soundcraft_audio_io::decode(&std::fs::read(files[0]["path"].as_str().unwrap()).unwrap(), None).unwrap().1;
+        assert_eq!(audio.num_channels(), 1);
+        assert_eq!(audio.frames(), 4800);
+        // Preserve the existing -3 dB pan law and bridge mono compensation.
+        let expected = 0.75 * 10.0_f32.powf(6.020_6 / 20.0) * 10.0_f32.powf(-3.0 / 20.0) * std::f32::consts::SQRT_2;
+        assert!(expected > 1.5);
+        assert!((audio.channels[0][2000] - expected).abs() < 0.000_01, "actual {}", audio.channels[0][2000]);
+        assert_eq!(engine.session().to_json().unwrap(), before);
+        assert_eq!(engine.is_dirty(), dirty);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn float_headroom_survives_project_save_copy_and_bundle() {
+        let dir = std::env::temp_dir().join(format!("sculpt-float-headroom-{}", std::process::id()));
+        let mut engine = with_take(1.5);
+        let path = dir.join("Main.scdaw").to_string_lossy().into_owned();
+        save_session(&mut engine, &path).unwrap();
+        let restored = reopen(&path);
+        let source = engine.session().sources[0].id;
+        assert_eq!(restored.session().pool.get(source).unwrap().buffer.channels[0], vec![1.5; 4800]);
+        let copy = dir.join("Copy/Copy.scdaw").to_string_lossy().into_owned();
+        save_copy(&engine, &copy).unwrap();
+        assert_eq!(reopen(&copy).session().pool.get(source).unwrap().buffer.channels[0], vec![1.5; 4800]);
+        let before = engine.session().to_json().unwrap();
+        let (bytes, _) = session_bundle(engine.session()).unwrap();
+        let mut bundled = Engine::default();
+        assert!(open_session_bytes(&mut bundled, "Headroom.scraftz", &bytes).unwrap().is_empty());
+        assert_eq!(bundled.session().pool.get(source).unwrap().buffer.channels[0], vec![1.5; 4800]);
+        assert_eq!(engine.session().to_json().unwrap(), before);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn saving_never_replaces_audio_of_another_session() {
         let dir = std::env::temp_dir().join(format!("soundcraft-no-replace-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
