@@ -208,6 +208,33 @@ impl Engine {
         self.saved = Arc::clone(&self.doc);
     }
 
+    /// Save As relocates unchanged source payloads, not edits. Keep matching runtime audio
+    /// references in Undo/Redo attached to the verified copy; reused IDs with different payloads
+    /// must retain their own history. Serialized historical document fields stay unchanged.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn rebind_saved_sources(&mut self, before: &Session, after: &Session) {
+        let changed: Vec<_> = before
+            .pool
+            .ids()
+            .filter_map(|id| {
+                let old = before.pool.get(id)?;
+                let new = after.pool.get(id)?;
+                (!old.is_resident() && !Arc::ptr_eq(old, new)).then(|| (id, Arc::clone(old), Arc::clone(new)))
+            })
+            .collect();
+        for entry in self.undo.iter_mut().chain(self.redo.iter_mut()) {
+            if !changed.iter().any(|(id, old, _)| entry.doc.pool.get(*id).is_some_and(|audio| Arc::ptr_eq(audio, old))) {
+                continue;
+            }
+            let document = Arc::make_mut(&mut entry.doc);
+            for (id, old, new) in &changed {
+                if document.pool.get(*id).is_some_and(|audio| Arc::ptr_eq(audio, old)) {
+                    document.pool.insert(*id, Arc::clone(new));
+                }
+            }
+        }
+    }
+
     pub fn can_undo(&self) -> bool {
         !self.undo.is_empty()
     }

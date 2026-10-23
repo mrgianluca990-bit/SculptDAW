@@ -112,6 +112,18 @@ impl SourceAudio {
         self.stream.as_ref()
     }
 
+    /// Rebind a verified canonical copy without rescanning its waveform. Control thread only.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn rebind_stream(&self, source: soundcraft_audio_io::stream_cache::StreamSource) -> soundcraft_audio_io::Result<Self> {
+        if source.info().frames != self.frames() as u64
+            || usize::from(source.info().channels) != self.channels()
+            || source.info().sample_rate != self.sample_rate()
+        {
+            return Err(soundcraft_audio_io::AudioError::Malformed("copied source metadata differs".into()));
+        }
+        Ok(Self { buffer: AudioBuffer { sample_rate: self.sample_rate(), channels: Vec::new() }, peaks: self.peaks.clone(), stream: Some(source) })
+    }
+
     /// Worker/control-thread construction. Disk media retains metadata and bounded overviews,
     /// not a whole-file PCM vector. Callers must use backend-aware reads/render views.
     #[cfg(not(target_arch = "wasm32"))]
@@ -280,9 +292,41 @@ impl SourceAudio {
 #[derive(Debug, Clone, Default)]
 pub struct SourcePool {
     map: BTreeMap<SourceId, Arc<SourceAudio>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    cache: Arc<ProjectCache>,
+}
+
+/// Shared even by snapshots taken before the first disk source is loaded. Undo cannot create
+/// a second cache for the same project merely by returning to an empty source pool.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Default)]
+struct ProjectCache(std::sync::Mutex<Option<Arc<soundcraft_audio_io::stream_cache::StreamCache>>>);
+
+#[cfg(not(target_arch = "wasm32"))]
+impl std::fmt::Debug for ProjectCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ProjectCache")
+    }
 }
 
 impl SourcePool {
+    /// Lazy project-owned cache. Control/worker threads only: this may lock, allocate and
+    /// start a disk worker. PCM sources and undo snapshots share this owner.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn stream_cache(&self) -> soundcraft_audio_io::Result<Arc<soundcraft_audio_io::stream_cache::StreamCache>> {
+        let mut owner = self.cache.0.lock().map_err(|_| soundcraft_audio_io::AudioError::Io("project cache lock failed".into()))?;
+        if let Some(cache) = owner.as_ref() {
+            return Ok(Arc::clone(cache));
+        }
+        if let Some(source) = self.map.values().find_map(|audio| audio.stream_source()) {
+            let cache = Arc::clone(source.cache());
+            *owner = Some(Arc::clone(&cache));
+            return Ok(cache);
+        }
+        let cache = soundcraft_audio_io::stream_cache::StreamCache::new(soundcraft_audio_io::stream_cache::CacheConfig::default())?;
+        *owner = Some(Arc::clone(&cache));
+        Ok(cache)
+    }
     pub fn insert(&mut self, id: SourceId, audio: Arc<SourceAudio>) {
         self.map.insert(id, audio);
     }
@@ -356,6 +400,22 @@ mod backend_tests {
         time::Duration,
     };
     static SERIAL: AtomicU64 = AtomicU64::new(0);
+    #[test]
+    fn project_cache_is_lazy_shared_by_empty_undo_snapshots_and_unique_per_project() {
+        let pool = SourcePool::default();
+        let before = pool.clone();
+        assert!(pool.cache.0.lock().unwrap().is_none());
+        let other = before.clone();
+        let worker = std::thread::spawn(move || other.stream_cache().unwrap());
+        let cache = pool.stream_cache().unwrap();
+        assert!(Arc::ptr_eq(&cache, &worker.join().unwrap()));
+        assert!(Arc::ptr_eq(&cache, &before.stream_cache().unwrap()));
+        let next_project = SourcePool::default();
+        assert!(!Arc::ptr_eq(&pool.cache, &next_project.cache));
+        assert!(next_project.cache.0.lock().unwrap().is_none());
+        assert_eq!(pool, before);
+        cache.shutdown(Duration::from_secs(1)).unwrap();
+    }
     struct Fixture(PathBuf);
     impl Fixture {
         fn new() -> Self {

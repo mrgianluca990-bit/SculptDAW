@@ -528,7 +528,10 @@ pub fn save_session(e: &mut Engine, path: &str) -> Result<usize> {
     if cfg!(target_arch = "wasm32") {
         return save_session_bundle(e, path);
     }
-    let (fresh, written, p) = write_session(e.session(), path, false)?;
+    let before = e.session_arc();
+    let (fresh, written, p) = write_session(&before, path, false, true)?;
+    #[cfg(not(target_arch = "wasm32"))]
+    e.rebind_saved_sources(&before, &fresh);
     // Keep the in-memory document in sync (paths, unsaved flags) without an undo step.
     *e.session_mut() = fresh;
     e.path = Some(p.to_string_lossy().into_owned());
@@ -539,18 +542,18 @@ pub fn save_session(e: &mut Engine, path: &str) -> Result<usize> {
 /// Write a copy of the session (and any audio it needs) without touching the open document —
 /// used for autosave / crash recovery. Audio already written for a source is reused.
 pub fn save_copy(e: &Engine, path: &str) -> Result<usize> {
-    write_session(e.session(), path, true).map(|(_, n, _)| n)
+    write_session(e.session(), path, true, false).map(|(_, n, _)| n)
 }
 
 /// File › Save Session Copy In: a normal session folder that does not rename, retarget or
 /// clean the session that stays open.
 pub fn save_session_copy(e: &Engine, path: &str) -> Result<usize> {
-    write_session(e.session(), path, false).map(|(_, n, _)| n)
+    write_session(e.session(), path, false, false).map(|(_, n, _)| n)
 }
 
 /// Write `session` to `path`; returns the session with updated media paths, the number of audio
 /// files written and the final path.
-fn write_session(session: &Session, path: &str, overwrite: bool) -> Result<(Session, usize, PathBuf)> {
+fn write_session(session: &Session, path: &str, overwrite: bool, rebind_streams: bool) -> Result<(Session, usize, PathBuf)> {
     let p = session_file(path);
     let dir = p.parent().map(Path::to_path_buf).unwrap_or_default();
     let audio_dir = dir.join("Audio Files");
@@ -607,6 +610,20 @@ fn write_session(session: &Session, path: &str, overwrite: bool) -> Result<(Sess
     }
     if written > 0 {
         sync_dir(&audio_dir);
+    }
+    if rebind_streams {
+        #[cfg(not(target_arch = "wasm32"))]
+        for source in &s.sources {
+            let Some(audio) = s.pool.get(source.id).filter(|audio| !audio.is_resident()).cloned() else { continue };
+            let target = if Path::new(&source.path).is_absolute() { PathBuf::from(&source.path) } else { dir.join(&source.path) };
+            if audio.stream_source().is_some_and(|stream| same_path(stream.path(), &target)) {
+                continue;
+            }
+            let cache = s.pool.stream_cache().map_err(|e| EngineError::Io(e.to_string()))?;
+            let stream = cache.open_source(&target).map_err(|e| EngineError::Io(format!("{}: {e}", target.display())))?;
+            let rebound = audio.rebind_stream(stream).map_err(|e| EngineError::Io(e.to_string()))?;
+            s.pool.insert(source.id, Arc::new(rebound));
+        }
     }
     s.folder = Some(dir.clone());
     if !overwrite && let Some(stem) = p.file_stem().and_then(|x| x.to_str()) {
@@ -911,8 +928,19 @@ pub fn open_session(e: &mut Engine, path: &str) -> Result<Vec<String>> {
     let mut s = Session::from_json(&text).map_err(|err| EngineError::Io(err.to_string()))?;
     let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
     let mut missing = Vec::new();
+    #[cfg(not(target_arch = "wasm32"))]
+    let overview_blocks = (1_048_576 / s.sources.len().max(1)).clamp(1, 16_384);
     for src in s.sources.clone() {
         let p = if Path::new(&src.path).is_absolute() { PathBuf::from(&src.path) } else { dir.join(&src.path) };
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if !p.exists() {
+                missing.push(p.display().to_string());
+            } else if let Err(error) = load_source_file(&mut s, src.id, &p, overview_blocks) {
+                missing.push(format!("{}: {error}", p.display()));
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
         match std::fs::read(&p) {
             Ok(bytes) => {
                 if let Err(err) = load_source_audio(&mut s, src.id, &bytes, p.extension().and_then(|x| x.to_str())) {
@@ -930,6 +958,35 @@ pub fn open_session(e: &mut Engine, path: &str) -> Result<Vec<String>> {
         e.message(format!("missing media: {m}"));
     }
     Ok(missing)
+}
+
+/// Native project media: stream supported WAV at the project rate. Other codecs and legacy
+/// rate mismatches keep the existing offline decode/resample path until their migration.
+#[cfg(not(target_arch = "wasm32"))]
+fn load_source_file(s: &mut Session, id: SourceId, path: &Path, overview_blocks: usize) -> std::result::Result<(), String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut header = [0u8; 12];
+    let wave =
+        file.read_exact(&mut header).is_ok() && matches!(header.get(..4), Some(b"RIFF" | b"RF64" | b"BW64")) && header.get(8..12) == Some(b"WAVE");
+    if wave {
+        match soundcraft_audio_io::stream::WavReader::open(path) {
+            Ok(reader) if reader.info().sample_rate == s.sample_rate.hz() => {
+                if reader.info().frames == 0 {
+                    return Err("empty project audio".into());
+                }
+                let cache = s.pool.stream_cache().map_err(|e| e.to_string())?;
+                let source = cache.open_source(path).map_err(|e| e.to_string())?;
+                let audio = SourceAudio::from_stream(source, overview_blocks, |_, _| true).map_err(|e| e.to_string())?;
+                s.pool.insert(id, Arc::new(audio));
+                return Ok(());
+            }
+            Ok(_) | Err(soundcraft_audio_io::AudioError::Unsupported(_)) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    load_source_audio(s, id, &bytes, path.extension().and_then(|x| x.to_str()))
 }
 
 /// Decode one source's audio file into the session pool, at the session rate.
@@ -1333,10 +1390,10 @@ mod save_tests {
         save_session(&mut engine, &path).unwrap();
         let restored = reopen(&path);
         let source = engine.session().sources[0].id;
-        assert_eq!(restored.session().pool.get(source).unwrap().buffer.channels[0], vec![1.5; 4800]);
+        assert_eq!(restored.session().pool.get(source).unwrap().read_frames(0, 4800).unwrap().channels[0], vec![1.5; 4800]);
         let copy = dir.join("Copy/Copy.scdaw").to_string_lossy().into_owned();
         save_copy(&engine, &copy).unwrap();
-        assert_eq!(reopen(&copy).session().pool.get(source).unwrap().buffer.channels[0], vec![1.5; 4800]);
+        assert_eq!(reopen(&copy).session().pool.get(source).unwrap().read_frames(0, 4800).unwrap().channels[0], vec![1.5; 4800]);
         let before = engine.session().to_json().unwrap();
         let (bytes, _) = session_bundle(engine.session()).unwrap();
         let mut bundled = Engine::default();
@@ -1357,7 +1414,7 @@ mod save_tests {
         save_session(&mut reopen(&path("B/B.scraft")), &path("A/B.scraft")).unwrap();
         let levels = ["A/A.scraft", "A/A v2.scraft", "B/B.scraft", "A/B.scraft"].map(|p| {
             let r = reopen(&path(p));
-            r.session().pool.get(r.session().sources[0].id).unwrap().buffer.channels[0][0]
+            r.session().pool.get(r.session().sources[0].id).unwrap().read_frames(0, 1).unwrap().channels[0][0]
         });
         assert_eq!(levels, [0.5, -0.25, 0.75, 0.75]);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1399,7 +1456,7 @@ mod save_tests {
         let dir = std::env::temp_dir().join(format!("soundcraft-own-folder-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = |p: &str| dir.join(p).to_string_lossy().into_owned();
-        let level = |r: &Engine| r.session().pool.get(r.session().sources[0].id).unwrap().buffer.channels[0][0];
+        let level = |r: &Engine| r.session().pool.get(r.session().sources[0].id).unwrap().read_frames(0, 1).unwrap().channels[0][0];
         save_session(&mut with_take(-0.25), &path("B/Other.scraft")).unwrap();
         let mut e = with_take(0.5);
         save_session(&mut e, &path("A/A.scraft")).unwrap();
@@ -1444,7 +1501,7 @@ mod save_tests {
         bare.execute("session.save", &json!({})).unwrap();
         second.execute("session.save_as", &json!({"path": path, "replace": true})).unwrap();
         let r = reopen(&path);
-        assert_eq!(r.session().pool.get(r.session().sources[0].id).unwrap().buffer.channels[0][0], -0.25);
+        assert_eq!(r.session().pool.get(r.session().sources[0].id).unwrap().read_frames(0, 1).unwrap().channels[0][0], -0.25);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1702,6 +1759,34 @@ mod offline_source_tests {
         (Engine::new(s), track)
     }
     #[test]
+    fn native_project_open_and_save_as_keep_disk_audio_available_through_undo() {
+        let fixture = Fixture::new(7);
+        let (mut original, track) = engine(&fixture, None);
+        let dir = fixture.path.with_extension("rebind-project");
+        let first = dir.join("First/First.scdaw");
+        save_session(&mut original, &first.to_string_lossy()).unwrap();
+        let mut opened = Engine::default();
+        assert!(open_session(&mut opened, &first.to_string_lossy()).unwrap().is_empty());
+        let source = opened.session().sources[0].id;
+        let audio = opened.session().pool.get(source).unwrap();
+        assert!(!audio.is_resident());
+        assert!(audio.buffer.channels.is_empty());
+        let cache = opened.session().pool.stream_cache().unwrap();
+        assert!(Arc::ptr_eq(&cache, audio.stream_source().unwrap().cache()));
+        assert_eq!(audio.read_frames(0, 6000).unwrap(), fixture.audio);
+        opened.execute("mix.volume", &json!({"track":track.0,"db":-6.0})).unwrap();
+        let second = dir.join("Second/Second.scdaw");
+        save_session(&mut opened, &second.to_string_lossy()).unwrap();
+        std::fs::remove_dir_all(dir.join("First/Audio Files")).unwrap();
+        assert_eq!(opened.session().pool.get(source).unwrap().read_frames(0, 6000).unwrap(), fixture.audio);
+        assert!(opened.undo());
+        assert_eq!(opened.session().pool.get(source).unwrap().read_frames(0, 6000).unwrap(), fixture.audio);
+        assert!(opened.redo());
+        assert_eq!(opened.session().pool.get(source).unwrap().read_frames(0, 6000).unwrap(), fixture.audio);
+        cache.shutdown(Duration::from_secs(1)).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
     fn disk_sources_stream_to_bundle_file_and_reopen_without_document_changes() {
         let fixture = Fixture::new(7);
         let cache = StreamCache::new(CacheConfig::default()).unwrap();
@@ -1716,7 +1801,7 @@ mod offline_source_tests {
         let bytes = std::fs::read(&path).unwrap();
         assert!(open_session_bytes(&mut restored, "Disk.scraftz", &bytes).unwrap().is_empty());
         let source = e.session().sources[0].id;
-        assert_eq!(restored.session().pool.get(source).unwrap().buffer, fixture.audio);
+        assert_eq!(restored.session().pool.get(source).unwrap().read_frames(0, fixture.audio.frames()).unwrap(), fixture.audio);
         assert_eq!(e.session().to_json().unwrap(), before);
         assert!(!e.session().pool.get(source).unwrap().is_resident());
         assert!(!fresh.pool.get(source).unwrap().is_resident());
@@ -1777,7 +1862,7 @@ mod offline_source_tests {
         assert!(!e.session().pool.get(source).unwrap().is_resident());
         let mut restored = Engine::default();
         assert!(open_session(&mut restored, &path).unwrap().is_empty());
-        assert_eq!(restored.session().pool.get(source).unwrap().buffer, fixture.audio);
+        assert_eq!(restored.session().pool.get(source).unwrap().read_frames(0, fixture.audio.frames()).unwrap(), fixture.audio);
         let copy = dir.join("Copy/Copy.scdaw").to_string_lossy().into_owned();
         let before = e.session().to_json().unwrap();
         assert_eq!(save_copy(&e, &copy).unwrap(), 1);
@@ -1788,7 +1873,8 @@ mod offline_source_tests {
         std::fs::write(target.join("Collision.wav"), b"unrelated").unwrap();
         assert_eq!(store_source_wav(&target, "Collision", audio).unwrap(), ("Collision_01.wav".into(), true));
         assert_eq!(std::fs::read(target.join("Collision.wav")).unwrap(), b"unrelated");
-        std::fs::OpenOptions::new().write(true).open(&fixture.path).unwrap().set_len(100).unwrap();
+        let active = e.session().pool.get(source).unwrap().stream_source().unwrap().path().to_path_buf();
+        std::fs::OpenOptions::new().write(true).open(active).unwrap().set_len(100).unwrap();
         let fail = dir.join("Failed/Failed.scdaw");
         assert!(save_copy(&e, &fail.to_string_lossy()).is_err());
         assert!(!fail.exists());
