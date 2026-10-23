@@ -19,7 +19,7 @@ use symphonia::core::probe::Hint;
 use crate::pcm::MAX_DECODE_SAMPLES;
 use crate::{AudioBuffer, AudioError, AudioInfo, FileFormat, Result, SampleFormat};
 
-fn map_err(e: SymError) -> AudioError {
+pub(crate) fn map_err(e: SymError) -> AudioError {
     match e {
         SymError::Unsupported(m) => AudioError::Unsupported(m.to_string()),
         SymError::LimitError(m) => AudioError::TooLarge(m.to_string()),
@@ -28,7 +28,7 @@ fn map_err(e: SymError) -> AudioError {
 }
 
 /// Run `f`, turning a panic inside the third-party decoder into an error.
-fn guarded<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
+pub(crate) fn guarded<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
     catch_unwind(AssertUnwindSafe(f)).unwrap_or_else(|_| Err(AudioError::Malformed("decoder failed on malformed input".into())))
 }
 
@@ -91,7 +91,7 @@ fn sample_format_of(p: &CodecParameters) -> SampleFormat {
     }
 }
 
-fn info_of(reader: &dyn FormatReader, detected: FileFormat) -> Result<(u32, AudioInfo)> {
+pub(crate) fn info_of(reader: &dyn FormatReader, detected: FileFormat) -> Result<(u32, AudioInfo)> {
     let track = reader
         .tracks()
         .iter()

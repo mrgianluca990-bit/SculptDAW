@@ -99,3 +99,7 @@ Core43 pubblicato in PR #19, commit ea80166, gate locale 797 test numerici più 
 Core44: riprodotto vecchio percorso nella snapshot Undo dopo Save As e cancellazione della vecchia cartella media. Correzione selettiva dei riferimenti runtime condivisi: test apertura disco/Save As/Undo/Redo passato. Gate completo avviato; audit dei media presenti soltanto nella storia e waveform background ancora successivi.
 
 Core44: gate completo locale passato (799 test numerici più harness UI, fmt/Clippy/assets/layers/wasm), ricevitore SHOW 82355f8. Apertura WAV coerenti da disco attiva; cache lazy, rebind Save As delle sorgenti correnti e riferimenti runtime identici in Undo/Redo verificati. Media solo nella storia, import/take/rate mismatch/codec e waveform background restano da concludere.
+
+Core44 pubblicato in PR #20, commit 355a72f, gate locale 799 test numerici più harness UI. Core45 in corso: decoder File a blocchi con WAV nativo/RF64 e Symphonia per codec compressi; sei regressioni nuove passate, inclusi MP3 sintetici gapless e senza Xing, durata AIFF da COMM e media incompleti. Componente ancora non collegato all’import. Gate completo avviato con RUSTUP_TOOLCHAIN=stable esplicito (settings privati /tmp non presenti).
+
+Core45: gate completo locale passato (805 test numerici più harness UI, fmt/Clippy/assets/layers/wasm), ricevitore SHOW 82355f8; assets sintetici attribuiti e controllo assets passato. Decoder File ancora da collegare al writer/import, nessuna modifica SHOW/bridge e nessuna consegna finale.
