@@ -144,41 +144,91 @@ impl SourceAudio {
         Ok(AudioBuffer { sample_rate: self.sample_rate(), channels })
     }
 
+    /// Blocking region preparation with an explicit total sample budget. Only samples beyond
+    /// the known source end are padded; incomplete in-file reads fail without partial output.
+    pub fn read_region(&self, start: usize, count: usize, max_samples: usize) -> soundcraft_audio_io::Result<AudioBuffer> {
+        self.read_region_with_progress(start, count, max_samples, |_, _| true)
+    }
+
+    /// Control/worker-thread variant with cancellation before allocation and between chunks.
+    pub fn read_region_with_progress(
+        &self,
+        start: usize,
+        count: usize,
+        max_samples: usize,
+        mut progress: impl FnMut(usize, usize) -> bool,
+    ) -> soundcraft_audio_io::Result<AudioBuffer> {
+        use soundcraft_audio_io::AudioError;
+        let channels = self.channels();
+        if channels == 0 || channels > 64 || !self.has_uniform_channels() {
+            return Err(AudioError::Malformed("offline source channels are invalid".into()));
+        }
+        if count.checked_mul(channels).is_none_or(|n| n > max_samples) {
+            return Err(AudioError::TooLarge("offline region exceeds the PCM budget".into()));
+        }
+        if !progress(0, count) {
+            return Err(AudioError::Io("audio region preparation cancelled".into()));
+        }
+        let available = self.frames().saturating_sub(start).min(count);
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut reader = if available > 0 { self.stream.as_ref().map(|source| source.open_reader()).transpose()? } else { None };
+        let mut out = Vec::new();
+        out.try_reserve_exact(channels).map_err(|e| AudioError::TooLarge(e.to_string()))?;
+        for _ in 0..channels {
+            let mut channel = Vec::new();
+            channel.try_reserve_exact(count).map_err(|e| AudioError::TooLarge(e.to_string()))?;
+            channel.resize(count, 0.0);
+            out.push(channel);
+        }
+        let mut done = 0usize;
+        while done < available {
+            if done > 0 && !progress(done, count) {
+                return Err(AudioError::Io("audio region preparation cancelled".into()));
+            }
+            let n = (available - done).min(65_536 / channels);
+            let at = start.checked_add(done).ok_or_else(|| AudioError::TooLarge("audio region offset overflow".into()))?;
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Some(reader) = &mut reader {
+                let block = reader.read_frames(at as u64, n)?;
+                if block.frames() != n || block.num_channels() != channels {
+                    return Err(AudioError::Malformed("incomplete source region".into()));
+                }
+                for (dst, src) in out.iter_mut().zip(block.channels) {
+                    let dst = dst.get_mut(done..done + n).ok_or_else(|| AudioError::Malformed("offline output region bounds".into()))?;
+                    if src.len() != dst.len() {
+                        return Err(AudioError::Malformed("incomplete source channel".into()));
+                    }
+                    dst.copy_from_slice(&src);
+                }
+                done += n;
+                continue;
+            }
+            for (dst, src) in out.iter_mut().zip(&self.buffer.channels) {
+                let input = src.get(at..at + n).ok_or_else(|| AudioError::Malformed("incomplete resident source region".into()))?;
+                let dst = dst.get_mut(done..done + n).ok_or_else(|| AudioError::Malformed("offline output region bounds".into()))?;
+                dst.copy_from_slice(input);
+            }
+            done += n;
+        }
+        if count > 0 && !progress(count, count) {
+            return Err(AudioError::Io("audio region preparation cancelled".into()));
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if reader.is_some()
+            && let Some(source) = &self.stream
+        {
+            // Detect replacement/truncation even when it occurred after the final read.
+            source.open_reader()?;
+        }
+        Ok(AudioBuffer { sample_rate: self.sample_rate(), channels: out })
+    }
+
     /// Explicit compatibility copy for offline APIs that require resident PCM. The caller owns
     /// the sample budget and temporary result; neither this source nor Undo snapshots change.
     pub fn resident_copy(&self, max_samples: usize) -> soundcraft_audio_io::Result<Arc<Self>> {
-        if self.channels() > 64 || !self.has_uniform_channels() {
-            return Err(soundcraft_audio_io::AudioError::Malformed("offline source channels are invalid".into()));
-        }
-        let frames = self.frames();
-        if frames.checked_mul(self.channels()).is_none_or(|n| n > max_samples) {
-            return Err(soundcraft_audio_io::AudioError::TooLarge("offline source residency exceeds the PCM budget".into()));
-        }
-        let mut channels = Vec::new();
-        for _ in 0..self.channels() {
-            let mut ch = Vec::new();
-            ch.try_reserve_exact(frames).map_err(|e| soundcraft_audio_io::AudioError::TooLarge(e.to_string()))?;
-            channels.push(ch);
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        let mut reader = self.stream.as_ref().map(|source| source.open_reader()).transpose()?;
-        let mut start = 0usize;
-        while start < frames {
-            let count = (frames - start).min(65_536 / self.channels().max(1));
-            #[cfg(not(target_arch = "wasm32"))]
-            let block = if let Some(reader) = &mut reader { reader.read_frames(start as u64, count)? } else { self.read_frames(start, count)? };
-            #[cfg(target_arch = "wasm32")]
-            let block = self.read_frames(start, count)?;
-            if block.frames() != count || block.num_channels() != self.channels() {
-                return Err(soundcraft_audio_io::AudioError::Malformed("incomplete source read during offline preparation".into()));
-            }
-            for (dst, samples) in channels.iter_mut().zip(block.channels) {
-                dst.extend_from_slice(&samples);
-            }
-            start += count;
-        }
+        let buffer = self.read_region(0, self.frames(), max_samples)?;
         Ok(Arc::new(Self {
-            buffer: AudioBuffer { sample_rate: self.sample_rate(), channels },
+            buffer,
             peaks: self.peaks.clone(),
             #[cfg(not(target_arch = "wasm32"))]
             stream: None,
@@ -303,6 +353,41 @@ mod backend_tests {
         assert!(resident.is_resident());
         assert!(!disk.is_resident());
         assert!(disk.buffer.channels.is_empty());
+        cache.shutdown(Duration::from_secs(1)).unwrap();
+    }
+    #[test]
+    fn selected_regions_match_disk_and_resident_with_explicit_eof_padding_and_budget() {
+        let fixture = Fixture::new();
+        let cache = StreamCache::new(CacheConfig::default()).unwrap();
+        let disk = SourceAudio::from_stream(cache.open_source(&fixture.0).unwrap(), 70, |_, _| true).unwrap();
+        let resident = SourceAudio::new(audio());
+        for (start, count) in [(137, 600), (4000, 1000), (usize::MAX, 10), (0, 70_000)] {
+            let result = disk.read_region(start, count, count * 7).unwrap();
+            assert_eq!(result, resident.read_region(start, count, count * 7).unwrap());
+            assert_eq!(result.frames(), count);
+        }
+        let padded = disk.read_region(4000, 1000, 7000).unwrap();
+        assert!(padded.channels.iter().all(|ch| ch[103..].iter().all(|&x| x == 0.0)));
+        assert!(disk.read_region(0, usize::MAX, usize::MAX).is_err());
+        assert!(disk.read_region(0, 600, 4199).is_err());
+        assert!(!disk.is_resident());
+        cache.shutdown(Duration::from_secs(1)).unwrap();
+    }
+    #[test]
+    fn region_cancellation_and_changes_at_completion_return_no_partial_result() {
+        let fixture = Fixture::new();
+        let cache = StreamCache::new(CacheConfig::default()).unwrap();
+        let disk = SourceAudio::from_stream(cache.open_source(&fixture.0).unwrap(), 70, |_, _| true).unwrap();
+        assert!(disk.read_region_with_progress(0, 600, 4200, |_, _| false).is_err());
+        assert!(disk.read_region_with_progress(0, 600, 4200, |at, total| at != total).is_err());
+        let result = disk.read_region_with_progress(0, 600, 4200, |at, total| {
+            if at == total {
+                std::fs::OpenOptions::new().write(true).open(&fixture.0).unwrap().set_len(100).unwrap();
+            }
+            true
+        });
+        assert!(result.is_err());
+        assert!(!disk.is_resident());
         cache.shutdown(Duration::from_secs(1)).unwrap();
     }
     #[test]
