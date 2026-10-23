@@ -65,3 +65,7 @@ Core36: gate completo locale passato (763 test numerici più harness UI, fmt/Cli
 Core36 pubblicato in PR #12, commit `0721f14`, gate locale 763 test numerici più harness UI. Core37 in corso: backup numerati esclusivi, errore prima di sostituire il progetto quando la copia fallisce, nove regressioni mirate passate. Gate completo avviato con ricevitore SHOW `82355f8`; restore/recovery con media rimane lavoro distinto.
 
 Core37: gate completo locale passato (772 test numerici più harness UI, fmt/Clippy/assets/layers/wasm), ricevitore SHOW 82355f8. Nessuna sostituzione del progetto su fallimento backup; restore/recovery e storage restano aperti. Nessuna consegna finale.
+
+Core37 pubblicato in PR #13, commit 8fe62a3. CI Core34 39942163391, Core35 39944262965 e Core36 39945823565 verificate success sui rispettivi commit. Core37 40024235827 ancora in corso all’ultima verifica. Core38: perdita headroom float riprodotta, codec WAV/AIFF corretto e prove codec/sessione passate; regressione render bridge e gate completo in verifica. Scrittura a blocchi e attivazione loader restano da completare.
+
+Core38: gate completo locale passato (776 test numerici più harness UI, fmt/Clippy/assets/layers/wasm). Regressione stem con headroom passata, mantenendo la legge pan esistente. Nessuna modifica bridge/SHOW.
