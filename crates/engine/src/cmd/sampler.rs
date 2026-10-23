@@ -305,7 +305,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_media_plays_silence() {
+    fn missing_media_is_reported_before_native_render() {
         let d = dir("missing");
         let wav = d.join("tone.wav");
         tone_wav(&wav, 440.0, 48_000, 1.0, 1);
@@ -315,6 +315,15 @@ mod tests {
         let r = e.execute("mix.sampler_load", &json!({"track": t.0, "path": wav.to_string_lossy()})).unwrap();
         let src = soundcraft_model::SourceId(r["source"].as_u64().unwrap());
         e.session_mut().pool.remove(src);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let before = e.session().to_json().unwrap();
+            let error = soundcraft_mix::render_range_checked(e.session(), Range::new(0, 48_000), 512).unwrap_err();
+            assert!(error.contains("Media preparation"), "{error}");
+            assert_eq!(e.session().to_json().unwrap(), before);
+            assert!(e.session().pool.get(src).is_none());
+        }
+        #[cfg(target_arch = "wasm32")]
         assert_eq!(peak(&render(&e, 1)[0]), 0.0);
         let _ = std::fs::remove_dir_all(d);
     }
