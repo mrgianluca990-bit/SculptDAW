@@ -107,3 +107,7 @@ Core45: gate completo locale passato (805 test numerici più harness UI, fmt/Cli
 Core45 pubblicato in PR #21, commit 587dfad, gate locale 805 test numerici più harness UI. Fixture MP3 binarie pubblicate con SHA Git verificati. Core46 in corso: writer Growing WAV/RF64 e trasferimento decoder→WAV originale senza SRC, con cancellazione/errori e finalizzazione dopo EOF. Sei regressioni nuove e suite audio-io/Clippy passati; gate completo avviato. Import UI e SRC offline restano successivi.
 
 Core46: gate completo locale passato (811 test numerici più harness UI, fmt/Clippy/assets/layers/wasm), ricevitore SHOW 82355f8. Trasferimento decoder→WAV verificato con cancellazione/errori; SRC e import UI restano da collegare. Nessuna modifica SHOW/bridge o consegna finale.
+
+Core46 pubblicato in PR #22, commit a762a05, gate locale 811 test numerici più harness UI. Core47 in corso: WindowedResampler offline con stesso kernel sinc e fase globale, finestre bounded, durata u64/u128, errori espliciti. Quattro regressioni nuove/Clippy DSP passati, confronto bit-per-bit incluso 88,2→48 e 64ch; gate completo avviato. Collegamento al trasferimento file/import ancora successivo.
+
+Core47: gate completo locale passato (815 test numerici più harness UI, fmt/Clippy/assets/layers/wasm), ricevitore SHOW 82355f8. Le tre differenze baseline causate da fmt sono state verificate confrontando il contenuto corrente con rustfmt(stdin HEAD), poi ripristinate prima del commit. SRC ancora da collegare ai trasferimenti/import; piano completo aperto.
