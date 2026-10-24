@@ -1,0 +1,11 @@
+# Core48 — trasferimento file e SRC offline bounded
+
+24 ottobre 2026. Tre regressioni nuove e Clippy engine passati; gate completo locale passato: 818 test numerici più harness UI, fmt/Clippy/assets/layers/wasm; sandbox con esclusione sola lettura VST3 installati, ricevitore SHOW 82355f8 invariato. Preparazione worker, non ancora comando/UI import attivo.
+
+transfer_file converte in WAV float alla frequenza richiesta, senza modificare documenti Engine. Destinazione riservata create_new, rifiuto di file esistenti/alias input e rimozione degli output creati dal job in caso di errore/cancellazione. Same-rate usa decoder→Growing WAV; mismatch usa un WAV temporaneo alla frequenza originale, poi WindowedResampler e writer a durata nota. Due passate scambiano I/O disco con memoria PCM bounded. Temporanei nello stesso parent, nomi esclusivi con tentativi limitati; nessuna cartella globale aggiunta.
+
+Callback distingue Decode/Resample con contatori u64 e totale opzionale. File finale sync_all prima del receipt; il chiamante applicherà il risultato al progetto soltanto dopo successo. Non è pubblicazione filesystem atomica contro crash: il nome finale può essere visibile durante il lavoro e cleanup fallito viene registrato. Non è ancora recovery di job interrotti. Il receipt conserva info della sorgente originale e dimensione/durata destinazione; il WAV canonico non riproduce tutti i tag/container metadata originali, la conservazione/provenienza degli originali e il trasferimento metadata nel modello sono fasi dell’import ancora da collegare.
+
+Prove: confronto campioni con resample precedente su WAV 88,2→48 kHz a 1/2/7/64ch con headroom, FLAC/AIFF 96→48, MP3 gapless 44,1→48 e mono senza Xing 48→48; durata/rate/byte/progress corretti e input identico dopo successo; file destinazione e originale non sovrascritti; cancellazione in ciascuna fase con nessun parziale residuo; input danneggiato in corso e parametri invalidi con pulizia. Sono test offline, non misure hardware o certificazione di ogni filesystem.
+
+Restano collegamento import UI/CLI, workspace, originali portabili, metadati, batch atomico/Undo, conversione legacy/take, waveform background e resto del piano. Nessuna modifica SHOW/bridge o consegna finale.
