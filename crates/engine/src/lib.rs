@@ -13,6 +13,11 @@ pub mod demo;
 pub mod edit;
 pub mod inspect;
 pub mod io;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod media_transfer;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[allow(clippy::unwrap_used)]
+mod media_transfer_tests;
 pub mod score;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
