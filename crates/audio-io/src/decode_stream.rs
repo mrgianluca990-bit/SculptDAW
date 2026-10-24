@@ -7,7 +7,7 @@ use crate::{
 };
 use std::{
     fs::File,
-    io::{Read, Seek, SeekFrom},
+    io::{Read, Seek, SeekFrom, Write},
     path::Path,
     time::SystemTime,
 };
@@ -105,6 +105,7 @@ impl FileDecoder {
             Ok(Self { backend: Backend::Codec(Box::new(CodecDecoder::open(path)?)) })
         })
     }
+    /// Header-derived duration may be estimated for compressed streams until clean EOF.
     pub fn info(&self) -> &AudioInfo {
         match &self.backend {
             Backend::Wave { reader, .. } => reader.info(),
@@ -151,6 +152,38 @@ impl FileDecoder {
             }
         }
     }
+}
+
+/// Canonical float WAV transfer at the original sample rate, without whole-file staging.
+/// No SRC is performed. The caller owns output cleanup/publication; partial output must be
+/// discarded on any error or cancellation. The final header is written only after clean EOF.
+pub fn decode_file_to_wave<W: Write + Seek>(
+    path: impl AsRef<Path>,
+    destination: W,
+    mut progress: impl FnMut(u64, Option<u64>) -> bool,
+) -> Result<(W, AudioInfo)> {
+    let mut decoder = FileDecoder::open(path)?;
+    let hint = (decoder.info().frames > 0).then_some(decoder.info().frames);
+    if !progress(0, hint) {
+        return Err(AudioError::Io("audio transfer cancelled".into()));
+    }
+    let first = decoder.next_block()?.ok_or_else(|| AudioError::Malformed("input has no audio frames".into()))?;
+    let mut writer = crate::stream_write::GrowingFloatWavWriter::new(destination, first.num_channels(), first.sample_rate)?;
+    writer.write_frames(&first)?;
+    if !progress(decoder.frames_decoded(), hint) {
+        return Err(AudioError::Io("audio transfer cancelled".into()));
+    }
+    while let Some(block) = decoder.next_block()? {
+        writer.write_frames(&block)?;
+        if !progress(decoder.frames_decoded(), hint) {
+            return Err(AudioError::Io("audio transfer cancelled".into()));
+        }
+    }
+    let info = decoder.info().clone();
+    if !progress(info.frames, Some(info.frames)) {
+        return Err(AudioError::Io("audio transfer cancelled".into()));
+    }
+    Ok((writer.finish()?, info))
 }
 
 struct CodecDecoder {

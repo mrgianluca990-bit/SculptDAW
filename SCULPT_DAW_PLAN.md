@@ -103,3 +103,7 @@ Core44: gate completo locale passato (799 test numerici più harness UI, fmt/Cli
 Core44 pubblicato in PR #20, commit 355a72f, gate locale 799 test numerici più harness UI. Core45 in corso: decoder File a blocchi con WAV nativo/RF64 e Symphonia per codec compressi; sei regressioni nuove passate, inclusi MP3 sintetici gapless e senza Xing, durata AIFF da COMM e media incompleti. Componente ancora non collegato all’import. Gate completo avviato con RUSTUP_TOOLCHAIN=stable esplicito (settings privati /tmp non presenti).
 
 Core45: gate completo locale passato (805 test numerici più harness UI, fmt/Clippy/assets/layers/wasm), ricevitore SHOW 82355f8; assets sintetici attribuiti e controllo assets passato. Decoder File ancora da collegare al writer/import, nessuna modifica SHOW/bridge e nessuna consegna finale.
+
+Core45 pubblicato in PR #21, commit 587dfad, gate locale 805 test numerici più harness UI. Fixture MP3 binarie pubblicate con SHA Git verificati. Core46 in corso: writer Growing WAV/RF64 e trasferimento decoder→WAV originale senza SRC, con cancellazione/errori e finalizzazione dopo EOF. Sei regressioni nuove e suite audio-io/Clippy passati; gate completo avviato. Import UI e SRC offline restano successivi.
+
+Core46: gate completo locale passato (811 test numerici più harness UI, fmt/Clippy/assets/layers/wasm), ricevitore SHOW 82355f8. Trasferimento decoder→WAV verificato con cancellazione/errori; SRC e import UI restano da collegare. Nessuna modifica SHOW/bridge o consegna finale.
