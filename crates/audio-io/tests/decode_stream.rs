@@ -101,6 +101,57 @@ fn mp3_without_xing_counts_until_eof_and_preserves_existing_mono_decode() {
 }
 
 #[test]
+fn decoded_mp3_transfers_to_float_wave_and_cancellation_leaves_unfinalized_output() {
+    use soundcraft_audio_io::decode_stream::decode_file_to_wave;
+    use std::io::Cursor;
+    for bytes in [include_bytes!("fixtures/synthetic-stereo.mp3").as_slice(), include_bytes!("fixtures/synthetic-mono-no-xing.mp3").as_slice()] {
+        let fixture = Fixture::new(bytes, "mp3");
+        let mut output = Cursor::new(Vec::new());
+        let mut progress = Vec::new();
+        let (_, info) = decode_file_to_wave(&fixture.0, &mut output, |done, total| {
+            progress.push((done, total));
+            true
+        })
+        .unwrap();
+        let expected = decode(bytes, Some("mp3")).unwrap().1;
+        assert_eq!(decode(output.get_ref(), Some("wav")).unwrap().1, expected);
+        assert_eq!(info.frames, expected.frames() as u64);
+        assert_eq!(info.sample_rate, expected.sample_rate);
+        assert_eq!(progress.first().unwrap().0, 0);
+        assert_eq!(progress.last().unwrap().0, info.frames);
+        let mut early = Cursor::new(Vec::new());
+        assert!(decode_file_to_wave(&fixture.0, &mut early, |_, _| false).is_err());
+        assert!(early.into_inner().is_empty());
+        let mut late = Cursor::new(Vec::new());
+        assert!(decode_file_to_wave(&fixture.0, &mut late, |done, _| done == 0).is_err());
+        let reader = soundcraft_audio_io::stream::WavReader::from_reader(Cursor::new(late.into_inner())).unwrap();
+        assert_eq!(reader.info().frames, 0, "cancelled output must not claim a completed duration");
+    }
+}
+
+#[test]
+fn decoder_failure_does_not_finalize_a_partial_wave_transfer() {
+    use soundcraft_audio_io::decode_stream::decode_file_to_wave;
+    use std::io::Cursor;
+    let bytes = encode(&AudioBuffer::new(48_000, 2, 75003), &EncodeOptions { bit_depth: BitDepth::Float32, ..EncodeOptions::default() }).unwrap();
+    let fixture = Fixture::new(&bytes, "wav");
+    let mut output = Cursor::new(Vec::new());
+    let mut changed = false;
+    assert!(
+        decode_file_to_wave(&fixture.0, &mut output, |done, _| {
+            if done > 0 && !changed {
+                std::fs::OpenOptions::new().write(true).open(&fixture.0).unwrap().set_len(100).unwrap();
+                changed = true;
+            }
+            true
+        })
+        .is_err()
+    );
+    assert!(changed);
+    assert_eq!(soundcraft_audio_io::stream::WavReader::from_reader(Cursor::new(output.into_inner())).unwrap().info().frames, 0);
+}
+
+#[test]
 fn changed_truncated_and_invalid_files_fail_without_clean_eof() {
     let source = AudioBuffer::new(48_000, 2, 75003);
     let bytes = encode(&source, &EncodeOptions { bit_depth: BitDepth::Float32, ..EncodeOptions::default() }).unwrap();
