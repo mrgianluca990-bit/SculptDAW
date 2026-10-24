@@ -1,8 +1,8 @@
 //! AudioSuite-style whole-buffer processing on planar `f32` audio.
 //!
-//! These functions may allocate (they are not for the audio thread) but never panic: lengths,
-//! rates and ratios are sanitized and output sizes are capped at [`MAX_OFFLINE_SAMPLES`] per
-//! channel.
+//! These functions may allocate and are not for the audio thread. Whole-buffer helpers sanitize
+//! rates/ratios and cap output at [`MAX_OFFLINE_SAMPLES`] per channel. [`WindowedResampler`]
+//! instead checks each staging window and supports longer transfers through global positions.
 
 use std::f64::consts::PI;
 
@@ -13,7 +13,7 @@ pub use crate::osc::Waveform;
 use crate::util::sane_sr;
 use crate::{Plugin, db_to_gain, gain_to_db};
 
-/// Largest number of samples per channel any offline function will produce.
+/// Whole-buffer offline helper output cap per channel.
 pub const MAX_OFFLINE_SAMPLES: usize = 1 << 28;
 
 /// Fade curves. [`FadeShape::gain`] is the fade-in curve; a fade-out uses `gain(1 - t)`.
@@ -237,6 +237,122 @@ pub fn resample(ch: &[Vec<f32>], from: u32, to: u32) -> Vec<Vec<f32>> {
             resample_ratio(std::slice::from_ref(c), ratio, out_len).into_iter().next().unwrap_or_default()
         })
         .collect()
+}
+
+/// Maximum staging samples across all channels for bounded offline SRC windows/blocks.
+pub const RESAMPLE_WINDOW_SAMPLES: usize = 1_048_576;
+
+/// Windowed-sinc conversion using global output positions, so splitting an offline transfer
+/// does not reset phase or truncate the filter at block boundaries. No file I/O or realtime use.
+pub struct WindowedResampler {
+    ratio: f64,
+    source_frames: u64,
+    output_frames: u64,
+    channels: usize,
+    table: Option<SincTable>,
+}
+
+impl WindowedResampler {
+    pub fn new(from: u32, to: u32, source_frames: u64, channels: usize) -> Result<Self, String> {
+        if from == 0 || to == 0 || !(1..=64).contains(&channels) {
+            return Err("SRC requires nonzero rates and 1–64 channels".into());
+        }
+        let output_frames = (u128::from(source_frames) * u128::from(to) + u128::from(from) / 2) / u128::from(from);
+        let output_frames = u64::try_from(output_frames).map_err(|_| "SRC duration overflow")?;
+        // Positions must remain exact integers when converted to f64 for the existing kernel.
+        if source_frames > (1u64 << 53) || output_frames > (1u64 << 53) {
+            return Err("SRC duration exceeds exact frame-position range".into());
+        }
+        let ratio = f64::from(to) / f64::from(from);
+        let table = (from != to).then(|| SincTable::new(if ratio < 1.0 { ratio * 0.94 } else { 0.97 }));
+        Ok(Self { ratio, source_frames, output_frames, channels, table })
+    }
+
+    pub fn output_frames(&self) -> u64 {
+        self.output_frames
+    }
+
+    pub fn recommended_block_frames(&self) -> usize {
+        let input_budget = (RESAMPLE_WINDOW_SAMPLES / self.channels).min(65_536);
+        let padding = self.table.as_ref().map_or(0, |t| (2.0 * t.half_width).ceil() as usize + 4);
+        ((input_budget.saturating_sub(padding) as f64 * self.ratio).floor() as usize).clamp(1, 8192)
+    }
+
+    /// Exact source extent needed for this output block, including filter support. Missing
+    /// in-file samples are an error; only the true source boundaries imply zero padding.
+    pub fn input_window(&self, output_start: u64, frames: usize) -> Result<std::ops::Range<u64>, String> {
+        let end = output_start.checked_add(frames as u64).filter(|end| *end <= self.output_frames).ok_or("SRC output range exceeds duration")?;
+        if frames.checked_mul(self.channels).is_none_or(|n| n > RESAMPLE_WINDOW_SAMPLES) || frames > 65_536 {
+            return Err("SRC output block exceeds staging budget".into());
+        }
+        if frames == 0 {
+            return Ok(0..0);
+        }
+        let range = if let Some(table) = &self.table {
+            let first = output_start as f64 / self.ratio;
+            let last = (end - 1) as f64 / self.ratio;
+            let lo = (first - table.half_width).ceil().max(0.0) as u64;
+            let hi = ((last + table.half_width).floor() as u64).min(self.source_frames.saturating_sub(1));
+            lo..hi.checked_add(1).ok_or("SRC input range overflow")?
+        } else {
+            output_start..end
+        };
+        let length = range.end.checked_sub(range.start).ok_or("invalid SRC input range")?;
+        if length > 65_536 || length.checked_mul(self.channels as u64).is_none_or(|n| n > RESAMPLE_WINDOW_SAMPLES as u64) {
+            return Err("SRC input window exceeds staging budget; reduce output block".into());
+        }
+        Ok(range)
+    }
+
+    pub fn process_window(&self, input: &[Vec<f32>], input_start: u64, output_start: u64, frames: usize) -> Result<Vec<Vec<f32>>, String> {
+        let required = self.input_window(output_start, frames)?;
+        let input_frames = input.first().map_or(0, Vec::len);
+        if input.len() != self.channels
+            || input.iter().any(|c| c.len() != input_frames)
+            || input_frames.checked_mul(self.channels).is_none_or(|n| n > RESAMPLE_WINDOW_SAMPLES)
+        {
+            return Err("invalid SRC input channel/window shape".into());
+        }
+        let input_end =
+            input_start.checked_add(input_frames as u64).filter(|end| *end <= self.source_frames).ok_or("SRC input exceeds source duration")?;
+        if frames > 0 && (input_start > required.start || input_end < required.end) {
+            return Err("incomplete SRC input window".into());
+        }
+        if input.iter().flatten().any(|v| !v.is_finite()) {
+            return Err("non-finite SRC input".into());
+        }
+        let mut output = Vec::new();
+        output.try_reserve_exact(self.channels).map_err(|_| "SRC channel allocation failed")?;
+        for channel in input {
+            let mut converted = Vec::new();
+            converted.try_reserve_exact(frames).map_err(|_| "SRC block allocation failed")?;
+            for offset in 0..frames {
+                let position = output_start + offset as u64;
+                let sample = if let Some(table) = &self.table {
+                    let time = position as f64 / self.ratio;
+                    let lo = (time - table.half_width).ceil().max(0.0) as u64;
+                    let hi = ((time + table.half_width).floor() as u64).min(self.source_frames - 1);
+                    let mut accumulated = 0.0f32;
+                    for index in lo..=hi {
+                        let local = usize::try_from(index.checked_sub(input_start).ok_or("SRC window origin mismatch")?)
+                            .map_err(|_| "SRC local index overflow")?;
+                        accumulated += *channel.get(local).ok_or("SRC window is incomplete")? * table.at(time - index as f64);
+                    }
+                    accumulated
+                } else {
+                    let local = usize::try_from(position.checked_sub(input_start).ok_or("SRC window origin mismatch")?)
+                        .map_err(|_| "SRC local index overflow")?;
+                    *channel.get(local).ok_or("SRC window is incomplete")?
+                };
+                if !sample.is_finite() {
+                    return Err("non-finite SRC output".into());
+                }
+                converted.push(sample);
+            }
+            output.push(converted);
+        }
+        Ok(output)
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
